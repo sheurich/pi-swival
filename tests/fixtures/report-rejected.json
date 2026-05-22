@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "mode": "oneshot",
+  "timestamp": "2026-05-01T03:30:00+00:00",
+  "task": "Refactor foo",
+  "model": "claude-opus-4-6",
+  "provider": "lmstudio",
+  "settings": {
+    "temperature": null,
+    "top_p": null,
+    "seed": null,
+    "max_turns": 100,
+    "max_output_tokens": 32768,
+    "context_length": null,
+    "files": "all",
+    "commands": "all",
+    "max_review_rounds": 2,
+    "skills_discovered": [],
+    "instructions_loaded": []
+  },
+  "sandbox": { "mode": "builtin" },
+  "result": {
+    "outcome": "failed",
+    "answer": "Attempted refactor of foo.ts; left some TODOs.",
+    "exit_code": 0
+  },
+  "stats": {
+    "turns": 3,
+    "tool_calls_total": 2,
+    "tool_calls_succeeded": 2,
+    "tool_calls_failed": 0,
+    "tool_calls_by_name": { "read_file": { "succeeded": 1, "failed": 0 }, "edit": { "succeeded": 1, "failed": 0 } },
+    "compactions": 0,
+    "turn_drops": 0,
+    "guardrail_interventions": 0,
+    "truncated_responses": 0,
+    "llm_calls": 5,
+    "total_llm_time_s": 12.4,
+    "total_tool_time_s": 0.1,
+    "skills_used": [],
+    "review_rounds": 2
+  },
+  "timeline": [
+    { "turn": 1, "type": "llm_call", "duration_s": 3.1, "prompt_tokens_est": 4000, "finish_reason": "stop", "is_retry": false },
+    { "type": "review", "round": 1, "exit_code": 1, "feedback": "Still has TODOs; remove them or explain." },
+    { "turn": 2, "type": "llm_call", "duration_s": 4.2, "prompt_tokens_est": 4200, "finish_reason": "stop", "is_retry": true },
+    { "type": "review", "round": 2, "exit_code": 1, "feedback": "TODOs still unresolved. Final: REJECT." }
+  ]
+}

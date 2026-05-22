@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "mode": "oneshot",
+  "timestamp": "2026-05-01T03:20:54.634931+00:00",
+  "task": "Write a haiku about coffee. After you share your haiku, stop.",
+  "model": "claude-opus-4-6",
+  "provider": "lmstudio",
+  "settings": {
+    "temperature": null,
+    "top_p": null,
+    "seed": null,
+    "max_turns": 100,
+    "max_output_tokens": 32768,
+    "context_length": null,
+    "files": "all",
+    "commands": "all",
+    "max_review_rounds": 2,
+    "skills_discovered": [],
+    "instructions_loaded": []
+  },
+  "sandbox": {
+    "mode": "builtin"
+  },
+  "result": {
+    "outcome": "success",
+    "answer": "Here's a haiku about coffee:\n\n*Steam curls from the cup,*\n*Bitter warmth ignites the dawn—*\n*World begins to hum.*",
+    "exit_code": 0
+  },
+  "stats": {
+    "turns": 1,
+    "tool_calls_total": 0,
+    "tool_calls_succeeded": 0,
+    "tool_calls_failed": 0,
+    "tool_calls_by_name": {},
+    "compactions": 0,
+    "turn_drops": 0,
+    "guardrail_interventions": 0,
+    "truncated_responses": 0,
+    "llm_calls": 1,
+    "total_llm_time_s": 2.543,
+    "total_tool_time_s": 0.0,
+    "skills_used": [],
+    "review_rounds": 1
+  },
+  "timeline": [
+    {
+      "turn": 1,
+      "type": "llm_call",
+      "duration_s": 2.543,
+      "prompt_tokens_est": 4179,
+      "finish_reason": "stop",
+      "is_retry": false
+    },
+    {
+      "type": "review",
+      "round": 1,
+      "exit_code": 0,
+      "feedback": "The task asks for a haiku about coffee, then to stop. The answer provides a haiku about coffee with the correct 5-7-5 syllable structure. VERDICT: ACCEPT\n",
+      "stderr": ""
+    }
+  ]
+}

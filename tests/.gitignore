@@ -1,0 +1,3 @@
+node_modules/
+package-lock.json
+# Do not ignore package.json itself or any of the test files.
