@@ -14,6 +14,7 @@ The first argument is the repository reference. It may be a local path, a GitHub
 - Invoke workers through Pi's `swival-subagent` tool with the `audit-worker` agent. Each Swival task must start with `/audit`, followed by the focused bucket prompt. Do not use `reviewed-worker`; this is a read-only audit, not implementation work. Do not invoke the `swival` CLI directly unless the user explicitly approves a fallback.
 - Report only concrete, evidence-backed findings. Do not include speculative hardening ideas, style issues, unreachable issues, or issues already prevented by existing checks.
 - Preserve all worker prompts, worker reports, exact commands or tool invocations, and the final report under `/tmp` unless the user specifies another output directory.
+- For any file larger than ~4 KB, prefer a `bash` heredoc (`cat > path <<'EOF' ... EOF`) over the `write` tool. The `write` tool truncates or drops content silently when the body is large; heredocs round-trip the bytes faithfully and surface errors at the shell.
 
 ## Phase 1: Resolve and inspect the repository
 
@@ -74,28 +75,30 @@ Use Pi's `swival-subagent` tool for each worker with `agent: "audit-worker"`. Do
 
 The `task` passed to `swival-subagent` must begin with `/audit`, then include the focused bucket prompt. Store the exact tool invocation under `/tmp` before or immediately after running it.
 
-Example single-worker invocation:
+The `audit-worker` runs under an AgentFS sandbox that restricts reads to the worker's `cwd`. Files under `/tmp/swival-audit-<repo>/prompts/` (or any path outside the audited repo) are not visible to the worker. Embed the rendered bucket prompt directly in the `task` string — do not pass a `/tmp` file path and expect the worker to read it. If you need to keep an audit trail of the prompt, write it to disk yourself before dispatch and inline its contents into the `task` field.
+
+Example single-worker invocation (rendered prompt embedded inline):
 
 ```json
 {
   "agent": "audit-worker",
-  "task": "/audit Audit the <bucket-name> bucket.\n\n<focused bucket prompt>",
+  "task": "/audit Audit the <bucket-name> bucket.\n\n<full focused bucket prompt body, embedded inline>",
   "cwd": "<resolved-repo-path>"
 }
 ```
 
-Example parallel invocation shape:
+Example parallel invocation shape (each task carries its own embedded prompt):
 
 ```json
 {
   "tasks": [
     {
       "agent": "audit-worker",
-      "task": "/audit Audit the <first-bucket> bucket.\n\n<focused bucket prompt>"
+      "task": "/audit Audit the <first-bucket> bucket.\n\n<full first-bucket prompt body, embedded inline>"
     },
     {
       "agent": "audit-worker",
-      "task": "/audit Audit the <second-bucket> bucket.\n\n<focused bucket prompt>"
+      "task": "/audit Audit the <second-bucket> bucket.\n\n<full second-bucket prompt body, embedded inline>"
     }
   ],
   "cwd": "<resolved-repo-path>"
@@ -132,18 +135,34 @@ Also include:
 
 ## Phase 5: Consolidate the final report
 
-After all workers finish:
+After all workers finish, dispatch the `security-consolidator` agent against the workspace directory that contains `reports/`. Do not synthesize the report yourself — the orchestrator has too much extra context and synthesis drifts.
 
-1. Read every worker report.
-2. Merge duplicate findings.
-3. Remove false positives and findings whose exploitability depends on unsupported assumptions.
-4. Prioritize findings by severity, exploitability, confidence, and production impact.
-5. List buckets with no concrete findings.
-6. List open questions or areas needing human review.
-7. Include exact Swival commands or `swival-subagent` invocations used.
-8. Verify the audited repository status matches the initial status when it is a Git repo.
+Use the same dispatch overrides used for `audit-worker` so the consolidation runs at the same model tier and reasoning effort:
 
-Final report format:
+```json
+{
+  "agent": "security-consolidator",
+  "cwd": "<workspace dir containing reports/>",
+  "task": "Read every file under reports/. For each finding, dedupe across buckets and produce a consolidated report matching the contract.",
+  "output": "<workspace>/consolidated-findings.md",
+  "profileOverride": "heavy",
+  "reasoningEffortOverride": "high",
+  "temperatureOverride": 0.2,
+  "maxReviewRoundsOverride": 2,
+  "seedOverride": <int>
+}
+```
+
+The consolidator's reviewer enforces the output contract (top-level structure, finding ordering, originating bucket, verbatim worker prose, no invented findings, no severity adjustments). See `agents/security-consolidator.md` for the criteria the reviewer applies.
+
+After the consolidator returns, the orchestrator's remaining job is verification, not synthesis:
+
+1. Read `consolidated-findings.md` and confirm it covers every bucket the workers reported on.
+2. Verify the audited repository status matches the initial status when it is a Git repo.
+3. Append the exact `swival-subagent` invocations used (recon, per-bucket fan-out, consolidator) to the artifact directory so the audit trail is reproducible.
+4. Hash the artifacts (`shasum -a 256` over `recon.json`, `reports/*`, `consolidated-findings.md`) into `SHA256SUMS.txt` for downstream auditors.
+
+Final report format — `consolidated-findings.md`, produced by the consolidator agent, contains:
 
 - Repository reference, resolved path, branch/ref, and commit SHA when available
 - Scope and assumptions

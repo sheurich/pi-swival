@@ -42,6 +42,11 @@ export interface SwivalAgentConfig {
 	reviewPrompt?: string;
 	verify?: string;
 	maxReviewRounds?: number;
+	/** When true, the dispatcher refuses to spawn this agent unless the call
+	 *  supplies a reviewer (frontmatter, override, or selfReview). Set on agents
+	 *  whose contract depends on the reviewer loop — e.g. test-runner cannot
+	 *  declare success without the test script gating it. */
+	requiresReviewer?: boolean;
 
 	// Filesystem / commands
 	sandbox?: "builtin" | "agentfs";
@@ -187,6 +192,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			reviewPrompt: typeof fm.reviewPrompt === "string" ? fm.reviewPrompt : undefined,
 			verify: typeof fm.verify === "string" ? fm.verify : undefined,
 			maxReviewRounds: asNumber(fm.maxReviewRounds),
+			requiresReviewer: asBool(fm.requiresReviewer),
 
 			sandbox: asEnum(fm.sandbox, ["builtin", "agentfs"] as const),
 			sandboxSession: typeof fm.sandboxSession === "string" ? fm.sandboxSession : undefined,

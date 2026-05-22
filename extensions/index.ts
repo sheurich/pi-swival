@@ -185,6 +185,59 @@ export function isRunFailure(r: { exitCode: number; report?: { outcome?: string 
 }
 
 /**
+ * The exact `commands` allowlist that marks an agent as read-only at the
+ * shell-allowlist level. Used by `isMutatingCwdAgent` to identify audit-style
+ * agents whose only commands are read-only inspection. Drift-sensitive: if
+ * the bundled audit-worker's allowlist changes, update this constant in
+ * lockstep so the parallel-cwd guard keeps recognising it as read-only.
+ */
+export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
+
+/**
+ * True when an agent could plausibly mutate its cwd — the inverse of the
+ * conditions that make parallel dispatch on a shared cwd safe.
+ *
+ * Safe (i.e. NOT mutating-cwd):
+ *   1. files: "none" — no filesystem write surface at all.
+ *   2. commands == READ_ONLY_AUDIT_COMMANDS — read-only shell allowlist.
+ *   3. sandbox: "agentfs" + noSandboxAutoSession — each invocation gets its
+ *      own AgentFS overlay session, so writes don't collide on the cwd.
+ *
+ * Anything else is treated as write-capable for the purposes of the
+ * parallel-cwd collision guard.
+ */
+export function isMutatingCwdAgent(agent: SwivalAgentConfig): boolean {
+	if (agent.files === "none") return false;
+	if (agent.commands === READ_ONLY_AUDIT_COMMANDS) return false;
+	if (agent.sandbox === "agentfs" && agent.noSandboxAutoSession) return false;
+	return true;
+}
+
+/**
+ * Validate that an agent declaring `requiresReviewer: true` actually has a
+ * reviewer attached for this call. Returns an error string when the gate
+ * fails, or undefined when the call is allowed to proceed. Both frontmatter
+ * and overrides count — the dispatcher accepts any of: agent.reviewer,
+ * agent.selfReview, overrides.reviewer, overrides.selfReview.
+ *
+ * Pulled out of the run functions so both sync and async dispatch paths share
+ * the same validation logic.
+ */
+export function checkRequiresReviewer(
+	agent: SwivalAgentConfig,
+	overrides: SwivalOverrides,
+): string | undefined {
+	if (!agent.requiresReviewer) return undefined;
+	if (overrides.reviewer || agent.reviewer) return undefined;
+	if (overrides.selfReview || agent.selfReview) return undefined;
+	return (
+		`Agent "${agent.name}" requires a reviewer (frontmatter sets requiresReviewer: true) ` +
+		`but the call did not supply one. Pass reviewerOverride with a path to a reviewer ` +
+		`script (test-as-contract), or selfReviewOverride: true to enable LLM self-review.`
+	);
+}
+
+/**
  * Dispatch-time overrides that outrank frontmatter for a single call.
  * All fields are optional; undefined means "use the agent's frontmatter value".
  */
@@ -1140,6 +1193,10 @@ async function runSingleSwivalAsync(
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		throw new Error(`Unknown swival agent: "${agentName}". Available: ${available}`);
 	}
+	const reviewerError = checkRequiresReviewer(agent, overrides);
+	if (reviewerError) {
+		throw new Error(reviewerError);
+	}
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
@@ -1263,6 +1320,20 @@ async function runSingleSwival(
 			stderrTail: [`Unknown swival agent: "${agentName}". Available: ${available}`],
 			durationMs: 0,
 			errorMessage: `Unknown swival agent: "${agentName}"`,
+		};
+	}
+	const reviewerError = checkRequiresReviewer(agent, overrides);
+	if (reviewerError) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [reviewerError],
+			durationMs: 0,
+			errorMessage: reviewerError,
+			reason: { code: "config_error", text: reviewerError },
 		};
 	}
 
@@ -2228,6 +2299,47 @@ export default function (pi: ExtensionAPI) {
 							},
 						],
 						details: makeDetails("parallel")([]),
+					};
+				}
+
+				// Reject parallel dispatches where two write-capable tasks resolve to
+				// the same cwd. The motivating bug: parallel `reviewed-worker` fan-out
+				// on a shared worktree silently lost the second worker's edits because
+				// they raced on the same filesystem. Read-only audit-style agents and
+				// AgentFS sessions with their own overlay (noSandboxAutoSession=true)
+				// are exempted by isMutatingCwdAgent.
+				const defaultCwd = params.cwd ?? ctx.cwd;
+				const cwdGroups = new Map<string, number[]>();
+				for (let i = 0; i < params.tasks.length; i++) {
+					const t = params.tasks[i];
+					const agent = agents.find((a) => a.name === t.agent);
+					if (!agent) continue; // unknown-agent diagnostics happen per-task in runSingleSwival
+					if (!isMutatingCwdAgent(agent)) continue;
+					const resolvedCwd = path.resolve(t.cwd ?? defaultCwd);
+					const existing = cwdGroups.get(resolvedCwd) ?? [];
+					existing.push(i);
+					cwdGroups.set(resolvedCwd, existing);
+				}
+				for (const [resolvedCwd, indices] of cwdGroups) {
+					if (indices.length < 2) continue;
+					const preview = indices
+						.map((i) => `[${i}] ${params.tasks![i].agent}`)
+						.join(", ");
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									`Refusing to dispatch ${indices.length} write-capable tasks against the same cwd ` +
+									`(${resolvedCwd}): ${preview}. Parallel filesystem writes on a shared cwd race ` +
+									`and silently lose edits. Remedies: (a) dispatch them serially, (b) give each task ` +
+									`its own cwd (per-task cwd field, e.g. distinct git worktrees), or (c) use an agent ` +
+									`with sandbox: agentfs and noSandboxAutoSession: true so each invocation gets its ` +
+									`own overlay.`,
+							},
+						],
+						details: makeDetails("parallel")([]),
+						isError: true,
 					};
 				}
 

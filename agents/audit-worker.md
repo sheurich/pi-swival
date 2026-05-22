@@ -2,6 +2,7 @@
 name: audit-worker
 description: Runs Swival /audit for read-only security and domain audit buckets.
 sandbox: agentfs
+noSandboxAutoSession: true
 files: some
 commands: "git,ls,find,rg,grep,head,tail,wc,pwd"
 noInstructions: true

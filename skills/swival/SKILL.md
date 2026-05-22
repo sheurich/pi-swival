@@ -145,6 +145,7 @@ selfReview: true                  # LLM self-review
 reviewer: ./test.sh               # script as reviewer (exit 0 = accept)
 reviewPrompt: "Check X and Y"    # criteria for self-review
 maxReviewRounds: 5                # round budget
+requiresReviewer: true            # dispatcher refuses to spawn without a reviewer
 
 # Sandbox / commands
 sandbox: agentfs                  # builtin | agentfs
@@ -181,6 +182,34 @@ definitions. Model routing belongs in `~/.config/swival/config.toml`
 (managed per environment alongside the rest of your shell config).
 Use `profileOverride` at
 dispatch time when a specific profile is needed.
+
+### Agent configs do not inherit
+
+Each agent's frontmatter is independent. There is no base agent, no
+`extends:` field, and no implicit inheritance from the bundled set.
+When you fork a bundled agent into `~/.pi/agent/swival-agents/` or
+`.pi/swival-agents/`, copy the entire frontmatter; flags you omit
+revert to the schema default, which is rarely what the bundled
+agent intended. The trap to watch for:
+
+- `noSandboxAutoSession: true` on `audit-worker` is what makes
+  parallel `/audit` fan-out work. Drop it in a fork and the next
+  parallel dispatch deadlocks on the AgentFS SQLite overlay.
+- `requiresReviewer: true` on `test-runner` is what makes the
+  test-as-contract gate enforceable. Drop it in a fork and the
+  agent will silently report "completed" without ever running the
+  test script.
+- The nested-invocation hygiene flags (`noLifecycle`, `noMcp`,
+  `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`)
+  default to `true` only for *bundled* agents whose frontmatter
+  declares them. The schema default for an unspecified flag is
+  `undefined`, which `buildSwivalArgs` treats as `true` for hygiene
+  flags but as `false` for everything else — do not rely on this
+  asymmetry, restate the flags you want.
+
+When overriding a bundled agent name from the user or project scope,
+diff your frontmatter against the bundled file and ensure every
+semantically-load-bearing flag is preserved.
 
 ## Capabilities Reference
 

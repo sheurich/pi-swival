@@ -1,6 +1,7 @@
 ---
 name: test-runner
 description: Test-as-contract worker. The caller must pass reviewerOverride with the path to a test script — the agent cannot declare success until that script exits 0. Use when working in a repo with a runnable test command.
+requiresReviewer: true
 maxReviewRounds: 10
 noInstructions: true
 noMemory: true
