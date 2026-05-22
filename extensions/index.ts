@@ -26,6 +26,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -747,8 +748,13 @@ export function startTraceTail(
 						const want = Math.min(CHUNK_BYTES, end - position);
 						const { bytesRead } = await handle.read(chunk, 0, want, position);
 						if (bytesRead <= 0) break;
-						position += bytesRead;
-						buffer += chunk.toString("utf-8", 0, bytesRead);
+					position += bytesRead;
+					buffer += chunk.toString("utf-8", 0, bytesRead);
+					// Cap buffer to prevent OOM from malicious newline-free trace files
+					if (buffer.length > 4 * 1024 * 1024) {
+						const cut = buffer.lastIndexOf("\n");
+						buffer = cut >= 0 ? buffer.slice(cut + 1) : "";
+					}
 					}
 					const lines = buffer.split("\n");
 					buffer = lines.pop() ?? "";
@@ -873,7 +879,7 @@ function mintArtifactDir(
 			.replace(/[^a-zA-Z0-9._-]/g, "_")
 			.replace(/\.+/g, ".")
 			.replace(/^[._-]+/, "") || "swival";
-	const suffix = Math.random().toString(36).slice(2, 8);
+	const suffix = randomBytes(4).toString("hex");
 	const runId = `swival-run-${ts}-${suffix}`;
 	const artifactDir = path.join(artifactRoot, `${safeAgent}-${ts}-${suffix}`);
 	return { artifactDir, ts, runId };
@@ -1012,6 +1018,10 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 	for (const name of entries) {
 		const metaPath = path.join(artifactRoot, name, "run-meta.json");
 		try {
+			try {
+				const metaStat = await fs.promises.stat(metaPath);
+				if (metaStat.size > 65536) continue; // 64 KB cap — legitimate meta files are < 1 KB
+			} catch { continue; }
 			const text = await fs.promises.readFile(metaPath, "utf-8");
 			const parsed = JSON.parse(text) as Record<string, unknown>;
 			// Fix 10: validate expected fields before trusting the object.
@@ -1020,6 +1030,26 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number")
 			) continue;
+
+			// Path containment: artifactDir must be under artifactRoot
+			const resolvedArtifact = path.resolve(parsed.artifactDir as string);
+			const resolvedRoot = path.resolve(artifactRoot);
+			if (!resolvedArtifact.startsWith(resolvedRoot + path.sep)) continue;
+
+			// stdoutFile and stderrFile must be under artifactDir
+			if (typeof (parsed as any).stdoutFile === "string") {
+				if (!path.resolve((parsed as any).stdoutFile).startsWith(resolvedArtifact + path.sep)) continue;
+			}
+			if (typeof (parsed as any).stderrFile === "string") {
+				if (!path.resolve((parsed as any).stderrFile).startsWith(resolvedArtifact + path.sep)) continue;
+			}
+
+			// PID range: reject 0, 1, negative, and non-integer values
+			if (typeof (parsed as any).pid === "number") {
+				const pidVal = (parsed as any).pid;
+				if (!Number.isInteger(pidVal) || pidVal < 2) continue;
+			}
+
 			const meta = parsed as unknown as RunMeta;
 			if (meta.runId === runId) return meta;
 		} catch {
@@ -1297,6 +1327,9 @@ async function runSingleSwival(
 				}
 			}
 		}
+		if (current.traceEvents && current.traceEvents.length >= 1000) {
+			current.traceEvents.shift();
+		}
 		current.traceEvents.push(event);
 		scheduleEmit();
 	});
@@ -1339,7 +1372,7 @@ async function runSingleSwival(
 			}
 
 			proc.stdout.on("data", (buf: Buffer) => {
-				stdoutBuf += stdoutDecoder.decode(buf, { stream: true });
+				stdoutBuf += stripAnsi(stdoutDecoder.decode(buf, { stream: true }));
 				if (stdoutBuf.length > STDOUT_RING_CHARS) {
 					stdoutBuf = stdoutBuf.slice(-STDOUT_RING_CHARS);
 				}
@@ -1885,7 +1918,7 @@ export default function (pi: ExtensionAPI) {
 			const discoveryCwd = params.cwd ?? ctx.cwd;
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			const confirmProjectAgents = !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
 			const makeDetails =
@@ -1973,15 +2006,22 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const pid = state.meta.pid;
-					if (pid == null) {
-						return {
-							content: [{ type: "text", text: `Run ${runId} has no recorded PID — cannot interrupt.` }],
-							details: makeDetails("single")([]),
-							isError: true,
-						};
-					}
-					// Fix 9: signal the entire process group so child processes
+				const pid = state.meta.pid;
+				if (pid == null) {
+					return {
+						content: [{ type: "text", text: `Run ${runId} has no recorded PID — cannot interrupt.` }],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				if (!Number.isInteger(pid) || pid < 2 || pid === process.pid) {
+					return {
+						content: [{ type: "text", text: `Run ${runId} has an invalid recorded PID (${pid}) — refusing to signal.` }],
+						details: makeDetails("single")([]),
+						isError: true,
+					};
+				}
+				// Fix 9: signal the entire process group so child processes
 					// (sub-shells, nested tools) are also terminated.
 					// Schedule SIGKILL escalation after 5 s in case SIGTERM is ignored.
 					try {

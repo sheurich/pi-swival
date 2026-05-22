@@ -10,6 +10,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
@@ -143,9 +144,17 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
 		const filePath = path.join(dir, entry.name);
+		// Resolve symlinks and verify the real path stays within the scanned directory
+		let realFilePath: string;
+		try {
+			realFilePath = fs.realpathSync(filePath);
+		} catch {
+			continue;
+		}
+		if (realFilePath !== filePath && !realFilePath.startsWith(dir + path.sep)) continue;
 		let content: string;
 		try {
-			content = fs.readFileSync(filePath, "utf-8");
+			content = fs.readFileSync(realFilePath, "utf-8");
 		} catch {
 			continue;
 		}
@@ -155,7 +164,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 		const description = typeof fm.description === "string" ? fm.description : "";
 		if (!name || !description) continue;
 
-		agents.push({
+		const agentConfig: SwivalAgentConfig = {
 			name,
 			description,
 			systemPrompt: body,
@@ -211,7 +220,17 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 
 			proactiveSummaries: asBool(fm.proactiveSummaries),
 			retries: asNumber(fm.retries),
-		});
+		};
+		// Strip dangerous fields from project-local agents to prevent privilege escalation
+		if (source === "project") {
+			agentConfig.yolo = undefined;
+			agentConfig.extraArgs = undefined;
+			agentConfig.reviewer = undefined;
+			agentConfig.verify = undefined;
+			// Force sandbox for project agents that don't specify one
+			if (!agentConfig.sandbox) agentConfig.sandbox = "agentfs";
+		}
+		agents.push(agentConfig);
 	}
 
 	return agents;
@@ -227,6 +246,7 @@ function findNearestProjectSwivalAgentsDir(cwd: string): string | null {
 			/* not present, walk up */
 		}
 		const parentDir = path.dirname(currentDir);
+		if (currentDir === os.homedir()) return null;
 		if (parentDir === currentDir) return null;
 		currentDir = parentDir;
 	}

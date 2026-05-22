@@ -12,7 +12,7 @@ fi
 
 # 1. Install vitest locally.
 if [[ ! -d node_modules/vitest ]]; then
-	npm install --silent
+	npm install --silent --ignore-scripts
 fi
 
 # 2. Find the Pi install so we can symlink the peer packages the extension
