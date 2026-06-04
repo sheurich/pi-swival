@@ -5,7 +5,7 @@ Two short videos that show the package end-to-end inside Pi.
 | Demo | Length | What it shows |
 |------|-------:|---------------|
 | [`demo-quick`](demo-quick.gif) | ~60s | Pi loads pi-swival, dispatches a trivial task through `swival-subagent`, shows the structured tool block, verifies the produced file. Use this as the headline shareable. |
-| [`demo-reviewer`](demo-reviewer.gif) | ~150s | The reviewer-loop differentiator. Pi consults the `swival` skill, dispatches `reviewed-worker`, swival's reviewer iterates until the contract is satisfied, then Pi reads `report.json` and shows `outcome`, `rounds`, `tools`, `llm_time_s`. |
+| [`demo-reviewer`](demo-reviewer.gif) | ~150s | The reviewer-loop differentiator. Pi consults the `swival` skill, dispatches `self-review-worker`, swival's reviewer iterates until the contract is satisfied, then Pi reads `report.json` and shows `outcome`, `rounds`, `tools`, `llm_time_s`. |
 
 Both files render to GIF and MP4. Embed the GIF in READMEs; share the MP4 for higher-fidelity playback.
 

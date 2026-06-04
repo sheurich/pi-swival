@@ -189,12 +189,12 @@ If two buckets report overlapping findings (same file:line), Stage 3 dedupes the
 - Hardcoding model IDs in agent definitions or dispatches. Routing belongs in `~/.config/swival/config.toml`.
 - Accepting "No concrete findings" without coverage notes. That report is unverified, not negative.
 - Running consolidation in the orchestrator's context. The orchestrator has too much extra context; synthesis drifts. Use the dedicated agent.
-- Mixing audit and remediation in one pipeline. This skill is read-only. Backports are a separate flow that uses `reviewed-worker`.
+- Mixing audit and remediation in one pipeline. This skill is read-only. Backports are a separate flow that uses `self-review-worker`.
 
 ## Cross-references
 
 - The companion `swival-audit` prompt template (`prompts/swival-audit.md` in this package) walks an interactive operator through the same pipeline as a slash-command-style invocation.
-- For implementing fixes from audit findings, dispatch a `reviewed-worker` separately. This skill is read-only; remediation is a separate flow.
+- For implementing fixes from audit findings, dispatch a `self-review-worker` separately. This skill is read-only; remediation is a separate flow.
 
 ## Reference files
 

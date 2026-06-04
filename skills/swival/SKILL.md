@@ -31,12 +31,14 @@ extend them by placing `.md` files in
 
 | Agent | Use when |
 |-------|----------|
-| `reviewed-worker` | Multi-file code changes or any task where a second pass catches mistakes |
+| `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks |
 | `test-runner` | Task has a runnable test command as acceptance criterion (pass `reviewerOverride`) |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying |
 | `swival` | Simple delegation, no review needed (also the default when agent is omitted) |
 
 ### Dispatch examples
+
+`self-review-worker` is a worker with Swival self-review enabled. Use reviewer agents, the `code-review` skill, or the GitHub PR review workflow for review-only tasks.
 
 Single task (generic, no review):
 
@@ -47,7 +49,7 @@ swival-subagent with task: "Refactor the auth module"
 Self-reviewed implementation:
 
 ```
-swival-subagent with agent: "reviewed-worker", task: "Add input validation to cmd/serve.go"
+swival-subagent with agent: "self-review-worker", task: "Add input validation to cmd/serve.go"
 ```
 
 Test-as-contract:
@@ -69,8 +71,8 @@ Parallel:
 
 ```
 swival-subagent with tasks: [
-  { agent: "reviewed-worker", task: "Refactor auth module" },
-  { agent: "reviewed-worker", task: "Add error handling to parser" }
+  { agent: "self-review-worker", task: "Refactor auth module" },
+  { agent: "self-review-worker", task: "Add error handling to parser" }
 ]
 ```
 
@@ -79,7 +81,7 @@ Chain (each step gets prior step's output as `{previous}`):
 ```
 swival-subagent with chain: [
   { agent: "swival", task: "Summarize the auth module" },
-  { agent: "reviewed-worker", task: "Given: {previous}\nAdd input validation." }
+  { agent: "self-review-worker", task: "Given: {previous}\nAdd input validation." }
 ]
 ```
 
@@ -88,7 +90,7 @@ swival-subagent with chain: [
 Run a long task in the background and return immediately:
 
 ```
-swival-subagent with agent: "reviewed-worker", task: "Refactor the auth module", async: true
+swival-subagent with agent: "self-review-worker", task: "Refactor the auth module", async: true
 ```
 
 The tool returns a `runId` (e.g. `swival-run-1716326580000`). `async: true` is only supported in single-agent mode, not chain/parallel.

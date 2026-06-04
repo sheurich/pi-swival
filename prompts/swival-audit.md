@@ -11,7 +11,7 @@ The first argument is the repository reference. It may be a local path, a GitHub
 - Keep the audited repository read-only. Do not create, edit, delete, format, commit, branch, or write files inside it.
 - Do not perform externally visible actions other than read-only cloning/fetching when needed to obtain the repository.
 - Use Swival workers by security or domain bucket, not one worker per package or directory.
-- Invoke workers through Pi's `swival-subagent` tool with the `audit-worker` agent. Each Swival task must start with `/audit`, followed by the focused bucket prompt. Do not use `reviewed-worker`; this is a read-only audit, not implementation work. Do not invoke the `swival` CLI directly unless the user explicitly approves a fallback.
+- Invoke workers through Pi's `swival-subagent` tool with the `audit-worker` agent. Each Swival task must start with `/audit`, followed by the focused bucket prompt. Do not use `self-review-worker`; this is a read-only audit, not implementation work. Do not invoke the `swival` CLI directly unless the user explicitly approves a fallback.
 - Report only concrete, evidence-backed findings. Do not include speculative hardening ideas, style issues, unreachable issues, or issues already prevented by existing checks.
 - Preserve all worker prompts, worker reports, exact commands or tool invocations, and the final report under `/tmp` unless the user specifies another output directory.
 - For any file larger than ~4 KB, prefer a `bash` heredoc (`cat > path <<'EOF' ... EOF`) over the `write` tool. The `write` tool truncates or drops content silently when the body is large; heredocs round-trip the bytes faithfully and surface errors at the shell.
@@ -71,7 +71,7 @@ For each bucket, write a focused worker prompt that includes:
 
 Run the workers in parallel when their scopes do not share mutable state. Keep each worker read-only.
 
-Use Pi's `swival-subagent` tool for each worker with `agent: "audit-worker"`. Do not use `reviewed-worker`. Do not hardcode model names; let Swival configuration choose the model.
+Use Pi's `swival-subagent` tool for each worker with `agent: "audit-worker"`. Do not use `self-review-worker`. Do not hardcode model names; let Swival configuration choose the model.
 
 The `task` passed to `swival-subagent` must begin with `/audit`, then include the focused bucket prompt. Store the exact tool invocation under `/tmp` before or immediately after running it.
 

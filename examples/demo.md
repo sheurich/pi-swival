@@ -45,7 +45,7 @@ Confirm it shows up in your settings:
 pi list | grep pi-swival
 ```
 
-All seven bundled agents (`swival`, `reviewed-worker`, `test-runner`,
+All seven bundled agents (`swival`, `self-review-worker`, `test-runner`,
 `sandboxed-explorer`, `audit-worker`, `security-recon`,
 `security-consolidator`) are auto-discovered from the package's `agents/`
 directory — no symlinks needed.
@@ -74,10 +74,10 @@ This exercises:
 ## Demo 2 — reviewer loop
 
 Ask for a change that benefits from a second pass. The
-`reviewed-worker` agent has `selfReview: true` and a 5-round budget.
+`self-review-worker` agent has `selfReview: true` and a 5-round budget.
 
 ```text
-Use swival-subagent with agent: "reviewed-worker"
+Use swival-subagent with agent: "self-review-worker"
 and task: "Write a Python script /tmp/fizzbuzz.py that prints 1..15 with
 FizzBuzz. After writing, also write a sibling test_fizzbuzz.py with at
 least four pytest cases covering 3, 5, 15, and a non-multiple."
@@ -85,7 +85,7 @@ least four pytest cases covering 3, 5, 15, and a non-multiple."
 
 Expected behaviour:
 
-1. Pi reports `✓ reviewed-worker  <model> · N rounds · M tool calls · ...`
+1. Pi reports `✓ self-review-worker  <model> · N rounds · M tool calls · ...`
    where N is at least 1 (the reviewer ran).
 2. Both files exist and are correct.
 
@@ -142,8 +142,8 @@ Confirm the `tasks[]` mode works:
 
 ```text
 Use swival-subagent with tasks: [
-  { agent: "reviewed-worker", task: "Add a docstring to /tmp/fizzbuzz.py" },
-  { agent: "reviewed-worker", task: "Add type hints to /tmp/test_fizzbuzz.py" }
+  { agent: "self-review-worker", task: "Add a docstring to /tmp/fizzbuzz.py" },
+  { agent: "self-review-worker", task: "Add type hints to /tmp/test_fizzbuzz.py" }
 ]
 ```
 

@@ -2303,7 +2303,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Reject parallel dispatches where two write-capable tasks resolve to
-				// the same cwd. The motivating bug: parallel `reviewed-worker` fan-out
+				// the same cwd. The motivating bug: parallel `self-review-worker` fan-out
 				// on a shared worktree silently lost the second worker's edits because
 				// they raced on the same filesystem. Read-only audit-style agents and
 				// AgentFS sessions with their own overlay (noSandboxAutoSession=true)

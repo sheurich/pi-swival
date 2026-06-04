@@ -10,7 +10,7 @@ The package bundles:
 - `swival` skill — drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and proxy setup.
 - `auditing-with-swival` skill — a three-stage recon → per-bucket → consolidate pipeline for security audits over codebases too large for one worker.
 - `swival-audit` prompt template — slash-command-style invocation that walks an interactive operator through the audit pipeline.
-- Seven swival agents — `swival`, `reviewed-worker`, `test-runner`, `sandboxed-explorer` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
+- Seven swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
 
 ## Install
 
@@ -81,7 +81,7 @@ Bundled in `agents/` for the `swival-subagent` tool:
 | Agent | Use when |
 |-------|----------|
 | `swival` | Generic delegate — no system prompt, no review. The implicit default when `agent` is omitted. |
-| `reviewed-worker` | Multi-file code changes or any task where a second pass catches mistakes. |
+| `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks. |
 | `test-runner` | Task has a runnable test command as acceptance criterion (caller passes `reviewerOverride`). |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying. |
 | `audit-worker` | Read-only security or domain audit (Stage 2 of the audit pipeline). |
@@ -140,7 +140,7 @@ The golden fixtures under `tests/fixtures/` are the source of truth for the swiv
 Two recordings under [`demo/`](demo/):
 
 - `demo-quick.gif` (~60s) — the headline shareable embedded above. Pi dispatches a small task through `swival-subagent`, the structured tool block renders inline, file is verified.
-- `demo-reviewer.gif` (~150s) — the reviewer-loop differentiator. Pi loads the `swival` skill, dispatches `reviewed-worker`, swival's reviewer iterates until the contract is satisfied, then `report.json` is inspected.
+- `demo-reviewer.gif` (~150s) — the reviewer-loop differentiator. Pi loads the `swival` skill, dispatches `self-review-worker`, swival's reviewer iterates until the contract is satisfied, then `report.json` is inspected.
 
 Regenerate with `make -C demo` (requires [`vhs`](https://github.com/charmbracelet/vhs), `pi`, `swival`, and an LLM provider configured for swival).
 
