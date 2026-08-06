@@ -214,6 +214,25 @@ export function isMutatingCwdAgent(agent: SwivalAgentConfig): boolean {
 }
 
 /**
+ * Diagnostic for a dispatch naming an agent that is not in the discovered
+ * roster. Enumerates the roster that resolution just scanned — bundled, user
+ * (`~/.pi/agent/swival-agents/`), and project (`.pi/swival-agents/`) scope,
+ * after collision precedence — so the caller can retry from the same message.
+ * `swival-subagent` has no listing action, and an agent name that was guessed
+ * by analogy with another agent's name will otherwise fail with no hint.
+ *
+ * Called only on the failure branch; the success path pays nothing.
+ */
+export function unknownAgentMessage(agentName: string, agents: SwivalAgentConfig[]): string {
+	const available =
+		agents
+			.map((a) => a.name)
+			.sort((a, b) => a.localeCompare(b))
+			.join(", ") || "none";
+	return `Unknown swival agent: "${agentName}". Available: ${available}`;
+}
+
+/**
  * Validate that an agent declaring `requiresReviewer: true` actually has a
  * reviewer attached for this call. Returns an error string when the gate
  * fails, or undefined when the call is allowed to proceed. Both frontmatter
@@ -1190,8 +1209,7 @@ async function runSingleSwivalAsync(
 ): Promise<{ runId: string; artifactDir: string }> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		throw new Error(`Unknown swival agent: "${agentName}". Available: ${available}`);
+		throw new Error(unknownAgentMessage(agentName, agents));
 	}
 	const reviewerError = checkRequiresReviewer(agent, overrides);
 	if (reviewerError) {
@@ -1310,16 +1328,19 @@ async function runSingleSwival(
 ): Promise<SwivalResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		const message = unknownAgentMessage(agentName, agents);
 		return {
 			agent: agentName,
 			agentSource: "unknown",
 			task,
 			exitCode: 1,
 			finalOutput: "",
-			stderrTail: [`Unknown swival agent: "${agentName}". Available: ${available}`],
+			stderrTail: [message],
 			durationMs: 0,
-			errorMessage: `Unknown swival agent: "${agentName}"`,
+			// The roster belongs in errorMessage, not just stderrTail: the failure
+			// headline rendered to the caller is built from errorMessage.
+			errorMessage: message,
+			reason: { code: "config_error", text: message },
 		};
 	}
 	const reviewerError = checkRequiresReviewer(agent, overrides);

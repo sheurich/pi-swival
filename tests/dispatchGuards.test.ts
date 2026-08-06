@@ -3,6 +3,7 @@ import {
 	checkRequiresReviewer,
 	isMutatingCwdAgent,
 	READ_ONLY_AUDIT_COMMANDS,
+	unknownAgentMessage,
 } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
@@ -92,5 +93,32 @@ describe("checkRequiresReviewer", () => {
 		expect(
 			checkRequiresReviewer(makeAgent({ requiresReviewer: true }), { selfReview: true }),
 		).toBeUndefined();
+	});
+});
+
+describe("unknownAgentMessage", () => {
+	it("enumerates the scanned roster in sorted order", () => {
+		const msg = unknownAgentMessage("explorer", [
+			makeAgent({ name: "self-review-worker" }),
+			makeAgent({ name: "audit-worker" }),
+			makeAgent({ name: "sandboxed-explorer" }),
+		]);
+		expect(msg).toBe(
+			'Unknown swival agent: "explorer". Available: audit-worker, sandboxed-explorer, self-review-worker',
+		);
+	});
+
+	it("includes project- and bundled-scope agents", () => {
+		const msg = unknownAgentMessage("nope", [
+			makeAgent({ name: "swival", source: "bundled" }),
+			makeAgent({ name: "repo-local", source: "project" }),
+		]);
+		expect(msg).toMatch(/Available: repo-local, swival$/);
+	});
+
+	it("says none when discovery found no agents", () => {
+		expect(unknownAgentMessage("explorer", [])).toBe(
+			'Unknown swival agent: "explorer". Available: none',
+		);
 	});
 });
