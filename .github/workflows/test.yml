@@ -24,7 +24,9 @@ jobs:
           node-version: ${{ matrix.node-version }}
 
       - name: Install Pi globally
-        run: npm install -g @earendil-works/pi-coding-agent@^1
+        env:
+          PI_VERSION: ${{ matrix.node-version == '20' && 'legacy-node20' || 'latest' }}
+        run: npm install -g "@earendil-works/pi-coding-agent@$PI_VERSION"
 
       - name: Smoke test
         run: ./scripts/smoke-test.sh
