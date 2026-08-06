@@ -1,11 +1,8 @@
-# pi-swival reviewer-loop demo — render with `vhs demo/demo-reviewer.tape`
+# pi-swival reviewer-loop demo
 #
-# 90–120s walkthrough showing the headline pi-swival feature: swival's
-# reviewer loop. Pi delegates to a self-review-worker agent which iterates
-# until a fresh-context reviewer accepts the answer.
-#
-# Compare to demo-quick.tape, which uses the no-review default agent.
-# Requires: vhs, pi, swival, an LLM provider configured for swival.
+# Render through `make -C demo reviewer`. demo/record.sh supplies a disposable
+# HOME, a clean checkout, selected provider credentials, and the
+# pi-swival extension as the only loaded resource.
 
 Output demo/demo-reviewer.gif
 Output demo/demo-reviewer.mp4
@@ -15,46 +12,36 @@ Set FontSize 14
 Set Width 1280
 Set Height 760
 Set Theme "Dracula"
-Set TypingSpeed 30ms
+Set TypingSpeed 25ms
 Set WindowBar Colorful
 Set Padding 16
 Set Margin 16
 Set MarginFill "#0a0a14"
-Set WaitTimeout 60s
+Set WaitTimeout 240s
 
-# ---------- Setup (hidden) ----------
+# Enter the disposable workspace without recording its generated path.
 Hide
-Type "rm -rf /tmp/swival-demo && mkdir /tmp/swival-demo && cd /tmp/swival-demo && clear"
+Type `mkdir -p "$PI_SWIVAL_DEMO_REPO/workspace" && cd "$PI_SWIVAL_DEMO_REPO/workspace" && clear`
 Enter
 Sleep 500ms
 Show
 
-# ---------- 1. Frame the demo ----------
-Type "# pi-swival reviewer loop — swival iterates until a reviewer accepts"
+Type "# pi-swival: Swival implements, reviews, and verifies before returning"
 Enter
 Sleep 1500ms
-
-Type "# Each round runs in a fresh reviewer context. Output is structured."
+Type "printf 'Pi '; pi --version"
 Enter
 Sleep 2s
 
-# ---------- 2. Open Pi and dispatch through self-review-worker ----------
-Type "pi --thinking off --no-session"
+Type "pi-swival-demo reviewer"
 Enter
 Sleep 4s
 
-Type@40ms `Use swival-subagent with agent: "self-review-worker" and task: "Create greet.py with greet(name: str) -> str returning 'Hello, ' + name + '!'. Also test_greet.py with one pytest case asserting greet('world') == 'Hello, world!'. Reviewer must verify both files exist and pytest passes."`
+Type@30ms `Use swival-subagent with agent "self-review-worker", agentScope "user", and task: "Create greet.py with greet(name: str) -> str returning 'Hello, ' + name + '!'. Create test_greet.py with one pytest test asserting greet('world') == 'Hello, world!'. Run python3 -m pytest -q before finishing." Do not call any other tool.`
 Sleep 1s
 Enter
-
-# A self-review-worker dispatch typically takes 60–120s. 100s lets the
-# round-trip finish and the structured tool block render fully on screen.
-Sleep 100s
-
-# ---------- 3. Show the artifact JSON, in-session ----------
-Type@40ms `Run this jq invocation and paste the output verbatim: jq '{outcome: .result.outcome, rounds: .stats.review_rounds, tools: .stats.tool_calls_total, llm_time_s: .stats.total_llm_time_s}' "$(ls -td ~/.pi/agent/swival-artifacts/self-review-worker-* | head -1)/report.json"`
-Sleep 1s
+Wait+Screen /Reviewer complete\./
+Sleep 4s
+Type "/quit"
 Enter
-
-# Wait for the JSON output to render
-Sleep 20s
+Sleep 2s

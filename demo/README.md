@@ -1,35 +1,52 @@
 # pi-swival demos
 
-Two short videos that show the package end-to-end inside Pi.
+These live recordings run Pi and pi-swival without mocks.
 
 | Demo | Length | What it shows |
 |------|-------:|---------------|
-| [`demo-quick`](demo-quick.gif) | ~60s | Pi loads pi-swival, dispatches a trivial task through `swival-subagent`, shows the structured tool block, verifies the produced file. Use this as the headline shareable. |
-| [`demo-reviewer`](demo-reviewer.gif) | ~150s | The reviewer-loop differentiator. Pi consults the `swival` skill, dispatches `self-review-worker`, swival's reviewer iterates until the contract is satisfied, then Pi reads `report.json` and shows `outcome`, `rounds`, `tools`, `llm_time_s`. |
+| [`demo-quick`](demo-quick.gif) | ~30s | An intentional `review-worker` typo returns the seven discovered bundled agents, giving Pi the exact name needed for a retry. This is the headline README demo. |
+| [`demo-reviewer`](demo-reviewer.gif) | ~75s | `self-review-worker` creates two Python files, runs pytest, and completes after Swival's reviewer accepts the result. |
 
-Both files render to GIF and MP4. Embed the GIF in READMEs; share the MP4 for higher-fidelity playback.
+Each recording is available as GIF and MP4. Use the GIF in Markdown and the MP4 for higher-fidelity playback.
+
+## Safe recording environment
+
+Run recordings through `record.sh`, not `vhs` directly. The script:
+
+- archives the current `HEAD` into a disposable checkout;
+- creates a disposable home containing only the selected Pi and Swival credentials plus an explicit Swival provider/model pair;
+- starts Pi under `env -i` with ambient extensions, skills, prompts, themes, context files, and built-in tools disabled;
+- loads only `pi-swival`'s extension and allows only `swival-subagent`;
+- removes the temporary checkout, home, and launcher on exit.
+
+The tapes show only neutral temporary paths. They do not display local resource inventories, credential values, or artifact directories.
 
 ## Regenerate
 
-```bash
-# Both demos
-make -C demo
+Requirements:
 
-# Just one
-vhs demo/demo-quick.tape
-vhs demo/demo-reviewer.tape
+- [`vhs`](https://github.com/charmbracelet/vhs), `pi`, `swival`, `git`, `jq`, `node`, `npm`, `python3`, `tar`, and Bash on `PATH`;
+- Pi auth-file entries for the selected Pi and Swival providers;
+- `shellcheck` when running `make -C demo check`.
+
+Set both provider/model pairs, then run Make:
+
+```bash
+PI_SWIVAL_DEMO_PROVIDER="$PI_PROVIDER" \
+PI_SWIVAL_DEMO_MODEL="$PI_MODEL" \
+PI_SWIVAL_DEMO_SWIVAL_PROVIDER="$SWIVAL_PROVIDER" \
+PI_SWIVAL_DEMO_SWIVAL_MODEL="$SWIVAL_MODEL" \
+make -C demo
 ```
 
-Each tape is a real recording — no mocks. Re-running them costs an LLM round-trip per dispatch (the reviewer demo costs more because of multiple rounds).
+If either auth-file key differs from its provider name, set `PI_SWIVAL_DEMO_AUTH_PROVIDER` or `PI_SWIVAL_DEMO_SWIVAL_AUTH_PROVIDER`. The `chatgpt` Swival provider requires an OAuth Pi auth entry. Other supported Swival providers require an API-key entry. Set `PI_SWIVAL_DEMO_SWIVAL_BASE_URL` only when the selected provider needs an explicit endpoint. Recording data defaults to `/tmp`; set `PI_SWIVAL_DEMO_TMPDIR` only to another neutral path because Pi displays the working directory.
 
-## Requirements
+`record.sh` compares `pi --version` with npm's latest published version and refuses to record if they differ. Rendering uses live model calls. The quick demo makes one Pi call; the reviewer demo also runs Swival's self-review loop.
 
-- [`vhs`](https://github.com/charmbracelet/vhs) for rendering
-- `pi`, `swival`, `jq`, `bash` on PATH
-- An LLM provider configured for swival (see [`skills/swival/references/setup.md`](../skills/swival/references/setup.md))
+Validate the harness and both tapes without model calls:
 
-## Why two demos
+```bash
+make -C demo check
+```
 
-The headline for pi-swival is the reviewer loop. But a 150-second demo is a hard sell on a README that scrolls past. The 60-second variant is for the embed; the long one is for anyone who wants to see the iteration play out.
-
-For the full pipeline including AgentFS sandboxing and the audit prompt template, see the step-by-step walkthrough in [`../examples/demo.md`](../examples/demo.md).
+For the full pipeline, including AgentFS sandboxing and the audit prompt template, see [`../examples/demo.md`](../examples/demo.md).

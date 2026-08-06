@@ -139,10 +139,10 @@ The golden fixtures under `tests/fixtures/` are the source of truth for the swiv
 
 Two recordings under [`demo/`](demo/):
 
-- `demo-quick.gif` (~60s) — the headline shareable embedded above. Pi dispatches a small task through `swival-subagent`, the structured tool block renders inline, file is verified.
-- `demo-reviewer.gif` (~150s) — the reviewer-loop differentiator. Pi loads the `swival` skill, dispatches `self-review-worker`, swival's reviewer iterates until the contract is satisfied, then `report.json` is inspected.
+- `demo-quick.gif` (~30s) shows an intentional unknown-agent dispatch returning the seven discovered bundled agents. This is the headline demo embedded above.
+- `demo-reviewer.gif` (~75s) shows `self-review-worker` creating and testing two Python files before Swival's reviewer accepts the result.
 
-Regenerate with `make -C demo` (requires [`vhs`](https://github.com/charmbracelet/vhs), `pi`, `swival`, and an LLM provider configured for swival).
+Regenerate with `make -C demo`. The recording harness uses a disposable checkout and home, disables ambient Pi resources, and refuses to run unless the installed Pi matches npm's latest release. See [`demo/README.md`](demo/README.md) for requirements and environment variables.
 
 For a longer step-by-step tour covering AgentFS sandboxing and the `/swival-audit` prompt template, see [`examples/demo.md`](examples/demo.md).
 
