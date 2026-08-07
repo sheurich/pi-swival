@@ -46,6 +46,7 @@ command -v fd >/dev/null
 [[ " ${*} " == *" --no-context-files "* ]]
 [[ " ${*} " == *" --no-builtin-tools "* ]]
 [[ " ${*} " == *" --tools swival-subagent "* ]]
+[[ " ${*} " == *" --system-prompt Call only the requested tool. After it returns, respond exactly: Fix reviewed and tests pass. "* ]]
 STUB
 chmod +x "$TMP/bin/pi"
 
@@ -69,6 +70,16 @@ exit 0
 STUB
 chmod +x "$TMP/bin/fd"
 
+cat > "$TMP/bin/python3" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "-m pytest --version" ]]; then
+  touch "$PYTEST_PREFLIGHT_MARKER"
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin/python3"
+
 cat > "$TMP/bin/vhs" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -81,6 +92,10 @@ grep -q '^model = "review-model"$' "$PI_SWIVAL_DEMO_HOME/.config/swival/config.t
 ! grep -R -q -E 'must-not-copy|unused-provider' "$PI_SWIVAL_DEMO_HOME"
 [[ "$PI_SWIVAL_DEMO_REPO" == "$VHS_TEST_TMP"/pi-swival-recording-repo.* ]]
 [[ -f "$PI_SWIVAL_DEMO_REPO/extensions/index.ts" ]]
+grep -q 'apply_discount' "$1"
+grep -q 'self-review-worker' "$1"
+grep -q 'Fix reviewed and tests pass' "$1"
+[[ "$(grep -c 'python3 -m pytest -q' "$1")" -eq 3 ]]
 mkdir -p "$PI_SWIVAL_DEMO_REPO/workspace"
 cd "$PI_SWIVAL_DEMO_REPO/workspace"
 pi-swival-demo quick
@@ -98,12 +113,14 @@ PI_SWIVAL_DEMO_SWIVAL_MODEL="review-model" \
 VHS_TEST_MARKER="$MARKER" \
 VHS_TEST_TMP="$TMP/runtime" \
 PI_SWIVAL_DEMO_TMPDIR="$TMP/runtime" \
+PYTEST_PREFLIGHT_MARKER="$TMP/pytest-preflight-ran" \
 TMPDIR="$TMP/ambient" \
 PATH="$TMP/bin:$TMP/private-bin:$PATH" \
 VHS="vhs" \
 "$RECORD" "$ROOT/demo/demo-quick.tape"
 
 [[ -f "$MARKER" ]]
+[[ -f "$TMP/pytest-preflight-ran" ]]
 if find "$TMP/runtime" -mindepth 1 -maxdepth 1 -name 'pi-swival-recording-*' -print -quit | grep -q .; then
   echo "recording temporary directories were not removed" >&2
   exit 1
