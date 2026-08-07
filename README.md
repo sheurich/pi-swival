@@ -139,7 +139,7 @@ The golden fixtures under `tests/fixtures/` are the source of truth for the swiv
 
 Two recordings under [`demo/`](demo/):
 
-- `demo-quick.gif` (~30s) shows an intentional unknown-agent dispatch returning the seven discovered bundled agents. This is the headline demo embedded above.
+- `demo-quick.gif` (~70s) shows a failing pytest run, a delegated repair via `self-review-worker`, reviewer acceptance, and the same tests passing. This is the headline demo embedded above.
 - `demo-reviewer.gif` (~75s) shows `self-review-worker` creating and testing two Python files before Swival's reviewer accepts the result.
 
 Regenerate with `make -C demo`. The recording harness uses a disposable checkout and home, disables ambient Pi resources, and refuses to run unless the installed Pi matches npm's latest release. See [`demo/README.md`](demo/README.md) for requirements and environment variables.

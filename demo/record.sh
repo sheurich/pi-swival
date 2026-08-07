@@ -49,6 +49,11 @@ for command in git jq node npm pi python3 swival tar "$VHS_BIN"; do
   fi
 done
 
+if ! python3 -m pytest --version >/dev/null 2>&1; then
+  echo "pytest is required but unavailable via python3 -m pytest; install pytest before recording" >&2
+  exit 1
+fi
+
 INSTALLED_PI="$(pi --version 2>&1 | tail -n 1 | tr -d '\r')"
 LATEST_PI="$(npm view @earendil-works/pi-coding-agent version)"
 if [[ "$INSTALLED_PI" != "$LATEST_PI" ]]; then
@@ -151,7 +156,7 @@ BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 case "${1:-}" in
   quick)
-    SYSTEM_PROMPT='Call only the requested tool. After its error, respond exactly: Roster received. The available names make the next dispatch correct.'
+    SYSTEM_PROMPT='Call only the requested tool. After it returns, respond exactly: Fix reviewed and tests pass.'
     ;;
   reviewer)
     SYSTEM_PROMPT='Call only the requested tool. After it returns, respond exactly: Reviewer complete.'

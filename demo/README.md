@@ -4,7 +4,7 @@ These live recordings run Pi and pi-swival without mocks.
 
 | Demo | Length | What it shows |
 |------|-------:|---------------|
-| [`demo-quick`](demo-quick.gif) | ~30s | An intentional `review-worker` typo returns the seven discovered bundled agents, giving Pi the exact name needed for a retry. This is the headline README demo. |
+| [`demo-quick`](demo-quick.gif) | ~70s | A failing pytest run, a delegated repair via `self-review-worker`, reviewer acceptance, and the same tests passing. This is the headline README demo. |
 | [`demo-reviewer`](demo-reviewer.gif) | ~75s | `self-review-worker` creates two Python files, runs pytest, and completes after Swival's reviewer accepts the result. |
 
 Each recording is available as GIF and MP4. Use the GIF in Markdown and the MP4 for higher-fidelity playback.
@@ -25,7 +25,7 @@ The tapes show only neutral temporary paths. They do not display local resource 
 
 Requirements:
 
-- [`vhs`](https://github.com/charmbracelet/vhs), `pi`, `swival`, `git`, `jq`, `node`, `npm`, `python3`, `tar`, and Bash on `PATH`;
+- [`vhs`](https://github.com/charmbracelet/vhs), `pi`, `swival`, `git`, `jq`, `node`, `npm`, `python3` (with `pytest` installed), `tar`, and Bash on `PATH`;
 - Pi auth-file entries for the selected Pi and Swival providers;
 - `shellcheck` when running `make -C demo check`.
 
@@ -41,7 +41,7 @@ make -C demo
 
 If either auth-file key differs from its provider name, set `PI_SWIVAL_DEMO_AUTH_PROVIDER` or `PI_SWIVAL_DEMO_SWIVAL_AUTH_PROVIDER`. The `chatgpt` Swival provider requires an OAuth Pi auth entry. Other supported Swival providers require an API-key entry. Set `PI_SWIVAL_DEMO_SWIVAL_BASE_URL` only when the selected provider needs an explicit endpoint. Recording data defaults to `/tmp`; set `PI_SWIVAL_DEMO_TMPDIR` only to another neutral path because Pi displays the working directory.
 
-`record.sh` compares `pi --version` with npm's latest published version and refuses to record if they differ. Rendering uses live model calls. The quick demo makes one Pi call; the reviewer demo also runs Swival's self-review loop.
+`record.sh` compares `pi --version` with npm's latest published version and refuses to record if they differ. Rendering uses live model calls. Each demo starts one Pi session and one Swival self-review run, so cost and duration vary by model.
 
 Validate the harness and both tapes without model calls:
 
