@@ -91,6 +91,8 @@ describe("trace status and liveness", () => {
 	it.each([
 		["exited from marker", state({ completed: true }), undefined, "exited"],
 		["exited from memory", state({ inMemory: "exited" }), undefined, "exited"],
+		["exited from child exitCode", state({ inMemory: "live", exitCode: 0 }), undefined, "exited"],
+		["exited from child signalCode", state({ inMemory: "live", signalCode: "SIGTERM" }), undefined, "exited"],
 		["live in memory", state({ inMemory: "live" }), undefined, "running"],
 		["live corroborated pid", state(), async () => 1_000_001, "running"],
 		["unknown without pid", state({ pid: undefined }), undefined, "unknown"],

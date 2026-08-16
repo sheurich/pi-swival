@@ -118,6 +118,21 @@ interface AsyncRunEntry {
 	exitCode: number | null;
 }
 
+interface BackgroundWorkProvider {
+	name: string;
+	wakeChannels: readonly string[];
+	listActiveWork(): readonly { id: string; sessionId: string }[];
+	reconcile?: (context: { sessionId: string; nowMs: number }) => void;
+}
+
+type RegisterBackgroundWorkProvider = (provider: BackgroundWorkProvider) => () => void;
+
+interface ExtensionWiringDeps {
+	startReconciler?: typeof startSwivalReconciler;
+	registerBackgroundWorkProvider?: RegisterBackgroundWorkProvider;
+	loadBackgroundWorkProvider?: () => Promise<RegisterBackgroundWorkProvider>;
+}
+
 export function mapSwivalActiveWork(
 	entries: readonly { meta: Pick<RunMeta, "runId" | "sessionId">; exited: boolean }[],
 	sessionId: string,
@@ -170,8 +185,12 @@ async function prepareCache(agent: SwivalAgentConfig, cwd: string, overrides: Sw
 	await ensureCacheGuard(resolved.dir, baseDir);
 }
 
+export function isSwivalPreflightDisabled(value: string | undefined = process.env.PI_SWIVAL_NO_PREFLIGHT): boolean {
+	return /^(?:1|true)$/i.test(value ?? "");
+}
+
 async function runCredentialPreflight(agent: SwivalAgentConfig, overrides: SwivalOverrides): Promise<string | undefined> {
-	if (process.env.PI_SWIVAL_NO_PREFLIGHT) return undefined;
+	if (isSwivalPreflightDisabled()) return undefined;
 	const result = await credentialPreflight({
 		provider: overrides.provider ?? agent.provider,
 		baseUrl: overrides.baseUrl ?? agent.baseUrl,
@@ -1203,7 +1222,7 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 			} catch { continue; }
 			const text = await fs.promises.readFile(metaPath, "utf-8");
 			const parsed = JSON.parse(text) as Record<string, unknown>;
-			// Fix 10: validate expected fields before trusting the object.
+			// Validate expected fields before trusting the object.
 			if (
 				typeof parsed.runId !== "string" ||
 				typeof parsed.artifactDir !== "string" ||
@@ -1239,7 +1258,7 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 }
 
 /**
- * Fix 8: Unified run-state loader used by all three control actions.
+ * Unified run-state loader used by all three control actions.
  *
  * Checks the in-memory `asyncRuns` Map first (fast path for same-session
  * queries). If the run is not there — or Pi was restarted — falls back to
@@ -1331,13 +1350,15 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 			pid: entry.meta.pid,
 			completed: completed !== undefined,
 			inMemory: entry.exited ? "exited" : "live",
+			exitCode: entry.proc.exitCode,
+			signalCode: entry.proc.signalCode,
 		});
 		return {
 			meta: entry.meta,
 			entry,
 			liveness,
 			exited: liveness === "exited",
-			exitCode: completed?.exitCode ?? entry.exitCode,
+			exitCode: completed?.exitCode ?? entry.proc.exitCode ?? entry.exitCode,
 			completed,
 		};
 	}
@@ -1369,6 +1390,42 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 }
 
 // ------------------------------------------------ async (background) --
+
+export function attachAsyncRunListeners(
+	proc: ChildProcess,
+	entry: AsyncRunEntry,
+	onFinish: (meta: RunMeta, exitCode: number | null) => void,
+): void {
+	const ASYNC_RUN_TTL_MS = 60 * 60 * 1000;
+	let completed = false;
+	const finish = async (exitCode: number | null, error?: Error) => {
+		if (completed) return;
+		completed = true;
+		entry.exited = true;
+		entry.exitCode = exitCode;
+		if (error) {
+			try {
+				await fs.promises.writeFile(
+					path.join(entry.meta.artifactDir, "spawn-error.txt"),
+					`swival failed to start: ${error.message}`,
+					"utf-8",
+				);
+			} catch { /* best-effort */ }
+		}
+		const marker: CompletedMarker = { exitCode, exitedAt: new Date().toISOString() };
+		try {
+			await fs.promises.writeFile(
+				path.join(entry.meta.artifactDir, "completed.json"),
+				JSON.stringify(marker, null, 2),
+				"utf-8",
+			);
+		} catch { /* onFinish must still run */ }
+		onFinish(entry.meta, exitCode);
+		setTimeout(() => { asyncRuns.delete(entry.meta.runId); }, ASYNC_RUN_TTL_MS).unref?.();
+	};
+	proc.on("close", (code) => { void finish(code); });
+	proc.on("error", (error) => { void finish(null, error); });
+}
 
 /**
  * Spawn a swival run in the background (detached process). Returns immediately
@@ -1443,8 +1500,6 @@ async function runSingleSwivalAsync(
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		try { fs.closeSync(stderrFd!); } catch { /* ignore */ }
 	}
-	proc.unref();
-
 	const meta: RunMeta = {
 		runId,
 		agent: agentName,
@@ -1456,48 +1511,17 @@ async function runSingleSwivalAsync(
 		stdoutFile,
 		stderrFile,
 	};
+	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
+	asyncRuns.set(runId, entry);
+	// Register both listeners before unref and before any await. ChildProcess can
+	// report both error and close for one failed spawn, so completion is guarded.
+	attachAsyncRunListeners(proc, entry, onFinish);
+	proc.unref();
 	await fs.promises.writeFile(
 		path.join(artifactDir, "run-meta.json"),
 		JSON.stringify(meta, null, 2),
 		"utf-8",
 	);
-
-	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
-	asyncRuns.set(runId, entry);
-
-	// TTL after which we remove a completed run from the in-memory map;
-	// long enough that same-session status/resume queries still work.
-	const ASYNC_RUN_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-	// Fix 6: write completed.json on close so cross-session fallback can
-	// determine whether the run finished without relying on process.kill probes.
-	// Fix 3: schedule asyncRuns.delete after 1 h (TTL).
-	proc.on("close", (code) => {
-		const e = asyncRuns.get(runId);
-		if (e) { e.exited = true; e.exitCode = code; }
-		const marker: CompletedMarker = { exitCode: code, exitedAt: new Date().toISOString() };
-		fs.promises
-			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.then(() => onFinish(meta, code), () => { /* best-effort */ });
-		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
-	});
-
-	// Fix 5: capture spawn errors (e.g. ENOENT when swival is not on PATH)
-	// and persist them so status/resume can report the failure clearly.
-	// Fix 6: also write completed.json so cross-session tools see it as done.
-	// Fix 3: schedule asyncRuns.delete after TTL.
-	proc.on("error", (err) => {
-		const e = asyncRuns.get(runId);
-		if (e) { e.exited = true; }
-		fs.promises
-			.writeFile(path.join(artifactDir, "spawn-error.txt"), `swival failed to start: ${err.message}`, "utf-8")
-			.catch(() => { /* best-effort */ });
-		const marker: CompletedMarker = { exitCode: null, exitedAt: new Date().toISOString() };
-		fs.promises
-			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.then(() => onFinish(meta, null), () => { /* best-effort */ });
-		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
-	});
 
 	return { runId, artifactDir };
 }
@@ -2194,31 +2218,38 @@ export function buildParallelSummary(
 	return [header, "", ...blocks].join("\n");
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {}) {
 	let currentSessionId: string | undefined;
 	let stopReconciler: (() => void) | undefined;
 	let backgroundWorkDisposer: (() => void) | undefined;
 	let notifier: SwivalNotifier | undefined;
+	let sessionGeneration = 0;
 
 	pi.on("session_start", async (_event, ctx) => {
+		const generation = ++sessionGeneration;
+		stopReconciler?.();
+		stopReconciler = undefined;
+		backgroundWorkDisposer?.();
+		backgroundWorkDisposer = undefined;
+		notifier = undefined;
 		currentSessionId = ctx.sessionManager.getSessionId();
 		notifier = createSwivalNotifier(pi, { currentSessionId });
-		stopReconciler = startSwivalReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
+		const startReconciler = wiringDeps.startReconciler ?? startSwivalReconciler;
+		stopReconciler = startReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
 		try {
-			const moduleName = "pi-subagents/background-work";
-			const module = await import(moduleName) as {
-				registerBackgroundWorkProvider(provider: {
-					name: string;
-					wakeChannels: readonly string[];
-					listActiveWork(): readonly { id: string; sessionId: string }[];
-					reconcile?: (context: { sessionId: string; nowMs: number }) => void;
-				}): () => void;
-			};
+			let registerBackgroundWorkProvider = wiringDeps.registerBackgroundWorkProvider;
+			if (!registerBackgroundWorkProvider) {
+				if (wiringDeps.loadBackgroundWorkProvider) {
+					registerBackgroundWorkProvider = await wiringDeps.loadBackgroundWorkProvider();
+				} else {
+					const moduleName = "pi-subagents/background-work";
+					const module = await import(moduleName) as { registerBackgroundWorkProvider: RegisterBackgroundWorkProvider };
+					registerBackgroundWorkProvider = module.registerBackgroundWorkProvider;
+				}
+			}
+			if (generation !== sessionGeneration) return;
 			// Registration makes live runs count as active work for subagent_wait.
-			// Residual limit: subagent_wait resolves subagent run ids only, so
-			// { id: "<swival run id>" } still will not resolve. {} and
-			// { all: true } do block on swival work.
-			backgroundWorkDisposer = module.registerBackgroundWorkProvider({
+			backgroundWorkDisposer = registerBackgroundWorkProvider({
 				name: "pi-swival",
 				wakeChannels: ["pi-swival:run-finished"],
 				listActiveWork: () => currentSessionId ? mapSwivalActiveWork([...asyncRuns.values()], currentSessionId) : [],
@@ -2230,6 +2261,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionGeneration += 1;
 		stopReconciler?.();
 		stopReconciler = undefined;
 		backgroundWorkDisposer?.();
@@ -2437,7 +2469,8 @@ export default function (pi: ExtensionAPI) {
 					const finalOutput = (report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
 					const feedback = report?.lastReviewFeedback;
 					const outcome = report?.outcome ?? "unknown";
-					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
+					const possiblyIncomplete = state.liveness === "unknown" ? " (possibly incomplete)" : "";
+					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}${possiblyIncomplete}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
 					if (feedback) text += `\n\n─── reviewer feedback ───\n${feedback}`;
 					return {
 						content: [{ type: "text", text }],

@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 import { classifyFailure, isRunFailure, summarizeReport } from "../extensions/index.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// Fixture provenance: both JSON files were introduced by commit ac55843 as test
+// fixtures; history does not establish whether they were live captures or
+// synthetic, so they are regression fixtures rather than authoritative traces.
 const loadFixture = (name: string): Record<string, unknown> =>
 	JSON.parse(fs.readFileSync(path.join(here, "fixtures", name), "utf-8")) as Record<string, unknown>;
 

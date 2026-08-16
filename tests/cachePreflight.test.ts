@@ -5,12 +5,21 @@ import { credentialPreflight } from "../extensions/preflight.js";
 const env = {};
 
 describe("cache resolution", () => {
-	it("uses a stable extension-owned path outside the repository", () => {
-		const a = resolveCacheDir({ baseDir: "/work/repo", stateRoot: "/state", env });
-		const b = resolveCacheDir({ baseDir: "/work/repo", stateRoot: "/state", env });
-		expect(a.dir).toBe(b.dir);
-		expect(a.dir.startsWith("/work/repo/")).toBe(false);
-		expect(a.dir).toContain("repo-");
+	it("uses a stable, repo-specific extension-owned path outside each repository", () => {
+		const firstRepo = "/work/repo-one";
+		const secondRepo = "/work/repo-two";
+		const first = resolveCacheDir({ baseDir: firstRepo, stateRoot: "/state", env });
+		const firstAgain = resolveCacheDir({ baseDir: firstRepo, stateRoot: "/state", env });
+		const second = resolveCacheDir({ baseDir: secondRepo, stateRoot: "/state", env });
+
+		expect(first.dir).toBe(firstAgain.dir);
+		expect(first.dir).not.toBe(second.dir);
+		expect(first.dir).not.toBe(firstRepo);
+		expect(second.dir).not.toBe(secondRepo);
+		expect(first.dir.startsWith(`${firstRepo}/`)).toBe(false);
+		expect(second.dir.startsWith(`${secondRepo}/`)).toBe(false);
+		expect(first.dir).toContain("repo-one-");
+		expect(second.dir).toContain("repo-two-");
 	});
 	it("applies override, frontmatter, environment precedence", () => {
 		expect(resolveCacheDir({ baseDir: "/repo", cacheDirOverride: "/call", agentCacheDir: "/agent", env: { PI_SWIVAL_CACHE_DIR: "/env" } }).dir).toBe("/call");

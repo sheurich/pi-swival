@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { mintArtifactDir, mapSwivalActiveWork } from "../extensions/index.js";
+import { attachAsyncRunListeners, mintArtifactDir, mapSwivalActiveWork } from "../extensions/index.js";
 import { createSwivalNotifier } from "../extensions/notify.js";
 
 const tempDirs: string[] = [];
@@ -14,12 +15,47 @@ function tempDir(): string {
 
 afterEach(() => {
 	vi.useRealTimers();
+	vi.restoreAllMocks();
 	for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 function fakePi(sendMessage: (message: unknown, options: unknown) => void) {
 	return { sendMessage } as never;
 }
+
+describe("async process completion", () => {
+	it("attaches completion listeners before unref and the first post-spawn await", () => {
+		const source = fs.readFileSync(new URL("../extensions/index.ts", import.meta.url), "utf-8");
+		const functionStart = source.indexOf("async function runSingleSwivalAsync");
+		const spawnAt = source.indexOf('proc = spawn("swival"', functionStart);
+		const listenersAt = source.indexOf("attachAsyncRunListeners(proc, entry, onFinish)", spawnAt);
+		const unrefAt = source.indexOf("proc.unref()", spawnAt);
+		const awaitAt = source.indexOf("await ", spawnAt);
+
+		expect(functionStart).toBeGreaterThanOrEqual(0);
+		expect(spawnAt).toBeGreaterThan(functionStart);
+		expect(listenersAt).toBeGreaterThan(spawnAt);
+		expect(listenersAt).toBeLessThan(unrefAt);
+		expect(listenersAt).toBeLessThan(awaitAt);
+	});
+
+	it("finishes once on error and close even when completed marker writing fails", async () => {
+		const process = new EventEmitter() as EventEmitter & { exitCode: number | null; signalCode: NodeJS.Signals | null };
+		process.exitCode = null;
+		process.signalCode = null;
+		const meta = { runId: "run", agent: "a", task: "t", startedAt: Date.now(), pid: 123, artifactDir: tempDir(), stdoutFile: "stdout", stderrFile: "stderr" };
+		const finish = vi.fn();
+		vi.spyOn(fs.promises, "writeFile").mockRejectedValue(new Error("disk full"));
+		attachAsyncRunListeners(process as never, { meta, proc: process as never, exited: false, exitCode: null }, finish);
+		expect(process.listenerCount("error")).toBe(1);
+		expect(process.listenerCount("close")).toBe(1);
+		process.emit("error", new Error("spawn failed"));
+		process.emit("close", 1);
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(finish).toHaveBeenCalledTimes(1);
+		expect(finish).toHaveBeenCalledWith(meta, null);
+	});
+});
 
 describe("async run identity", () => {
 	it("uses the artifact directory basename as runId", () => {
@@ -99,6 +135,23 @@ describe("swival completion notifier", () => {
 		expect(await second).toBe(true);
 		expect(fs.existsSync(path.join(dir, "notified.json"))).toBe(true);
 		expect(send).toHaveBeenCalledTimes(2);
+		notifier.dispose();
+	});
+
+	it("does not resend after acknowledgement when notified.json cannot be written", async () => {
+		vi.useFakeTimers();
+		const send = vi.fn();
+		const dir = tempDir();
+		vi.spyOn(fs.promises, "writeFile").mockRejectedValueOnce(new Error("read-only marker"));
+		const notifier = createSwivalNotifier(fakePi(send), { currentSessionId: "s", batchWindowMs: 0 });
+		const first = notifier.deliver({ runId: "marker-failure", agent: "a", artifactDir: dir, sessionId: "s", status: "completed" });
+		await vi.runAllTimersAsync();
+		expect(await first).toBe(false);
+		expect(send).toHaveBeenCalledTimes(1);
+		const second = notifier.deliver({ runId: "marker-failure", agent: "a", artifactDir: dir, sessionId: "s", status: "completed" });
+		await vi.runAllTimersAsync();
+		expect(await second).toBe(false);
+		expect(send).toHaveBeenCalledTimes(1);
 		notifier.dispose();
 	});
 

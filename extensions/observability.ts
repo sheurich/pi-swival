@@ -28,6 +28,8 @@ export interface LivenessInput {
 	pid?: number;
 	completed: boolean;
 	inMemory: "live" | "exited" | "none";
+	exitCode?: number | null;
+	signalCode?: NodeJS.Signals | null;
 }
 
 export interface LivenessOptions {
@@ -179,7 +181,7 @@ export function readProcessStartTime(pid: number): Promise<number | undefined> {
 }
 
 export async function classifyRunLiveness(input: LivenessInput, options: LivenessOptions = {}): Promise<RunLiveness> {
-	if (input.completed || input.inMemory === "exited") return "exited";
+	if (input.completed || input.inMemory === "exited" || input.exitCode !== null && input.exitCode !== undefined || input.signalCode !== null && input.signalCode !== undefined) return "exited";
 	if (input.inMemory === "live") return "running";
 	if (!input.pid || !Number.isInteger(input.pid) || input.pid < 2) return "unknown";
 	const isAlive = options.isAlive ?? ((pid: number) => {

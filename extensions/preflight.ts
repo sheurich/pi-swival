@@ -159,7 +159,7 @@ async function checkAdc(input: CredentialPreflightInput, provider: string): Prom
 			await fileSystem.readFile(explicit, "utf8");
 			return { status: "pass", provider };
 		} catch {
-			return failure(provider, `GOOGLE_APPLICATION_CREDENTIALS points at an unreadable file (${explicit})`, "correct the path or run `gcloud auth application-default login` and retry");
+			return failure(provider, "GOOGLE_APPLICATION_CREDENTIALS points at an unreadable file", "correct the path or run `gcloud auth application-default login` and retry");
 		}
 	}
 	try {

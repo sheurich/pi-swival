@@ -17,9 +17,6 @@ export interface SwivalCompletionSummary {
 export interface SwivalNotifierDeps {
 	currentSessionId: string;
 	batchWindowMs?: number;
-	now?: () => number;
-	setTimeout?: (handler: () => void, delay: number) => NodeJS.Timeout;
-	clearTimeout?: (timer: NodeJS.Timeout) => void;
 }
 
 export interface SwivalNotifier {
@@ -95,9 +92,6 @@ async function loadCompletedSummary(dir: string): Promise<SwivalCompletionSummar
  * the artifact marker is written only after Pi accepts the message.
  */
 export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps: SwivalNotifierDeps): SwivalNotifier {
-	const now = deps.now ?? Date.now;
-	const setTimer = deps.setTimeout ?? ((handler, delay) => setTimeout(handler, delay));
-	const clearTimer = deps.clearTimeout ?? ((timer) => clearTimeout(timer));
 	const batchWindowMs = deps.batchWindowMs ?? 1500;
 	const seen = new Map<string, number>();
 	const pending = new Map<string, { summary: SwivalCompletionSummary; resolve: (accepted: boolean) => void }>();
@@ -105,7 +99,7 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 	let disposed = false;
 
 	const trimSeen = () => {
-		const cutoff = now() - NOTIFY_TTL_MS;
+		const cutoff = Date.now() - NOTIFY_TTL_MS;
 		for (const [id, at] of seen) if (at <= cutoff) seen.delete(id);
 	};
 
@@ -137,14 +131,16 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 			return;
 		}
 		for (const entry of entries) {
+			seen.set(entry.summary.runId, Date.now());
+		}
+		for (const entry of entries) {
 			try {
 				await fs.promises.mkdir(entry.summary.artifactDir, { recursive: true });
 				await fs.promises.writeFile(
 					path.join(entry.summary.artifactDir, "notified.json"),
-					JSON.stringify({ notifiedAt: new Date(now()).toISOString() }),
+					JSON.stringify({ notifiedAt: new Date(Date.now()).toISOString() }),
 					"utf-8",
 				);
-				seen.set(entry.summary.runId, now());
 				entry.resolve(true);
 			} catch {
 				entry.resolve(false);
@@ -161,7 +157,7 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 		const existing = pending.get(summary.runId);
 		if (existing) {
 			if (summary.status !== "completed") void flush();
-			else if (!timer) timer = setTimer(() => { void flush(); }, batchWindowMs);
+			else if (!timer) timer = setTimeout(() => { void flush(); }, batchWindowMs);
 			return new Promise<boolean>((resolve) => {
 				const originalResolve = existing.resolve;
 				existing.resolve = (accepted) => { originalResolve(accepted); resolve(accepted); };
@@ -171,7 +167,7 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 		if (summary.status !== "completed") {
 			void flush();
 		} else if (!timer) {
-			timer = setTimer(() => { void flush(); }, batchWindowMs);
+			timer = setTimeout(() => { void flush(); }, batchWindowMs);
 		}
 		return result;
 	};
@@ -192,7 +188,7 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 		reconcile,
 		dispose: () => {
 			disposed = true;
-			if (timer) clearTimer(timer);
+			if (timer) clearTimeout(timer);
 			timer = undefined;
 			for (const entry of pending.values()) entry.resolve(false);
 			pending.clear();

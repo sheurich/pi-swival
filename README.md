@@ -57,8 +57,8 @@ Key features beyond pi's example subagent extension:
 - AgentFS sandbox (`sandbox: agentfs`, or per-call `isolation`) that captures writes in a per-session SQLite overlay.
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
-- Async / background runs with cross-session `status` / `resume` / `interrupt`, and a completion notice pushed into the caller's session.
-- A credential preflight that refuses to dispatch against an expired or missing provider credential.
+- Async / background runs with `status` / `resume` / `interrupt`, and a completion notice pushed into the caller's session.
+- Credential preflight for selected providers and local endpoints; indeterminate results do not block dispatch. It checks ChatGPT OAuth artifacts, Bedrock through AWS STS, Google ADC artifacts for `vertexai`/`geap`, and TCP reachability for configured `generic`/`lmstudio`/`llamacpp` base URLs. Providers such as `google`, `huggingface`, `openrouter`, `applefm`, `command`, and unknown providers are not credential-validated.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
 
@@ -97,18 +97,18 @@ Audit agents include built-in self-review with JSON / structure contract enforce
 
 `async: true` returns a `runId` that is also the artifact directory basename, so `~/.pi/agent/swival-artifacts/<runId>/` holds the report, trace, stdout, and stderr for that run.
 
-When a background run finishes, the extension pushes a completion notice into the session that launched it. The notice carries the outcome, a bounded output preview, and the artifact path, and it wakes an idle session so a failure cannot sit unnoticed. Delivery is acknowledged by a `notified.json` marker written only after Pi accepts the message, and a reconciler rescans the artifact root, because the in-process exit handler cannot fire if Pi itself has been restarted.
+When a background run finishes, the extension pushes a completion notice into the caller session. The notice carries the outcome, a bounded output preview, and the artifact path. After Pi accepts the message, the notifier records the delivery in memory before it attempts to write `notified.json`. A reconciler scans completed artifacts for the active session.
 
 When [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is installed, live runs also register as background work, so `subagent_wait({})` and `subagent_wait({ all: true })` block on them. `subagent_wait({ id })` resolves subagent run ids only and will not resolve a swival run id.
 
-`status` classifies a run as running, exited, or unknown. A live pid must corroborate against its process start time, so a reused pid cannot read as alive, and a run whose fate cannot be established is reported as unknown rather than as running. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
+`status` classifies a run as running, exited, or unknown. For a run recovered from disk, a live PID must match its process start time. A reused PID cannot read as alive, and an uncertain fate reads as unknown. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
 
 Environment variables:
 
 | Variable | Effect |
 |----------|--------|
 | `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the default but not a per-call `cacheDirOverride` or agent `cacheDir`. |
-| `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight. |
+| `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight when set to `1` or `true`; other values do not disable it. |
 | `PI_SWIVAL_ARTIFACT_ROOT` | Redirect run artifacts away from `~/.pi/agent/swival-artifacts/`. |
 | `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. |
 
@@ -137,7 +137,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers the pure functions in `extensions/` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, bundled-agent integrity, completion-notice delivery, liveness classification, the cost and turn parsers, cache-location resolution, and the credential preflight. The harness never spawns an actual `swival` process; everything under test is pure or injected.
+The vitest harness covers pure functions and stub-runtime extension wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. The harness never starts an actual `swival` process.
 
 ```bash
 cd tests
@@ -157,7 +157,7 @@ The smoke test runs in under a second and validates: every path declared in `pac
 
 GitHub Actions runs both layers on every push and pull request, against Node 20 and 22.
 
-The golden fixtures under `tests/fixtures/` are the source of truth for the swival report schema this package depends on. Schema drift breaks the snapshots, not live runs.
+Commit `ac55843` added the JSON files under `tests/fixtures/` as regression fixtures. Repository history does not show whether they came from live Swival runs or synthetic data, so they are not an authoritative schema.
 
 ## End-to-end demo
 
