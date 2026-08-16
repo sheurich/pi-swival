@@ -131,6 +131,17 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("/tmp/cache");
 	});
 
+	it("pins --cache-dir outside the operated directory even without --cache", () => {
+		// swival's own config can enable caching, and its default resolves to
+		// <base_dir>/.swival. Pinning the path unconditionally is what keeps
+		// cache.db out of the caller's repository.
+		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
+		expect(args).not.toContain("--cache");
+		const dir = args[args.indexOf("--cache-dir") + 1];
+		expect(dir).toBeDefined();
+		expect(dir!.startsWith("/cwd")).toBe(false);
+	});
+
 	it("self-review override can force-enable the reviewer loop", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { selfReview: true });
 		expect(args).toContain("--self-review");
@@ -165,6 +176,28 @@ describe("buildSwivalArgs", () => {
 		);
 		expect(args).toContain("--yolo");
 		expect(args).not.toContain("--sandbox");
+		expect(args).not.toContain("--files");
+		expect(args).not.toContain("--commands");
+	});
+
+	it("explicit isolation emits builtin and agentfs sandboxes", () => {
+		for (const isolation of ["builtin", "agentfs"] as const) {
+			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { isolation });
+			const i = args.indexOf("--sandbox");
+			expect(i).toBeGreaterThan(-1);
+			expect(args[i + 1]).toBe(isolation);
+		}
+	});
+
+	it("explicit isolation overrides frontmatter and yolo while yolo remains enabled", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ yolo: true, sandbox: "builtin", files: "all", commands: "ls" }),
+			"/tmp/r.json",
+			"/cwd",
+			{ isolation: "agentfs" },
+		);
+		expect(args).toContain("--yolo");
+		expect(args[args.indexOf("--sandbox") + 1]).toBe("agentfs");
 		expect(args).not.toContain("--files");
 		expect(args).not.toContain("--commands");
 	});

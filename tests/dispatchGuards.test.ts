@@ -47,6 +47,10 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent({ sandbox: "agentfs" }))).toBe(true);
 	});
 
+	it("treats an isolation override without a session as per-child AgentFS isolation", () => {
+		expect(isMutatingCwdAgent(makeAgent(), { isolation: "agentfs" })).toBe(false);
+	});
+
 	it("returns true when noSandboxAutoSession is set without an agentfs sandbox", () => {
 		expect(isMutatingCwdAgent(makeAgent({ noSandboxAutoSession: true }))).toBe(true);
 	});

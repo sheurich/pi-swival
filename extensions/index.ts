@@ -41,6 +41,8 @@ import {
 	type SwivalAgentConfig,
 } from "./agents.js";
 import { createSwivalNotifier, startSwivalReconciler, type SwivalNotifier } from "./notify.js";
+import { ensureCacheGuard, resolveCacheDir } from "./cache.js";
+import { credentialPreflight } from "./preflight.js";
 import {
 	classifyRunLiveness,
 	collapseHtmlStderr,
@@ -65,6 +67,8 @@ export {
 	readProcessStartTime,
 };
 export type { RunLiveness, SessionCost, TraceStatus, TurnBanner };
+export { ensureCacheGuard, resolveCacheDir } from "./cache.js";
+export { credentialPreflight } from "./preflight.js";
 
 // Maximum array size of tasks[] and chain[] params.
 const MAX_PARALLEL_TASKS = 8;
@@ -148,6 +152,27 @@ export interface RunStateInfo {
 const asyncRuns = new Map<string, AsyncRunEntry>();
 
 // -------------------------------------------------------------- helpers --
+
+async function prepareCache(agent: SwivalAgentConfig, cwd: string, overrides: SwivalOverrides): Promise<void> {
+	const baseDir = agent.baseDir ?? cwd;
+	const resolved = resolveCacheDir({
+		baseDir,
+		cacheDirOverride: overrides.cacheDir,
+		agentCacheDir: agent.cacheDir,
+		env: process.env,
+	});
+	await ensureCacheGuard(resolved.dir, baseDir);
+}
+
+async function runCredentialPreflight(agent: SwivalAgentConfig, overrides: SwivalOverrides): Promise<string | undefined> {
+	if (process.env.PI_SWIVAL_NO_PREFLIGHT) return undefined;
+	const result = await credentialPreflight({
+		provider: overrides.provider ?? agent.provider,
+		baseUrl: overrides.baseUrl ?? agent.baseUrl,
+	});
+	if (result.status !== "failure") return undefined;
+	return `${result.message ?? "Credential preflight failed."} [reason: provider_auth]`;
+}
 
 function stripAnsi(s: string): string {
 	// Remove CSI / OSC / SGR sequences. Not exhaustive but covers swival's output.
@@ -242,10 +267,13 @@ export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
  * Anything else is treated as write-capable for the purposes of the
  * parallel-cwd collision guard.
  */
-export function isMutatingCwdAgent(agent: SwivalAgentConfig): boolean {
+export function isMutatingCwdAgent(agent: SwivalAgentConfig, overrides: SwivalOverrides = {}): boolean {
 	if (agent.files === "none") return false;
 	if (agent.commands === READ_ONLY_AUDIT_COMMANDS) return false;
-	if (agent.sandbox === "agentfs" && agent.noSandboxAutoSession) return false;
+	const isolation = overrides.isolation === "inherit" ? agent.sandbox : overrides.isolation ?? agent.sandbox;
+	const noAutoSession = overrides.noSandboxAutoSession ?? agent.noSandboxAutoSession;
+	const overrideGetsOwnAgentfsSession = overrides.isolation === "agentfs" && overrides.sandboxSession === undefined;
+	if (isolation === "agentfs" && (noAutoSession || overrideGetsOwnAgentfsSession)) return false;
 	return true;
 }
 
@@ -317,6 +345,9 @@ export interface SwivalOverrides {
 	verify?: string;
 	encryptSecrets?: boolean;
 	timeoutMs?: number;
+	isolation?: "inherit" | "builtin" | "agentfs";
+	sandboxSession?: string;
+	noSandboxAutoSession?: boolean;
 }
 
 export function buildSwivalArgs(
@@ -366,8 +397,22 @@ export function buildSwivalArgs(
 	// Caching
 	const cache = overrides.cache ?? agent.cache;
 	if (cache) args.push("--cache");
-	const cacheDir = overrides.cacheDir ?? agent.cacheDir;
-	if (cacheDir) args.push("--cache-dir", cacheDir);
+	const baseDir = agent.baseDir ?? cwd;
+	const resolvedCache = baseDir
+		? resolveCacheDir({
+			baseDir,
+			cacheDirOverride: overrides.cacheDir,
+			agentCacheDir: agent.cacheDir,
+			env: process.env,
+		})
+		: undefined;
+	if (overrides.cacheDir) args.push("--cache-dir", overrides.cacheDir);
+	else if (agent.cacheDir) args.push("--cache-dir", agent.cacheDir);
+	// Always pin the cache location, even when this extension does not pass
+	// --cache. swival's own config can enable caching independently, and its
+	// default resolves to <base_dir>/.swival, which is the caller's repository.
+	// Passing the path when caching is off is inert.
+	else if (resolvedCache) args.push("--cache-dir", resolvedCache.dir);
 
 	// Context management / retry budget (swival 1.0.12+)
 	if (agent.proactiveSummaries) args.push("--proactive-summaries");
@@ -390,19 +435,26 @@ export function buildSwivalArgs(
 	const maxReviewRounds = overrides.maxReviewRounds ?? agent.maxReviewRounds;
 	if (maxReviewRounds !== undefined) args.push("--max-review-rounds", String(maxReviewRounds));
 
-	// Sandbox / commands
+	// Sandbox / commands. An explicit isolation override survives yolo: yolo
+	// still widens files and commands, but the caller owns sandbox selection.
+	const isolation = overrides.isolation === "inherit" ? agent.sandbox : overrides.isolation ?? agent.sandbox;
+	const sandboxSession = overrides.sandboxSession ?? agent.sandboxSession;
+	const noSandboxAutoSession = (overrides.noSandboxAutoSession
+		?? agent.noSandboxAutoSession)
+		|| (overrides.isolation === "agentfs" && !sandboxSession);
 	if (agent.yolo) {
 		args.push("--yolo");
+		if (overrides.isolation && overrides.isolation !== "inherit") args.push("--sandbox", overrides.isolation);
 	} else {
-		if (agent.sandbox) args.push("--sandbox", agent.sandbox);
+		if (isolation && isolation !== "inherit") args.push("--sandbox", isolation);
 		if (agent.files) args.push("--files", agent.files);
 		if (agent.commands) args.push("--commands", agent.commands);
 	}
 	// AgentFS session controls (only meaningful with --sandbox agentfs; we pass
 	// them through regardless and let swival's argparse reject bad combinations).
-	if (agent.sandboxSession) args.push("--sandbox-session", agent.sandboxSession);
+	if (sandboxSession) args.push("--sandbox-session", sandboxSession);
 	if (agent.sandboxStrictRead) args.push("--sandbox-strict-read");
-	if (agent.noSandboxAutoSession) args.push("--no-sandbox-auto-session");
+	if (noSandboxAutoSession) args.push("--no-sandbox-auto-session");
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);
 	for (const d of agent.addDir ?? []) args.push("--add-dir", d);
@@ -1342,6 +1394,9 @@ async function runSingleSwivalAsync(
 	if (reviewerError) {
 		throw new Error(reviewerError);
 	}
+	const preflight = await runCredentialPreflight(agent, overrides);
+	if (preflight) throw new Error(preflight);
+	await prepareCache(agent, cwd ?? defaultCwd, overrides);
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
@@ -1485,6 +1540,21 @@ async function runSingleSwival(
 			reason: { code: "config_error", text: reviewerError },
 		};
 	}
+	const preflight = await runCredentialPreflight(agent, overrides);
+	if (preflight) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [preflight],
+			durationMs: 0,
+			errorMessage: preflight,
+			reason: { code: "provider_auth", text: preflight },
+		};
+	}
+	await prepareCache(agent, cwd ?? defaultCwd, overrides);
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
@@ -1786,6 +1856,9 @@ export const TaskItem = Type.Object(
 			}),
 		),
 		seed: Type.Optional(Type.Number({ description: "Override --seed for this task only." })),
+		isolation: Type.Optional(StringEnum(["inherit", "builtin", "agentfs"] as const, { description: "Isolation for this task; defaults to the agent frontmatter setting." })),
+		sandboxSession: Type.Optional(Type.String({ description: "AgentFS session for this task." })),
+		noSandboxAutoSession: Type.Optional(Type.Boolean({ description: "Give this task a fresh AgentFS session instead of reusing one." })),
 	},
 	{ additionalProperties: false },
 );
@@ -1798,6 +1871,9 @@ export const ChainItem = Type.Object(
 		}),
 		cwd: Type.Optional(Type.String({ description: "Working directory for the swival process" })),
 		seed: Type.Optional(Type.Number({ description: "Override --seed for this chain step only." })),
+		isolation: Type.Optional(StringEnum(["inherit", "builtin", "agentfs"] as const, { description: "Isolation for this chain step; defaults to the agent frontmatter setting." })),
+		sandboxSession: Type.Optional(Type.String({ description: "AgentFS session for this chain step." })),
+		noSandboxAutoSession: Type.Optional(Type.Boolean({ description: "Give this chain step a fresh AgentFS session." })),
 		output: Type.Optional(Type.String({ description: "Chain mode: file path to write this step's finalOutput to. Relative paths resolve against the step's cwd (or top-level cwd). Per-step output overrides top-level output. Defaults to file-only content unless outputMode=\"inline\"." })),
 		outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Chain mode: how to surface this step's output. Default with output is file-only; inline returns the body even when also writing to a file." })),
 	},
@@ -1824,6 +1900,9 @@ const SwivalParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the swival process (single mode)" })),
+	isolation: Type.Optional(StringEnum(["inherit", "builtin", "agentfs"] as const, { description: "Isolation override for single mode; defaults to the agent frontmatter setting." })),
+	sandboxSessionOverride: Type.Optional(Type.String({ description: "Override the AgentFS sandbox session for this call." })),
+	noSandboxAutoSessionOverride: Type.Optional(Type.Boolean({ description: "Override AgentFS automatic session creation for this call." })),
 
 	// Dispatch-time overrides (outrank agent frontmatter).
 	modelOverride: Type.Optional(
@@ -1945,6 +2024,9 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		reasoningEffort: g<string>("reasoningEffortOverride"),
 		cache: g<boolean>("cacheOverride"),
 		cacheDir: g<string>("cacheDirOverride"),
+		isolation: g<"inherit" | "builtin" | "agentfs">("isolation"),
+		sandboxSession: g<string>("sandboxSessionOverride"),
+		noSandboxAutoSession: g<boolean>("noSandboxAutoSessionOverride"),
 		verify: g<string>("verifyOverride"),
 		encryptSecrets: g<boolean>("encryptSecretsOverride"),
 		timeoutMs: g<number>("timeoutMs"),
@@ -2433,7 +2515,9 @@ export default function (pi: ExtensionAPI) {
 					// Per-step seed outranks the shared override so callers can
 					// seed each step independently for reproducibility.
 					const perStepOverrides: SwivalOverrides =
-						step.seed !== undefined ? { ...overrides, seed: step.seed } : overrides;
+						step.seed !== undefined || step.isolation !== undefined || step.sandboxSession !== undefined || step.noSandboxAutoSession !== undefined
+							? { ...overrides, ...(step.seed !== undefined ? { seed: step.seed } : {}), ...(step.isolation !== undefined ? { isolation: step.isolation } : {}), ...(step.sandboxSession !== undefined ? { sandboxSession: step.sandboxSession } : {}), ...(step.noSandboxAutoSession !== undefined ? { noSandboxAutoSession: step.noSandboxAutoSession } : {}) }
+							: overrides;
 
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
 						? (partial) => {
@@ -2520,7 +2604,7 @@ export default function (pi: ExtensionAPI) {
 					const t = params.tasks[i];
 					const agent = agents.find((a) => a.name === t.agent);
 					if (!agent) continue; // unknown-agent diagnostics happen per-task in runSingleSwival
-					if (!isMutatingCwdAgent(agent)) continue;
+					if (!isMutatingCwdAgent(agent, { ...overrides, isolation: params.tasks[i].isolation ?? overrides.isolation })) continue;
 					const resolvedCwd = path.resolve(t.cwd ?? defaultCwd);
 					const existing = cwdGroups.get(resolvedCwd) ?? [];
 					existing.push(i);
@@ -2581,7 +2665,9 @@ export default function (pi: ExtensionAPI) {
 					// Per-task seed outranks the shared override so callers can
 					// seed each task independently for reproducibility.
 					const perTaskOverrides: SwivalOverrides =
-						t.seed !== undefined ? { ...overrides, seed: t.seed } : overrides;
+						t.seed !== undefined || t.isolation !== undefined || t.sandboxSession !== undefined || t.noSandboxAutoSession !== undefined
+							? { ...overrides, ...(t.seed !== undefined ? { seed: t.seed } : {}), ...(t.isolation !== undefined ? { isolation: t.isolation } : {}), ...(t.sandboxSession !== undefined ? { sandboxSession: t.sandboxSession } : {}), ...(t.noSandboxAutoSession !== undefined ? { noSandboxAutoSession: t.noSandboxAutoSession } : {}) }
+							: overrides;
 					const r = await runSingleSwival(
 						ctx.cwd,
 						agents,
