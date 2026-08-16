@@ -41,6 +41,30 @@ import {
 	type SwivalAgentConfig,
 } from "./agents.js";
 import { createSwivalNotifier, startSwivalReconciler, type SwivalNotifier } from "./notify.js";
+import {
+	classifyRunLiveness,
+	collapseHtmlStderr,
+	filterStderrLines,
+	parseSessionCost,
+	parseTraceStatus,
+	parseTurnBanner,
+	readProcessStartTime,
+	type RunLiveness,
+	type SessionCost,
+	type TraceStatus,
+	type TurnBanner,
+} from "./observability.js";
+
+export {
+	classifyRunLiveness,
+	collapseHtmlStderr,
+	filterStderrLines,
+	parseSessionCost,
+	parseTraceStatus,
+	parseTurnBanner,
+	readProcessStartTime,
+};
+export type { RunLiveness, SessionCost, TraceStatus, TurnBanner };
 
 // Maximum array size of tasks[] and chain[] params.
 const MAX_PARALLEL_TASKS = 8;
@@ -100,11 +124,12 @@ interface CompletedMarker {
 }
 
 /** Unified view of an async run's state, for use in control actions. */
-interface RunStateInfo {
+export interface RunStateInfo {
 	meta: RunMeta;
 	/** Present when the run is (or was) tracked in the in-memory asyncRuns Map. */
 	entry?: AsyncRunEntry;
-	/** True when the run has definitively exited (in-memory flag or completed.json found). */
+	/** Three-state lifecycle result; unknown is deliberately not rendered as live. */
+	liveness: RunLiveness;
 	exited: boolean;
 	exitCode: number | null;
 	completed?: CompletedMarker;
@@ -499,6 +524,7 @@ export type ReasonCode =
 	| "review_rejected"
 	| "max_turns"
 	| "provider_auth"
+	| "provider_routing"
 	| "rate_limited"
 	| "context_overflow"
 	| "config_error"
@@ -710,6 +736,10 @@ export function classifyFailure(
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
 			return { code: "config_error", text: `Lifecycle hook failed — ${reportMsg}` };
+		// litellm raises NotFoundError / model_not_found when the model does not
+		// belong to the resolved provider (see litellm/exceptions.py).
+		if (/model_not_found|notfounderror|invalid model|model.*does not exist/i.test(reportMsg))
+			return { code: "provider_routing", text: `Model does not belong to the resolved provider — ${reportMsg}` };
 		if (/configerror|unknown provider|invalid provider|agentfs binary not found/i.test(reportMsg))
 			return { code: "config_error", text: reportMsg };
 		return { code: "unknown", text: reportMsg };
@@ -718,8 +748,16 @@ export function classifyFailure(
 	const tail = stderrLines.slice(-50).join("\n");
 	const L = tail.toLowerCase();
 
-	if (/token has expired|sso session|sso.*expired|expired token/i.test(tail))
-		return { code: "provider_auth", text: "AWS SSO session expired — run `aws sso login` and retry." };
+	if (/token has expired|sso session|sso.*expired|expired token|AWS SSO token is missing or expired/i.test(tail))
+		return { code: "provider_auth", text: "AWS SSO session expired or missing — run `aws sso login` and retry." };
+	// The ChatGPT OAuth backend answers an unauthenticated or wrongly routed
+	// request with a Cloudflare managed challenge: tens of KB of HTML whose only
+	// signal is the challenge marker. Both causes are named because the response
+	// body does not distinguish them.
+	if (/challenge-error-text|_cf_chl_opt/i.test(tail))
+		return { code: "provider_auth", text: "ChatGPT backend returned a Cloudflare challenge — the OAuth token is missing or expired, or the model does not belong to this provider." };
+	if (/model_not_found|notfounderror|invalid model|model.*does not exist/i.test(tail))
+		return { code: "provider_routing", text: "Model does not belong to the resolved provider — check the provider and model pair." };
 	if (/unable to locate credentials|no credentials|credentialretrieval|expiredtoken/i.test(tail))
 		return { code: "provider_auth", text: "AWS credentials missing or expired." };
 	if (/401 unauthorized|invalid[_ -]?api[_ -]?key|authentication.*fail/i.test(tail))
@@ -1152,28 +1190,98 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
  *
  * Returns `undefined` when the run cannot be found at all.
  */
+interface RunStatusObservability {
+	elapsedMs?: number;
+	turn?: TurnBanner;
+	lastToolCall?: string;
+	lastActivityAt?: string;
+	reviewRound?: number;
+	cost?: SessionCost;
+}
+
+async function readBoundedTail(filePath: string, maxBytes = 128 * 1024): Promise<string> {
+	try {
+		const stat = await fs.promises.stat(filePath);
+		const start = Math.max(0, stat.size - maxBytes);
+		const handle = await fs.promises.open(filePath, "r");
+		try {
+			const buffer = Buffer.alloc(stat.size - start);
+			const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+			return buffer.toString("utf-8", 0, bytesRead);
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return "";
+	}
+}
+
+async function readRunStatusObservability(state: RunStateInfo, report?: ReportSummary): Promise<RunStatusObservability> {
+	const stderr = await readBoundedTail(state.meta.stderrFile);
+	let trace = "";
+	try {
+		const files = await fs.promises.readdir(path.join(state.meta.artifactDir, "trace"));
+		const jsonl = files.find((name) => name.endsWith(".jsonl"));
+		if (jsonl) trace = await readBoundedTail(path.join(state.meta.artifactDir, "trace", jsonl), 512 * 1024);
+	} catch { /* trace is optional */ }
+	const traceStatus = parseTraceStatus(trace);
+	const end = state.completed?.exitedAt ? Date.parse(state.completed.exitedAt) : undefined;
+	const elapsedMs = (end !== undefined && Number.isFinite(end) ? end : Date.now()) - state.meta.startedAt;
+	return {
+		elapsedMs: elapsedMs >= 0 ? elapsedMs : undefined,
+		turn: parseTurnBanner(stderr),
+		lastToolCall: traceStatus.lastToolCall,
+		lastActivityAt: traceStatus.lastActivityAt,
+		reviewRound: report?.reviewRounds ?? (() => {
+			// swival prints "▶ Review round N: sending answer to reviewer" (fmt.py).
+			// Review rounds never appear in the trace JSONL.
+			const match = stderr.match(/\bReview round\s+(\d+)/i);
+			return match ? Number(match[1]) : undefined;
+		})(),
+		cost: parseSessionCost(stderr),
+	};
+}
+
+function formatStatusObservability(details: RunStatusObservability): string[] {
+	const lines: string[] = [];
+	if (details.elapsedMs !== undefined) lines.push(`elapsed: ${formatDuration(details.elapsedMs)}`);
+	if (details.turn) {
+		const depth = `${details.turn.turn}/${details.turn.turnLimit}`;
+		lines.push(`turn: ${depth}`);
+	}
+	if (details.lastToolCall) lines.push(`last tool: ${details.lastToolCall}`);
+	if (details.lastActivityAt) lines.push(`last activity: ${details.lastActivityAt}`);
+	if (details.reviewRound !== undefined) lines.push(`review round: ${details.reviewRound}`);
+	if (details.cost) {
+		const suffix = details.cost.known ? "" : ` (${details.cost.unpricedCalls} unpriced)`;
+		lines.push(`cost: $${details.cost.costUsd}${suffix}`);
+	}
+	return lines;
+}
+
 async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 	// In-memory fast path.
 	const entry = asyncRuns.get(runId);
 	if (entry) {
-		const info: RunStateInfo = {
+		let completed: CompletedMarker | undefined;
+		try {
+			const txt = await fs.promises.readFile(path.join(entry.meta.artifactDir, "completed.json"), "utf-8");
+			completed = JSON.parse(txt) as CompletedMarker;
+		} catch { /* marker may not exist while the child is live */ }
+		const liveness = await classifyRunLiveness({
+			startedAt: entry.meta.startedAt,
+			pid: entry.meta.pid,
+			completed: completed !== undefined,
+			inMemory: entry.exited ? "exited" : "live",
+		});
+		return {
 			meta: entry.meta,
 			entry,
-			exited: entry.exited,
-			exitCode: entry.exitCode,
+			liveness,
+			exited: liveness === "exited",
+			exitCode: completed?.exitCode ?? entry.exitCode,
+			completed,
 		};
-		// Also read completed.json when the entry says exited, so callers
-		// that need the marker (e.g. resume) get it without a separate read.
-		if (entry.exited) {
-			try {
-				const txt = await fs.promises.readFile(
-					path.join(entry.meta.artifactDir, "completed.json"),
-					"utf-8",
-				);
-				info.completed = JSON.parse(txt) as CompletedMarker;
-			} catch { /* best-effort */ }
-		}
-		return info;
 	}
 
 	// Disk fallback: find run-meta.json, then read completed.json + spawn-error.txt.
@@ -1191,9 +1299,15 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 		spawnError = await fs.promises.readFile(path.join(meta.artifactDir, "spawn-error.txt"), "utf-8");
 	} catch { /* no spawn error */ }
 
-	const exited = completed !== undefined;
+	const liveness = await classifyRunLiveness({
+		startedAt: meta.startedAt,
+		pid: meta.pid,
+		completed: completed !== undefined,
+		inMemory: "none",
+	});
+	const exited = liveness === "exited";
 	const exitCode = completed?.exitCode ?? null;
-	return { meta, exited, exitCode, completed, spawnError };
+	return { meta, liveness, exited, exitCode, completed, spawnError };
 }
 
 // ------------------------------------------------ async (background) --
@@ -1588,7 +1702,11 @@ async function runSingleSwival(
 			// `filter(Boolean)` here is defensive — upstream split already drops
 			// whitespace-only lines before they enter stderrLines, so this can't
 			// collapse multi-line errors that contain intentional blanks.
-			const stderrTail = stderrLines.filter(Boolean).slice(-5).join("\n");
+			const reportedStderr = filterStderrLines(stderrLines).filter(Boolean);
+			current.stderrTail = tail(reportedStderr, STDERR_TAIL_LINES);
+			// Keep the decisive headline at the front even when stderr contains
+			// a long traceback or an HTML response after it.
+			const stderrTail = reportedStderr.slice(0, 5).join("\n");
 			if (!current.errorMessage) {
 				current.errorMessage = computeErrorMessage({
 					classifiedText: classified?.text,
@@ -2124,9 +2242,20 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					if (!state.exited) {
+					const report = state.liveness === "exited"
+						? await readReport(path.join(state.meta.artifactDir, "report.json"))
+						: undefined;
+					const observability = await readRunStatusObservability(state, report);
+					const depth = formatStatusObservability(observability);
+					if (state.liveness === "unknown") {
 						return {
-							content: [{ type: "text", text: `Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"}).\nArtifact dir: ${state.meta.artifactDir}` }],
+							content: [{ type: "text", text: [`Run ${runId} fate cannot be determined. The owning Pi process may have exited before writing the completion marker.`, ...depth, `Artifact dir: ${state.meta.artifactDir}`].join("\n") }],
+							details: makeDetails("single")([]),
+						};
+					}
+					if (state.liveness === "running") {
+						return {
+							content: [{ type: "text", text: [`Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"})`, ...depth, `Artifact dir: ${state.meta.artifactDir}`].join("\n") }],
 							details: makeDetails("single")([]),
 						};
 					}
@@ -2137,18 +2266,17 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
 					const outcome = report?.outcome ?? "unknown";
 					const exitedAt = state.completed?.exitedAt ?? "unknown";
 					return {
-						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}` }],
+						content: [{ type: "text", text: [`Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).`, ...depth, `Artifact dir: ${state.meta.artifactDir}`].join("\n") }],
 						details: makeDetails("single")([]),
 					};
 				}
 
 				if (params.action === "interrupt") {
 					const state = await loadRunState(runId);
-					if (!state || state.exited) {
+					if (!state || state.liveness !== "running") {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is not running (already completed or not found) — nothing to interrupt.` }],
 							details: makeDetails("single")([]),
@@ -2201,7 +2329,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					if (!state.exited) {
+					if (state.liveness === "running") {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is still in progress (pid: ${state.meta.pid ?? "unknown"}). Wait for it to complete, or interrupt it first.` }],
 							details: makeDetails("single")([]),

@@ -115,9 +115,21 @@ describe("classifyFailure", () => {
 	});
 
 	it("recognises expired AWS SSO sessions", () => {
-		const res = classifyFailure(["botocore.exceptions.TokenRetrievalError: The SSO session has expired"]);
+		const res = classifyFailure(["Error: AWS SSO token is missing or expired"]);
 		expect(res?.code).toBe("provider_auth");
 		expect(res?.text).toMatch(/AWS SSO/i);
+	});
+
+	it("recognises a Cloudflare challenge body from the ChatGPT backend", () => {
+		const res = classifyFailure(["Error: ChatgptException", "<span id=\"challenge-error-text\">Enable JavaScript</span>", "window._cf_chl_opt = {}"]);
+		expect(res?.code).toBe("provider_auth");
+		expect(res?.text).toMatch(/Cloudflare challenge/i);
+	});
+
+	it("recognises a model that does not belong to the resolved provider", () => {
+		const res = classifyFailure(["Error: LLM call failed (model: gpt-9): litellm.NotFoundError: NotFoundError - The model `gpt-9` does not exist"]);
+		expect(res?.code).toBe("provider_routing");
+		expect(res?.text).toMatch(/does not belong to the resolved provider/i);
 	});
 
 	it("recognises 401 Unauthorized from the LLM provider", () => {
