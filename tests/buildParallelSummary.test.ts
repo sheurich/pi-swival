@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildParallelSummary, type SwivalResult } from "../extensions/index.js";
+import { buildParallelSummary, type SwivalResult } from "../extensions/runtime.js";
 
 function makeResult(overrides: Partial<SwivalResult> = {}): SwivalResult {
 	return {

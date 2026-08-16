@@ -7,7 +7,7 @@ import {
 	parseTraceStatus,
 	parseTurnBanner,
 	type RunLiveness,
-} from "../extensions/index.js";
+} from "../extensions/runtime.js";
 
 const costComplete = "  Session cost: ~$2.98";
 const costPartial = "  Known session cost: ~$1.2345 (3 calls unpriced)";
@@ -89,17 +89,24 @@ describe("trace status and liveness", () => {
 	});
 
 	it.each([
-		["exited from marker", state({ completed: true }), undefined, "exited"],
-		["exited from memory", state({ inMemory: "exited" }), undefined, "exited"],
-		["exited from child exitCode", state({ inMemory: "live", exitCode: 0 }), undefined, "exited"],
-		["exited from child signalCode", state({ inMemory: "live", signalCode: "SIGTERM" }), undefined, "exited"],
-		["live in memory", state({ inMemory: "live" }), undefined, "running"],
-		["live corroborated pid", state(), async () => 1_000_001, "running"],
-		["unknown without pid", state({ pid: undefined }), undefined, "unknown"],
-		["unknown when pid start cannot be read", state(), async () => undefined, "unknown"],
-		["unknown on pid reuse", state(), async () => 900_000, "unknown"],
-	] as const)("classifies %s", async (_name, input, source, expected) => {
-		const result: RunLiveness = await classifyRunLiveness(input, { processStartTime: source, isAlive: () => true });
+		["exited from marker", state({ completed: true }), undefined, undefined, "exited"],
+		["exited from memory", state({ inMemory: "exited" }), undefined, undefined, "exited"],
+		["exited from child exitCode", state({ inMemory: "live", exitCode: 0 }), undefined, undefined, "exited"],
+		["exited from child signalCode", state({ inMemory: "live", signalCode: "SIGTERM" }), undefined, undefined, "exited"],
+		["live in memory when start time still matches", state({ inMemory: "live" }), async () => 1_000_000, undefined, "running"],
+		["live corroborated pid", state(), async () => 1_000_001, undefined, "running"],
+		["unknown without pid", state({ pid: undefined }), undefined, undefined, "unknown"],
+		["unknown when pid start cannot be read", state(), async () => undefined, undefined, "unknown"],
+		["unknown on substantially older pid reuse", state(), async () => 900_000, undefined, "unknown"],
+		["running on older start time within lower tolerance bound", state(), async () => 995_000, { toleranceMs: 5000 }, "running"],
+		["running on newer start time within upper tolerance bound", state(), async () => 1_005_000, { toleranceMs: 5000 }, "running"],
+		["unknown on substantially newer process", state(), async () => 1_005_001, { toleranceMs: 5000 }, "unknown"],
+	] as const)("classifies %s", async (_name, input, source, options, expected) => {
+		const result: RunLiveness = await classifyRunLiveness(input, {
+			isAlive: () => true,
+			processStartTime: source,
+			...options,
+		});
 		expect(result).toBe(expected);
 	});
 });

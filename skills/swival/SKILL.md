@@ -95,7 +95,9 @@ swival-subagent with agent: "self-review-worker", task: "Refactor the auth modul
 
 The tool returns a `runId`, which is also the artifact directory basename, so the run's report, trace, stdout, and stderr live in `~/.pi/agent/swival-artifacts/<runId>/`. `async: true` is only supported in single-agent mode, not chain/parallel.
 
-When the run finishes, the extension pushes a completion notice into the session that launched it, so a failed or dead child does not wait for someone to poll. Notices reach only the launching session.
+When the run finishes, the extension pushes a completion notice into the session that launched it, so a failed or dead child does not wait for someone to poll. Notices reach only the launching session. The notice includes the status, agent, run ID, and artifact path. It does not include output. Use `resume` to read the final answer. Notice status comes from the exit marker plus `report.json`: reviewer-approved success becomes `accepted`, success without reviewer rounds becomes `completed`, `outcome: failed` becomes `rejected`, `outcome: error` becomes `error`, non-zero exits become `failed`, spawn errors become `failed`, and a null exit without `spawn-error.txt` becomes `stopped`.
+
+Delivery is acknowledged only after Pi emits the matching persisted `message_end` for that custom message. The notifier writes `notified.json` after that acknowledgement. A void `sendMessage` call is not enough.
 
 Once started, manage it using `action` and `id`:
 
@@ -103,9 +105,9 @@ Once started, manage it using `action` and `id`:
 |-------------|-------------|
 | `status`    | Liveness plus progress: turn depth, last tool call, last activity, review round, and cost |
 | `resume`    | Get the final answer and reviewer feedback when finished |
-| `interrupt` | Cancel a running task via SIGTERM |
+| `interrupt` | Cancel a running task via SIGTERM, with identity revalidated again before any delayed SIGKILL |
 
-`status` reports one of three states. `running` means a live process, corroborated against its start time so a reused pid cannot read as alive. `exited` means a completion marker exists. `unknown` means the fate cannot be established, usually because the owning Pi process exited before writing the marker; it is never reported as running.
+`status` reports one of three states. `running` means the PID is alive and its observed start time agrees with the persisted start time. A reused PID cannot read as alive. `exited` means a completion marker exists. `unknown` means the fate cannot be established, usually because the owning Pi process exited before writing the marker; it is never reported as running.
 
 Example:
 ```
@@ -179,7 +181,6 @@ addDirRo: ["/ref/repo"]          # read-only access
 encryptSecrets: true
 noReadGuard: true
 cache: true
-cacheDir: .swival/cache
 extraArgs: ["--max-context-tokens", "128000"]
 ---
 
@@ -191,6 +192,8 @@ definitions. Model routing belongs in `~/.config/swival/config.toml`
 (managed per environment alongside the rest of your shell config).
 Use `profileOverride` at
 dispatch time when a specific profile is needed.
+
+Most agents should omit `cacheDir`. The extension pins a default cache path outside the checkout and makes it repository-specific. If you set `cacheDir` or `cacheDirOverride`, the resolved path must stay outside the real checkout. Paths at the checkout root, inside it, or containing it are rejected.
 
 ### Agent configs do not inherit
 
@@ -224,14 +227,15 @@ semantically-load-bearing flag is preserved.
 
 ### Reviewer loop
 
-The headline feature. Runs after each answer; retries until
-acceptance or budget exhaustion.
+The headline feature. It runs after each answer and continues until acceptance or a configured limit.
 
 - Self-review: same model, fresh context evaluates the output
 - Test-as-contract: external script gates completion (exit 0 =
   accept, 1 = retry with stdout as feedback, 2 = reviewer error)
 - `--verify FILE`: feeds acceptance criteria to the reviewer
 - Default budget: 15 rounds (`maxReviewRounds` overrides)
+- Synchronous dispatch returns after the review loop finishes. Async dispatch returns after the run is durably started and the loop continues in the background.
+- Either mode can stop at the configured review-round or turn limit without acceptance.
 
 Self-review and `--reviewer` are mutually exclusive.
 
@@ -349,7 +353,7 @@ Proxy manager: `swival-proxy start|stop|status|restart`.
 | `ContextOverflowError` | Prompt exceeds context after truncation retries | `--proactive-summaries`; larger-context model |
 | `ToolsNotSupportedError` | Model lacks function calling | Switch model; check `--extra-body` |
 | `LifecycleError` | Hook failed under `--lifecycle-fail-closed` | Inspect hook; drop fail-closed |
-| `credential preflight failed` | The resolved provider has no usable credential; dispatch was refused before spawn | Follow the fix named in the message; `PI_SWIVAL_NO_PREFLIGHT=1` skips the check |
+| `credential preflight failed` | An explicit provider or base URL override, or the selected or active Swival profile resolved through bounded `swival --list-profiles`, mapped to a provider with a definite local auth failure; dispatch was refused before spawn | Follow the fix named in the message; `PI_SWIVAL_NO_PREFLIGHT=1` skips the check. Indeterminate routing does not block, and unknown providers are not validated |
 | Cloudflare challenge HTML from the ChatGPT backend | OAuth token missing or expired, or the model belongs to a different provider | Run `swival --provider chatgpt` once interactively; check the provider and model pair |
 
 A provider and a model are chosen independently, so a config model can reach a CLI-selected provider that has never heard of it. `--provider chatgpt` with a Bedrock model id produces a Cloudflare challenge, not a useful error.

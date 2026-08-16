@@ -1,8 +1,9 @@
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-export type SwivalRunStatus = "completed" | "failed" | "stopped";
+export type SwivalRunStatus = "accepted" | "completed" | "rejected" | "error" | "failed" | "stopped";
 
 export interface SwivalCompletionSummary {
 	runId: string;
@@ -17,6 +18,7 @@ export interface SwivalCompletionSummary {
 export interface SwivalNotifierDeps {
 	currentSessionId: string;
 	batchWindowMs?: number;
+	ackTimeoutMs?: number;
 }
 
 export interface SwivalNotifier {
@@ -25,18 +27,27 @@ export interface SwivalNotifier {
 	dispose(): void;
 }
 
-const NOTIFY_TTL_MS = 10 * 60 * 1000;
-const PREVIEW_CHARS = 1500;
-
-function preview(stdout: string | undefined): string {
-	const text = stdout?.slice(-PREVIEW_CHARS).trim() ?? "";
-	return text || "(no output)";
+interface PendingDelivery {
+	summary: SwivalCompletionSummary;
+	waiters: Array<(accepted: boolean) => void>;
 }
+
+interface AwaitingDelivery extends PendingDelivery {
+	batchId: string;
+}
+
+interface AwaitingBatch {
+	runIds: string[];
+	sessionId: string;
+	timeout: NodeJS.Timeout;
+}
+
+const NOTIFY_TTL_MS = 10 * 60 * 1000;
+const ACK_TIMEOUT_MS = 15_000;
 
 function singleContent(summary: SwivalCompletionSummary): string {
 	return [
 		`Swival background run ${summary.status}: **${summary.agent}** (${summary.runId})`,
-		preview(summary.stdout),
 		`Artifact dir: ${summary.artifactDir}`,
 	].join("\n");
 }
@@ -49,8 +60,61 @@ function batchContent(items: SwivalCompletionSummary[]): string {
 	].join("\n\n");
 }
 
+function isCleanStatus(status: SwivalRunStatus): boolean {
+	return status === "accepted" || status === "completed";
+}
+
+function toNum(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function toStr(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
 async function exists(file: string): Promise<boolean> {
-	try { await fs.promises.access(file); return true; } catch { return false; }
+	try {
+		await fs.promises.access(file);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function deriveStatus(dir: string, fallback: SwivalRunStatus): Promise<SwivalRunStatus> {
+	let exitCode: number | null | undefined;
+	try {
+		const completed = JSON.parse(await fs.promises.readFile(path.join(dir, "completed.json"), "utf-8")) as {
+			exitCode?: unknown;
+		};
+		if (typeof completed.exitCode === "number") exitCode = completed.exitCode;
+		else if (completed.exitCode === null) exitCode = null;
+	} catch {
+		return fallback;
+	}
+
+	if (exitCode !== 0) {
+		if (exitCode === null) {
+			return await exists(path.join(dir, "spawn-error.txt")) ? "failed" : "stopped";
+		}
+		return "failed";
+	}
+
+	try {
+		const report = JSON.parse(await fs.promises.readFile(path.join(dir, "report.json"), "utf-8")) as {
+			result?: { outcome?: unknown };
+			stats?: { review_rounds?: unknown };
+		};
+		const outcome = toStr(report.result?.outcome);
+		const reviewRounds = toNum(report.stats?.review_rounds) ?? 0;
+		if (outcome === "error") return "error";
+		if (outcome === "failed") return "rejected";
+		if (outcome === "success") return reviewRounds > 0 ? "accepted" : "completed";
+	} catch {
+		// Missing or malformed report.json falls back to the termination signal.
+	}
+
+	return fallback === "failed" || fallback === "stopped" ? fallback : "completed";
 }
 
 async function loadCompletedSummary(dir: string): Promise<SwivalCompletionSummary | undefined> {
@@ -60,126 +124,200 @@ async function loadCompletedSummary(dir: string): Promise<SwivalCompletionSummar
 			agent?: unknown;
 			artifactDir?: unknown;
 			sessionId?: unknown;
-			stdoutFile?: unknown;
-		};
-		const completed = JSON.parse(await fs.promises.readFile(path.join(dir, "completed.json"), "utf-8")) as {
-			exitCode?: unknown;
-			status?: unknown;
 		};
 		if (
-			typeof meta.runId !== "string" || typeof meta.agent !== "string" ||
-			typeof meta.artifactDir !== "string" || typeof meta.sessionId !== "string" ||
-			!meta.sessionId || path.resolve(meta.artifactDir) !== path.resolve(dir)
+			typeof meta.runId !== "string" ||
+			typeof meta.agent !== "string" ||
+			typeof meta.artifactDir !== "string" ||
+			typeof meta.sessionId !== "string" ||
+			!meta.sessionId ||
+			path.resolve(meta.artifactDir) !== path.resolve(dir)
 		) return undefined;
-		let stdout = "";
-		const stdoutFile = typeof meta.stdoutFile === "string" &&
-			path.resolve(meta.stdoutFile).startsWith(path.resolve(dir) + path.sep)
-			? meta.stdoutFile : undefined;
-		if (stdoutFile) {
-			try { stdout = await fs.promises.readFile(stdoutFile, "utf-8"); } catch { /* output is optional */ }
-		}
-		const status: SwivalRunStatus = completed.status === "stopped" || completed.exitCode === null
-			? "stopped"
-			: completed.exitCode === 0 ? "completed" : "failed";
-		return { runId: meta.runId, agent: meta.agent, artifactDir: meta.artifactDir, sessionId: meta.sessionId, status, stdout, stdoutFile };
+		return {
+			runId: meta.runId,
+			agent: meta.agent,
+			artifactDir: meta.artifactDir,
+			sessionId: meta.sessionId,
+			status: await deriveStatus(dir, "completed"),
+		};
 	} catch {
 		return undefined;
 	}
 }
 
+function matchesExactRunSet(expected: readonly string[], actual: readonly string[]): boolean {
+	if (expected.length !== actual.length) return false;
+	const expectedSorted = [...expected].sort();
+	const actualSorted = [...actual].sort();
+	return expectedSorted.every((runId, index) => runId === actualSorted[index]);
+}
+
 /**
- * Send durable completion notices. A successful send is the acknowledgement;
- * the artifact marker is written only after Pi accepts the message.
+ * Send durable completion notices. A successful send is NOT the acknowledgement;
+ * the artifact marker is written only after Pi emits the matching message_end.
  */
-export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps: SwivalNotifierDeps): SwivalNotifier {
+export function createSwivalNotifier(
+	pi: { sendMessage: ExtensionAPI["sendMessage"]; on?: ExtensionAPI["on"] },
+	deps: SwivalNotifierDeps,
+): SwivalNotifier {
 	const batchWindowMs = deps.batchWindowMs ?? 1500;
+	const ackTimeoutMs = deps.ackTimeoutMs ?? ACK_TIMEOUT_MS;
 	const seen = new Map<string, number>();
-	const pending = new Map<string, { summary: SwivalCompletionSummary; resolve: (accepted: boolean) => void }>();
+	const pending = new Map<string, PendingDelivery>();
+	const awaiting = new Map<string, AwaitingDelivery>();
+	const awaitingBatches = new Map<string, AwaitingBatch>();
 	let timer: NodeJS.Timeout | undefined;
 	let disposed = false;
 
 	const trimSeen = () => {
 		const cutoff = Date.now() - NOTIFY_TTL_MS;
-		for (const [id, at] of seen) if (at <= cutoff) seen.delete(id);
+		for (const [runId, at] of seen) if (at <= cutoff) seen.delete(runId);
 	};
 
-	const flush = async () => {
-		timer = undefined;
-		if (disposed || pending.size === 0) return;
-		trimSeen();
-		const entries = [...pending.values()].filter((entry) => !seen.has(entry.summary.runId));
-		pending.clear();
-		if (entries.length === 0) return;
-		const summaries = entries.map((entry) => entry.summary);
-		try {
-			pi.sendMessage(
-				{
-					customType: "swival-notify",
-					content: summaries.length === 1 ? singleContent(summaries[0]!) : batchContent(summaries),
-					display: summaries.some((item) => item.status !== "completed"),
-				},
-				{ triggerTurn: true },
-			);
-		} catch {
-			// A throw means Pi did not accept the message. Keep the record
-			// pending and unmarked so the next reconciler pass retries it;
-			// nothing here reschedules the batch timer on its own.
-			for (const entry of entries) {
-				pending.set(entry.summary.runId, entry);
-				entry.resolve(false);
-			}
+	const resolveDelivery = (entry: PendingDelivery, accepted: boolean) => {
+		for (const waiter of entry.waiters.splice(0)) waiter(accepted);
+	};
+
+	const scheduleFlush = (status: SwivalRunStatus) => {
+		if (!isCleanStatus(status) || batchWindowMs <= 0) {
+			void flush();
 			return;
 		}
-		for (const entry of entries) {
-			seen.set(entry.summary.runId, Date.now());
+		if (!timer) timer = setTimeout(() => { void flush(); }, batchWindowMs);
+	};
+
+	const handleAck = async (event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
+		if (disposed) return;
+		const sessionId = ctx?.sessionManager?.getSessionId?.();
+		if (sessionId && sessionId !== deps.currentSessionId) return;
+		const message = (event as { message?: { role?: unknown; customType?: unknown; details?: unknown } })?.message;
+		if (message?.role !== "custom" || message.customType !== "swival-notify") return;
+		const details = (message.details ?? {}) as { runIds?: unknown; batchId?: unknown; sessionId?: unknown };
+		const batchId = toStr(details.batchId);
+		const ackSessionId = toStr(details.sessionId);
+		if (!batchId || !ackSessionId || ackSessionId !== deps.currentSessionId) return;
+		const batch = awaitingBatches.get(batchId);
+		if (!batch || batch.sessionId !== deps.currentSessionId) return;
+		const runIdsRaw = details.runIds;
+		if (!Array.isArray(runIdsRaw)) return;
+		const runIds = runIdsRaw.filter((value): value is string => typeof value === "string");
+		if (!matchesExactRunSet(batch.runIds, runIds)) return;
+
+		awaitingBatches.delete(batchId);
+		clearTimeout(batch.timeout);
+		const entries: AwaitingDelivery[] = [];
+		for (const runId of batch.runIds) {
+			const entry = awaiting.get(runId);
+			if (!entry || entry.batchId !== batchId) continue;
+			awaiting.delete(runId);
+			seen.set(runId, Date.now());
+			entries.push(entry);
 		}
 		for (const entry of entries) {
 			try {
 				await fs.promises.mkdir(entry.summary.artifactDir, { recursive: true });
 				await fs.promises.writeFile(
 					path.join(entry.summary.artifactDir, "notified.json"),
-					JSON.stringify({ notifiedAt: new Date(Date.now()).toISOString() }),
+					JSON.stringify({ notifiedAt: new Date(Date.now()).toISOString(), runIds: [entry.summary.runId] }),
 					"utf-8",
 				);
-				entry.resolve(true);
+				resolveDelivery(entry, true);
 			} catch {
-				entry.resolve(false);
+				resolveDelivery(entry, false);
 			}
+		}
+	};
+
+	const unsubscribe = pi.on?.("message_end", handleAck as never);
+
+	const flush = async () => {
+		timer = undefined;
+		if (disposed || pending.size === 0) return;
+		trimSeen();
+		const entries = [...pending.entries()]
+			.filter(([runId]) => !seen.has(runId))
+			.map(([, entry]) => entry);
+		pending.clear();
+		if (entries.length === 0) return;
+
+		const delivered = await Promise.all(entries.map(async (entry) => ({
+			summary: { ...entry.summary, status: await deriveStatus(entry.summary.artifactDir, entry.summary.status) },
+			waiters: entry.waiters,
+		})));
+		const runIds = delivered.map((entry) => entry.summary.runId);
+		const batchId = `swival-notify-${randomBytes(8).toString("hex")}`;
+
+		try {
+			pi.sendMessage(
+				{
+					customType: "swival-notify",
+					content: delivered.length === 1
+						? singleContent(delivered[0]!.summary)
+						: batchContent(delivered.map((entry) => entry.summary)),
+					display: delivered.some((entry) => !isCleanStatus(entry.summary.status)),
+					details: { runIds, batchId, sessionId: deps.currentSessionId },
+				},
+				{ triggerTurn: true },
+			);
+		} catch {
+			for (const entry of delivered) resolveDelivery(entry, false);
+			return;
+		}
+
+		const timeout = setTimeout(() => {
+			const awaitingBatch = awaitingBatches.get(batchId);
+			if (!awaitingBatch) return;
+			awaitingBatches.delete(batchId);
+			for (const runId of awaitingBatch.runIds) {
+				const entry = awaiting.get(runId);
+				if (!entry || entry.batchId !== batchId) continue;
+				awaiting.delete(runId);
+				resolveDelivery(entry, false);
+			}
+		}, ackTimeoutMs);
+		timeout.unref?.();
+		awaitingBatches.set(batchId, { runIds, sessionId: deps.currentSessionId, timeout });
+		for (const entry of delivered) {
+			awaiting.set(entry.summary.runId, { ...entry, batchId });
 		}
 	};
 
 	const deliver = async (summary: SwivalCompletionSummary): Promise<boolean> => {
 		trimSeen();
 		if (disposed || !summary.sessionId || summary.sessionId !== deps.currentSessionId || seen.has(summary.runId)) return false;
-		if (summary.stdout === undefined && summary.stdoutFile) {
-			try { summary.stdout = await fs.promises.readFile(summary.stdoutFile, "utf-8"); } catch { /* output is optional */ }
-		}
+		const canonical = { ...summary, status: await deriveStatus(summary.artifactDir, summary.status) };
+		const active = awaiting.get(summary.runId);
+		if (active) return new Promise<boolean>((resolve) => active.waiters.push(resolve));
 		const existing = pending.get(summary.runId);
 		if (existing) {
-			if (summary.status !== "completed") void flush();
-			else if (!timer) timer = setTimeout(() => { void flush(); }, batchWindowMs);
-			return new Promise<boolean>((resolve) => {
-				const originalResolve = existing.resolve;
-				existing.resolve = (accepted) => { originalResolve(accepted); resolve(accepted); };
-			});
+			existing.summary = canonical;
+			scheduleFlush(canonical.status);
+			return new Promise<boolean>((resolve) => existing.waiters.push(resolve));
 		}
-		const result = new Promise<boolean>((resolve) => pending.set(summary.runId, { summary, resolve }));
-		if (summary.status !== "completed") {
-			void flush();
-		} else if (!timer) {
-			timer = setTimeout(() => { void flush(); }, batchWindowMs);
-		}
+		const entry: PendingDelivery = { summary: canonical, waiters: [] };
+		const result = new Promise<boolean>((resolve) => entry.waiters.push(resolve));
+		pending.set(summary.runId, entry);
+		scheduleFlush(canonical.status);
 		return result;
 	};
 
 	const reconcile = async (artifactRoot: string) => {
-		let names: string[];
-		try { names = await fs.promises.readdir(artifactRoot); } catch { return; }
-		for (const name of names) {
-			const dir = path.join(artifactRoot, name);
-			if (!(await exists(path.join(dir, "completed.json"))) || await exists(path.join(dir, "notified.json"))) continue;
+		let entries: fs.Dirent[];
+		try {
+			entries = await fs.promises.readdir(artifactRoot, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const dirent of entries) {
+			if (!dirent.isDirectory()) continue;
+			const dir = path.join(artifactRoot, dirent.name);
+			const [completedExists, notifiedExists] = await Promise.all([
+				exists(path.join(dir, "completed.json")),
+				exists(path.join(dir, "notified.json")),
+			]);
+			if (!completedExists || notifiedExists) continue;
 			const summary = await loadCompletedSummary(dir);
-			if (summary) await deliver(summary);
+			if (summary) void deliver(summary);
 		}
 	};
 
@@ -188,10 +326,15 @@ export function createSwivalNotifier(pi: Pick<ExtensionAPI, "sendMessage">, deps
 		reconcile,
 		dispose: () => {
 			disposed = true;
+			unsubscribe?.();
 			if (timer) clearTimeout(timer);
 			timer = undefined;
-			for (const entry of pending.values()) entry.resolve(false);
+			for (const batch of awaitingBatches.values()) clearTimeout(batch.timeout);
+			awaitingBatches.clear();
+			for (const entry of pending.values()) resolveDelivery(entry, false);
+			for (const entry of awaiting.values()) resolveDelivery(entry, false);
 			pending.clear();
+			awaiting.clear();
 		},
 	};
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, type SwivalOverrides } from "../extensions/runtime.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -142,6 +142,18 @@ describe("buildSwivalArgs", () => {
 		expect(dir!.startsWith("/cwd")).toBe(false);
 	});
 
+	it("pins environment cache-dir when frontmatter and overrides are absent", () => {
+		const oldEnv = process.env.PI_SWIVAL_CACHE_DIR;
+		process.env.PI_SWIVAL_CACHE_DIR = "/tmp/from-env";
+		try {
+			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
+			expect(args[args.indexOf("--cache-dir") + 1]).toBe("/tmp/from-env");
+		} finally {
+			if (oldEnv === undefined) delete process.env.PI_SWIVAL_CACHE_DIR;
+			else process.env.PI_SWIVAL_CACHE_DIR = oldEnv;
+		}
+	});
+
 	it("self-review override can force-enable the reviewer loop", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { selfReview: true });
 		expect(args).toContain("--self-review");
@@ -233,6 +245,18 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("/extra2");
 		expect(args.filter((a) => a === "--add-dir-ro").length).toBe(1);
 		expect(args).toContain("/ref/repo");
+	});
+
+	it("resolves relative cache-dir overrides against the effective baseDir before passing argv", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ baseDir: "/repo/worktree" }),
+			"/tmp/r.json",
+			"/different-cwd",
+			{ cacheDir: "../shared-cache" },
+		);
+		const i = args.indexOf("--cache-dir");
+		expect(i).toBeGreaterThan(-1);
+		expect(args[i + 1]).toBe("/repo/shared-cache");
 	});
 
 	it("falls back to cwd for --base-dir when baseDir is absent", () => {

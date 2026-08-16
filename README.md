@@ -53,14 +53,14 @@ A Pi tool that dispatches single, parallel, or chained tasks to swival processes
 
 Key features beyond pi's example subagent extension:
 
-- Reviewer loop (`selfReview` or test-as-contract `reviewer`) that retries until the reviewer accepts.
+- Reviewer loop (`selfReview` or test-as-contract `reviewer`) that runs to acceptance or a configured limit. Synchronous dispatch waits for the loop to finish. Async dispatch returns after the run is durably started and the loop continues in the background.
 - AgentFS sandbox (`sandbox: agentfs`, or per-call `isolation`) that captures writes in a per-session SQLite overlay.
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
 - Async / background runs with `status` / `resume` / `interrupt`, and a completion notice pushed into the caller's session.
-- Credential preflight for selected providers and local endpoints; indeterminate results do not block dispatch. It checks ChatGPT OAuth artifacts, Bedrock through AWS STS, Google ADC artifacts for `vertexai`/`geap`, and TCP reachability for configured `generic`/`lmstudio`/`llamacpp` base URLs. Providers such as `google`, `huggingface`, `openrouter`, `applefm`, `command`, and unknown providers are not credential-validated.
+- Credential preflight for selected providers and local endpoints. Explicit provider or base URL overrides short-circuit routing. Otherwise the extension resolves the selected or active profile through bounded `swival --list-profiles`. Indeterminate routes do not block dispatch. It checks ChatGPT OAuth artifacts, Bedrock through AWS STS, Google ADC artifacts for `vertexai`/`geap`, and TCP reachability for configured `generic`/`lmstudio`/`llamacpp` base URLs. Providers such as `google`, `huggingface`, `openrouter`, `applefm`, `command`, and unknown providers are not credential-validated.
 
-See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
+See `skills/swival/SKILL.md` for dispatch examples and `extensions/runtime.ts` for the full schema.
 
 ### Skills
 
@@ -97,17 +97,17 @@ Audit agents include built-in self-review with JSON / structure contract enforce
 
 `async: true` returns a `runId` that is also the artifact directory basename, so `~/.pi/agent/swival-artifacts/<runId>/` holds the report, trace, stdout, and stderr for that run.
 
-When a background run finishes, the extension pushes a completion notice into the caller session. The notice carries the outcome, a bounded output preview, and the artifact path. After Pi accepts the message, the notifier records the delivery in memory before it attempts to write `notified.json`. A reconciler scans completed artifacts for the active session.
+When a background run finishes, the extension pushes a completion notice into the caller session. The notice carries the status, agent, run ID, and artifact path. It does not include output. Use `resume` to read the final answer. Notice status is derived from the exit marker plus `report.json`: reviewer-approved success becomes `accepted`, success without reviewer rounds becomes `completed`, `outcome: failed` becomes `rejected`, `outcome: error` becomes `error`, non-zero exits become `failed`, spawn errors become `failed`, and a null exit without `spawn-error.txt` becomes `stopped`. Delivery is acknowledged only after Pi emits the matching persisted `message_end` for that custom message. The notifier writes `notified.json` after that acknowledgement. A void `sendMessage` call is not enough. A reconciler scans completed artifacts for the active session.
 
 When [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is installed, live runs also register as background work, so `subagent_wait({})` and `subagent_wait({ all: true })` block on them. `subagent_wait({ id })` resolves subagent run ids only and will not resolve a swival run id.
 
-`status` classifies a run as running, exited, or unknown. For a run recovered from disk, a live PID must match its process start time. A reused PID cannot read as alive, and an uncertain fate reads as unknown. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
+`status` classifies a run as running, exited, or unknown. A run is `running` only when the PID is alive and its observed start time agrees with the persisted start time. A reused PID cannot read as alive, and an uncertain fate reads as unknown. `interrupt` revalidates that identity before `SIGTERM` and again before a delayed `SIGKILL`. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
 
 Environment variables:
 
 | Variable | Effect |
 |----------|--------|
-| `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the default but not a per-call `cacheDirOverride` or agent `cacheDir`. |
+| `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the repository-specific default but not a per-call `cacheDirOverride` or agent `cacheDir`. The resolved cache path must stay outside the real checkout. |
 | `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight when set to `1` or `true`; other values do not disable it. |
 | `PI_SWIVAL_ARTIFACT_ROOT` | Redirect run artifacts away from `~/.pi/agent/swival-artifacts/`. |
 | `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. |
@@ -120,12 +120,13 @@ pi-swival/
 ├── README.md
 ├── LICENSE
 ├── extensions/
-│   ├── index.ts                # swival-subagent tool implementation
+│   ├── index.ts                # minimal default Pi entry point that re-exports the extension runtime
+│   ├── runtime.ts              # internal swival-subagent tool implementation and owner of shared test helpers
 │   ├── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
-│   ├── notify.ts               # completion notices and the artifact-root reconciler
+│   ├── notify.ts               # completion notices, message_end acknowledgement handling, and the artifact-root reconciler
 │   ├── observability.ts        # liveness classification, cost and turn parsers, stderr filtering
-│   ├── cache.ts                # cache-location resolution and the in-repo ignore guard
-│   └── preflight.ts            # per-provider credential preflight
+│   ├── cache.ts                # cache-path resolution plus overlap rejection for cache and checkout paths
+│   └── preflight.ts            # credential preflight routing and provider-specific checks
 ├── agents/                     # seven bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md, scripts/swival-proxy
@@ -137,7 +138,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers pure functions and stub-runtime extension wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. The harness never starts an actual `swival` process.
+The vitest harness covers pure functions and stub Pi runtime wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. It uses real temporary files, harmless spawn sentinels, and one real ENOENT `ChildProcess` probe. It never starts an actual `swival` task or provider request.
 
 ```bash
 cd tests

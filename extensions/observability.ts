@@ -182,7 +182,6 @@ export function readProcessStartTime(pid: number): Promise<number | undefined> {
 
 export async function classifyRunLiveness(input: LivenessInput, options: LivenessOptions = {}): Promise<RunLiveness> {
 	if (input.completed || input.inMemory === "exited" || input.exitCode !== null && input.exitCode !== undefined || input.signalCode !== null && input.signalCode !== undefined) return "exited";
-	if (input.inMemory === "live") return "running";
 	if (!input.pid || !Number.isInteger(input.pid) || input.pid < 2) return "unknown";
 	const isAlive = options.isAlive ?? ((pid: number) => {
 		try { process.kill(pid, 0); return true; } catch { return false; }
@@ -191,5 +190,5 @@ export async function classifyRunLiveness(input: LivenessInput, options: Livenes
 	const processStartTime = options.processStartTime ?? readProcessStartTime;
 	const started = await processStartTime(input.pid);
 	if (started === undefined || !Number.isFinite(started)) return "unknown";
-	return started >= input.startedAt - (options.toleranceMs ?? 5000) ? "running" : "unknown";
+	return Math.abs(started - input.startedAt) <= (options.toleranceMs ?? 5000) ? "running" : "unknown";
 }

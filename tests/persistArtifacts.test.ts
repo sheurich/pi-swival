@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { persistArtifacts } from "../extensions/index.js";
+import { persistArtifacts } from "../extensions/runtime.js";
 
 describe("persistArtifacts", () => {
 	let tmpDirs: string[] = [];

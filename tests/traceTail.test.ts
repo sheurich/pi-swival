@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { startTraceTail, type TraceEvent } from "../extensions/index.js";
+import { startTraceTail, type TraceEvent } from "../extensions/runtime.js";
 
 /** Write `content` to the trace JSONL file, creating it if needed. */
 function appendTrace(filePath: string, content: string) {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { applyInlineCap } from "../extensions/index.js";
+import { applyInlineCap } from "../extensions/runtime.js";
 
 describe("applyInlineCap", () => {
 	describe("no truncation cases", () => {

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isSwivalPreflightDisabled } from "../extensions/index.js";
+import { EventEmitter } from "node:events";
+import { isSwivalPreflightDisabled } from "../extensions/runtime.js";
 
 /**
  * Wiring test for the parts the pure-function tests cannot reach: the
@@ -32,10 +33,96 @@ async function loadExtension(): Promise<(pi: never, deps?: unknown) => void> {
 interface Handlers {
 	session_start?: (event: unknown, ctx: unknown) => unknown;
 	session_shutdown?: (event: unknown, ctx: unknown) => unknown;
+	message_end?: (event: unknown, ctx: unknown) => unknown;
 }
 
 interface RegisteredTool {
 	execute: (...args: unknown[]) => Promise<unknown>;
+}
+
+interface FakeSpawnSpec {
+	args: string[];
+	cwd?: string;
+}
+
+function makeFakeChildProcess() {
+	class FakeChildProcess extends EventEmitter {
+		stdout = new EventEmitter();
+		stderr = new EventEmitter();
+		killed = false;
+		kill = vi.fn(() => {
+			this.killed = true;
+			return true;
+		});
+	}
+	return new FakeChildProcess();
+}
+
+function installThrowingSpawn(onSpawn?: (spec: FakeSpawnSpec) => void) {
+	const spawn = vi.fn((_: string, args: string[], options?: { cwd?: string }) => {
+		onSpawn?.({ args, cwd: options?.cwd });
+		throw new Error("spawn should not be reached when the collision guard rejects first");
+	});
+	vi.doMock("node:child_process", () => ({ spawn }));
+	return { spawn };
+}
+
+function installSuccessfulSpawn(onSpawn?: (spec: FakeSpawnSpec) => void) {
+	const spawn = vi.fn((_: string, args: string[], options?: { cwd?: string }) => {
+		onSpawn?.({ args, cwd: options?.cwd });
+		const proc = makeFakeChildProcess();
+		const reportIndex = args.indexOf("--report");
+		if (reportIndex !== -1) {
+			const reportPath = args[reportIndex + 1];
+			if (reportPath) {
+				fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+				fs.writeFileSync(reportPath, JSON.stringify({
+					result: { outcome: "success", answer: "ok" },
+					stats: { review_rounds: 0 },
+				}));
+			}
+		}
+		queueMicrotask(() => {
+			proc.stdout.emit("data", Buffer.from("ok\n"));
+			proc.emit("spawn");
+			proc.emit("close", 0, null);
+		});
+		return proc;
+	});
+	vi.doMock("node:child_process", () => ({ spawn }));
+	return { spawn };
+}
+
+function installAsyncSpawn(factory: (spec: FakeSpawnSpec) => EventEmitter & {
+	stdout: EventEmitter;
+	stderr: EventEmitter;
+	pid?: number;
+	unref?: () => void;
+	kill?: () => boolean;
+}) {
+	const spawn = vi.fn((_: string, args: string[], options?: { cwd?: string }) => factory({ args, cwd: options?.cwd }));
+	vi.doMock("node:child_process", () => ({ spawn }));
+	return { spawn };
+}
+
+interface StubRunState {
+	meta: {
+		runId: string;
+		agent: string;
+		task: string;
+		startedAt: number;
+		pid?: number;
+		artifactDir: string;
+		stdoutFile: string;
+		stderrFile: string;
+		sessionId?: string;
+	};
+	liveness: "running" | "exited" | "unknown";
+	exited: boolean;
+	exitCode: number | null;
+	completed?: { exitCode: number | null; exitedAt: string };
+	spawnError?: string;
+	entry?: { proc?: { once?: (event: string, listener: () => void) => void } };
 }
 
 function stubPi(sessionId: string) {
@@ -43,19 +130,27 @@ function stubPi(sessionId: string) {
 	const sent: Array<{ message: unknown; options: unknown }> = [];
 	const emitted: Array<{ channel: string; data: unknown }> = [];
 	const registered: { current?: RegisteredTool } = {};
+	const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => sessionId } };
 	const pi = {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
 			handlers[event as keyof Handlers] = handler;
 			return () => {};
 		},
 		registerTool: vi.fn((tool: RegisteredTool) => { registered.current = tool; }),
-		sendMessage: (message: unknown, options: unknown) => { sent.push({ message, options }); },
+		sendMessage: (message: unknown, options: unknown) => {
+			sent.push({ message, options });
+			queueMicrotask(() => {
+				void handlers.message_end?.({
+					type: "message_end",
+					message: { role: "custom", ...(message as Record<string, unknown>) },
+				}, ctx);
+			});
+		},
 		events: {
 			emit: (channel: string, data: unknown) => { emitted.push({ channel, data }); },
 			on: () => () => {},
 		},
 	};
-	const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => sessionId } };
 	return { pi, ctx, handlers, sent, emitted, registered };
 }
 
@@ -91,6 +186,236 @@ describe("extension wiring", () => {
 		expect(pi.registerTool).toHaveBeenCalledTimes(1);
 		expect(typeof handlers.session_start).toBe("function");
 		expect(typeof handlers.session_shutdown).toBe("function");
+	});
+
+	it("rejects same-CWD parallel tasks that resolve to the same named AgentFS session before spawn", async () => {
+		const { spawn } = installThrowingSpawn();
+		try {
+			const factory = await loadExtension();
+			const { pi, ctx, registered } = stubPi("session-1");
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			const result = await registered.current?.execute(
+				"call",
+				{
+					tasks: [
+						{ agent: "self-review-worker", task: "first", cwd: "/repo", sandboxSession: "shared-overlay" },
+						{ agent: "self-review-worker", task: "second", cwd: "/repo", sandboxSession: "shared-overlay" },
+					],
+					isolation: "agentfs",
+				},
+				undefined,
+				undefined,
+				ctx,
+			) as { content: Array<{ text: string }>; isError?: boolean };
+			const text = result.content[0]?.text ?? "";
+			expect(result.isError).toBe(true);
+			expect(text).toContain("Refusing to dispatch 2 write-capable tasks against the same cwd");
+			expect(text).toContain("[0] self-review-worker");
+			expect(text).toContain("[1] self-review-worker");
+			expect(spawn).not.toHaveBeenCalled();
+		} finally {
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("allows same-CWD AgentFS tasks that keep distinct automatic overlays and dispatches them", async () => {
+		const seen: FakeSpawnSpec[] = [];
+		const { spawn } = installSuccessfulSpawn((spec) => { seen.push(spec); });
+		try {
+			const factory = await loadExtension();
+			const { pi, ctx, registered } = stubPi("session-1");
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			const result = await registered.current?.execute(
+				"call",
+				{
+					tasks: [
+						{ agent: "self-review-worker", task: "first", cwd: "/repo" },
+						{ agent: "self-review-worker", task: "second", cwd: "/repo" },
+					],
+					isolation: "agentfs",
+				},
+				undefined,
+				undefined,
+				ctx,
+			) as { content: Array<{ text: string }>; isError?: boolean };
+			const text = result.content[0]?.text ?? "";
+			expect(result.isError).not.toBe(true);
+			expect(text).toContain("swival parallel: 2/2 ok");
+			expect(spawn).toHaveBeenCalledTimes(2);
+			expect(seen).toHaveLength(2);
+			for (const spec of seen) {
+				expect(spec.cwd).toBe("/repo");
+				expect(spec.args).toContain("--sandbox");
+				expect(spec.args[spec.args.indexOf("--sandbox") + 1]).toBe("agentfs");
+				expect(spec.args).toContain("--no-sandbox-auto-session");
+				expect(spec.args).not.toContain("--sandbox-session");
+			}
+		} finally {
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("returns a start error when the child reports ENOENT before commitment and emits no completion signal", async () => {
+		const { spawn } = installAsyncSpawn(() => {
+			const proc = makeFakeChildProcess() as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+				pid?: number;
+				unref: ReturnType<typeof vi.fn>;
+			};
+			proc.pid = undefined;
+			proc.unref = vi.fn();
+			queueMicrotask(() => {
+				const error = Object.assign(new Error("spawn swival ENOENT"), { code: "ENOENT" });
+				proc.emit("error", error);
+				proc.emit("close", null, null);
+			});
+			return proc;
+		});
+		try {
+			const factory = await loadExtension();
+			const { pi, ctx, registered, emitted, sent, handlers } = stubPi("session-1");
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			await handlers.session_start?.({}, ctx);
+			const result = await registered.current?.execute(
+				"call",
+				{ agent: "self-review-worker", task: "background task", async: true },
+				undefined,
+				undefined,
+				ctx,
+			) as { content: Array<{ text: string }>; isError?: boolean };
+			const text = result.content[0]?.text ?? "";
+			expect(result.isError).toBe(true);
+			expect(text).toContain("Failed to start async run:");
+			expect(text).not.toContain("Async swival run started");
+			expect(spawn).toHaveBeenCalledTimes(1);
+			expect(sent).toHaveLength(0);
+			expect(emitted).toEqual([]);
+		} finally {
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("kills the detached process and rolls back state when metadata persistence fails after spawn", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-meta-fail-"));
+		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+		const killProcessGroup = vi.fn();
+		let artifactDir: string | undefined;
+		const originalWriteFile = fs.promises.writeFile.bind(fs.promises);
+		const writeFile = vi.spyOn(fs.promises, "writeFile");
+		let procRef: EventEmitter | undefined;
+		const { spawn } = installAsyncSpawn((spec) => {
+			const proc = makeFakeChildProcess() as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+				pid?: number;
+				unref: ReturnType<typeof vi.fn>;
+			};
+			proc.pid = 43210;
+			proc.unref = vi.fn();
+			procRef = proc;
+			const reportIndex = spec.args.indexOf("--report");
+			const reportPath = reportIndex >= 0 ? spec.args[reportIndex + 1] : undefined;
+			artifactDir = reportPath ? path.dirname(reportPath) : undefined;
+			queueMicrotask(() => { proc.emit("spawn"); });
+			return proc;
+		});
+		try {
+			process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+			const factory = await loadExtension();
+			const { pi, ctx, registered, emitted, sent, handlers } = stubPi("session-1");
+			writeFile.mockImplementation(async (...args: Parameters<typeof fs.promises.writeFile>) => {
+				const target = String(args[0]);
+				if (target.endsWith("run-meta.json")) {
+					throw new Error("disk full while writing run-meta");
+				}
+				return originalWriteFile(...args);
+			});
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {}, killProcessGroup });
+			await handlers.session_start?.({}, ctx);
+			const pending = registered.current?.execute(
+				"call",
+				{ agent: "self-review-worker", task: "background task", async: true },
+				undefined,
+				undefined,
+				ctx,
+			) as Promise<{ content: Array<{ text: string }>; isError?: boolean }>;
+			await waitFor(() => killProcessGroup.mock.calls.length === 1);
+			expect(killProcessGroup).toHaveBeenNthCalledWith(1, 43210, "SIGTERM");
+			await waitFor(() => killProcessGroup.mock.calls.length === 2);
+			expect(killProcessGroup).toHaveBeenNthCalledWith(2, 43210, "SIGKILL");
+			procRef?.emit("close", null, null);
+			const result = await pending;
+			const text = result.content[0]?.text ?? "";
+			expect(result.isError).toBe(true);
+			expect(text).toContain("Failed to start async run: disk full while writing run-meta");
+			expect(spawn).toHaveBeenCalledTimes(1);
+			expect(sent).toHaveLength(0);
+			expect(emitted).toEqual([]);
+			expect(artifactDir).toBeDefined();
+			if (artifactDir) {
+				expect(fs.existsSync(path.join(artifactDir, "run-meta.json"))).toBe(false);
+			}
+		} finally {
+			writeFile.mockRestore();
+			if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+			fs.rmSync(root, { recursive: true, force: true });
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("defers exactly one completion signal when the child exits before metadata commitment", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-early-exit-"));
+		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+		try {
+			process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+			const { spawn } = installAsyncSpawn((spec) => {
+				const proc = makeFakeChildProcess() as EventEmitter & {
+					stdout: EventEmitter;
+					stderr: EventEmitter;
+					pid?: number;
+					unref: ReturnType<typeof vi.fn>;
+				};
+				proc.pid = 50123;
+				proc.unref = vi.fn();
+				const reportIndex = spec.args.indexOf("--report");
+				const reportPath = reportIndex >= 0 ? spec.args[reportIndex + 1] : undefined;
+				if (reportPath) {
+					fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+					fs.writeFileSync(reportPath, JSON.stringify({ result: { outcome: "success", answer: "ok" }, stats: { review_rounds: 0 } }));
+				}
+				queueMicrotask(() => {
+					proc.emit("spawn");
+					proc.emit("close", 0, null);
+				});
+				return proc;
+			});
+			const factory = await loadExtension();
+			const { pi, ctx, registered, sent, emitted, handlers } = stubPi("session-1");
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			await handlers.session_start?.({}, ctx);
+			const result = await registered.current?.execute(
+				"call",
+				{ agent: "self-review-worker", task: "background task", async: true },
+				undefined,
+				undefined,
+				ctx,
+			) as { content: Array<{ text: string }>; isError?: boolean };
+			const text = result.content[0]?.text ?? "";
+			expect(result.isError).not.toBe(true);
+			expect(text).toContain("Async swival run started.");
+			await waitFor(() => sent.length === 1);
+			expect(sent).toHaveLength(1);
+			expect((sent[0]!.message as { content: string }).content).toContain("completed: **self-review-worker**");
+			expect(emitted.filter((event) => event.channel === "pi-swival:run-finished")).toHaveLength(1);
+			expect(spawn).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+			fs.rmSync(root, { recursive: true, force: true });
+			vi.doUnmock("node:child_process");
+		}
 	});
 
 	it("disposes both previous registrations before replacing them", async () => {
@@ -169,6 +494,100 @@ describe("extension wiring", () => {
 		}
 	});
 
+	it("reports the latest review round from bounded stderr status output", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wiring-review-round-"));
+		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+		try {
+			const artifactRoot = path.join(root, "artifacts");
+			const runDir = writeCompletedRun(artifactRoot, "review-round-run", "session-1");
+			fs.writeFileSync(path.join(runDir, "stderr.txt"), [
+				"noise",
+				"▶ Review round 1: sending answer to reviewer",
+				"more noise",
+				"▶ Review round 3: sending answer to reviewer",
+			].join("\n"));
+			const completed = JSON.parse(fs.readFileSync(path.join(runDir, "completed.json"), "utf8")) as Record<string, unknown>;
+			completed.exitedAt = new Date(Date.now() + 1500).toISOString();
+			fs.writeFileSync(path.join(runDir, "completed.json"), JSON.stringify(completed));
+			process.env.PI_SWIVAL_ARTIFACT_ROOT = artifactRoot;
+			const factory = await loadExtension();
+			const { pi, ctx, registered } = stubPi("session-1");
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			const result = await registered.current?.execute("call", { action: "status", id: "review-round-run" }, undefined, undefined, ctx);
+			const text = (result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+			expect(text).toContain("review round: 3");
+			expect(text).not.toContain("review round: 1");
+		} finally {
+			if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("revalidates identity before SIGTERM and before delayed SIGKILL, and cancels escalation on close", async () => {
+		vi.useFakeTimers();
+		try {
+			const factory = await loadExtension();
+			const { pi, ctx, registered } = stubPi("session-1");
+			const closeListeners: Array<() => void> = [];
+			const state: StubRunState = {
+				meta: {
+					runId: "interrupt-run",
+					agent: "self-review-worker",
+					task: "t",
+					startedAt: 1_000_000,
+					pid: 4321,
+					artifactDir: "/tmp/interrupt-run",
+					stdoutFile: "/tmp/interrupt-run/stdout.txt",
+					stderrFile: "/tmp/interrupt-run/stderr.txt",
+					sessionId: "session-1",
+				},
+				liveness: "running",
+				exited: false,
+				exitCode: null,
+				entry: { proc: { once: (_event, listener) => { closeListeners.push(listener); } } },
+			};
+			const loadRunState = vi.fn(async () => state);
+			const revalidate = vi.fn(async () => true);
+			const killProcessGroup = vi.fn();
+			factory(pi as never, {
+				startReconciler: () => () => {},
+				registerBackgroundWorkProvider: () => () => {},
+				loadRunState,
+				revalidateRunIdentity: revalidate,
+				killProcessGroup,
+			});
+
+			const first = await registered.current?.execute("call", { action: "interrupt", id: "interrupt-run" }, undefined, undefined, ctx);
+			const firstText = (first as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+			expect(firstText).toContain("Sent SIGTERM");
+			expect(revalidate).toHaveBeenCalledTimes(1);
+			expect(killProcessGroup).toHaveBeenNthCalledWith(1, 4321, "SIGTERM");
+
+			closeListeners.forEach((listener) => listener());
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(revalidate).toHaveBeenCalledTimes(1);
+			expect(killProcessGroup).toHaveBeenCalledTimes(1);
+
+			revalidate.mockResolvedValueOnce(false);
+			const second = await registered.current?.execute("call", { action: "interrupt", id: "interrupt-run" }, undefined, undefined, ctx);
+			const secondText = (second as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+			expect(secondText).toContain("identity changed");
+			expect(killProcessGroup).toHaveBeenCalledTimes(1);
+
+			revalidate.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+			const third = await registered.current?.execute("call", { action: "interrupt", id: "interrupt-run" }, undefined, undefined, ctx);
+			const thirdText = (third as { content: Array<{ text: string }> }).content[0]?.text ?? "";
+			expect(thirdText).toContain("Sent SIGTERM");
+			expect(killProcessGroup).toHaveBeenNthCalledWith(2, 4321, "SIGTERM");
+			await vi.advanceTimersByTimeAsync(5000);
+			expect(revalidate).toHaveBeenCalledTimes(4);
+			expect(killProcessGroup).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("delivers a completed run owned by this session, and ignores others", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wiring-"));
 		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
@@ -191,13 +610,16 @@ describe("extension wiring", () => {
 				await handlers.session_start?.({ reason: "startup" }, ctx);
 				// The wired notifier batches clean completions for 1500 ms by default.
 				await waitFor(() => sent.length >= 1);
+				await waitFor(() => fs.existsSync(path.join(mine, "notified.json")));
 
 				expect(sent).toHaveLength(1);
-				const message = sent[0]!.message as { customType: string; content: string; display: boolean };
+				const message = sent[0]!.message as { customType: string; content: string; display: boolean; details?: Record<string, unknown> };
 				expect(message.customType).toBe("swival-notify");
 				expect(message.content).toContain("mine-1-aaaa");
-				expect(message.content).toContain("the final answer");
+				expect(message.content).toContain(`Artifact dir: ${mine}`);
+				expect(message.content).not.toContain("the final answer");
 				expect(message.display).toBe(false);
+				expect(message.details).toMatchObject({ runIds: ["mine-1-aaaa"] });
 				expect(sent[0]!.options).toMatchObject({ triggerTurn: true });
 
 				expect(fs.existsSync(path.join(mine, "notified.json"))).toBe(true);

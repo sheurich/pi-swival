@@ -38,49 +38,66 @@ export function resolveCacheDir(input: CacheResolutionInput): CacheResolution {
 	return { dir: path.join(stateRoot, `${human}-${digest}`), source: "default" };
 }
 
-export interface CacheGuardFs {
-	mkdir(dir: string, options: { recursive: true }): Promise<void>;
-	readFile(file: string, encoding: "utf8"): Promise<string>;
-	writeFile(file: string, contents: string, encoding: "utf8"): Promise<void>;
-}
-
-const nodeCacheFs: CacheGuardFs = {
-	mkdir: (dir, options) => fs.promises.mkdir(dir, options),
-	readFile: (file, encoding) => fs.promises.readFile(file, encoding),
-	writeFile: (file, contents, encoding) => fs.promises.writeFile(file, contents, encoding),
-};
-
 function isInside(child: string, parent: string): boolean {
 	const relative = path.relative(parent, child);
 	return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-/** Ensure a cache inside a checkout cannot add cache files to git. */
-export async function ensureCacheGuard(
-	cacheDir: string,
-	baseDir: string,
-	fileSystem: CacheGuardFs = nodeCacheFs,
-): Promise<void> {
+function isSameOrInside(child: string, parent: string): boolean {
+	return child === parent || isInside(child, parent);
+}
+
+function isMissingPathError(error: unknown): boolean {
+	return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+async function canonicalizePath(target: string, seen: ReadonlySet<string> = new Set()): Promise<string> {
+	const resolved = path.resolve(target);
+	if (seen.has(resolved)) {
+		throw new Error(`Unsafe cache path ${target} contains a symlink loop.`);
+	}
+	const nextSeen = new Set(seen);
+	nextSeen.add(resolved);
+	const { root } = path.parse(resolved);
+	const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+	let current = root;
+	for (let index = 0; index < parts.length; index++) {
+		const candidate = path.join(current, parts[index]);
+		let stats: fs.Stats;
+		try {
+			stats = await fs.promises.lstat(candidate);
+		} catch (error) {
+			if (!isMissingPathError(error)) throw error;
+			return path.join(current, ...parts.slice(index));
+		}
+		if (stats.isSymbolicLink()) {
+			const linkTarget = await fs.promises.readlink(candidate);
+			const canonicalTarget = await canonicalizePath(path.resolve(current, linkTarget), nextSeen);
+			return index + 1 < parts.length
+				? canonicalizePath(path.join(canonicalTarget, ...parts.slice(index + 1)), nextSeen)
+				: canonicalTarget;
+		}
+		current = candidate;
+	}
+	return current;
+}
+
+/** Reject cache/checkouts that overlap in either direction, including through symlinks. */
+export async function ensureCacheGuard(cacheDir: string, baseDir: string): Promise<void> {
 	const resolvedCache = path.resolve(cacheDir);
 	const resolvedBase = path.resolve(baseDir);
-	if (!isInside(resolvedCache, resolvedBase)) return;
-	await fileSystem.mkdir(resolvedCache, { recursive: true });
-	const ignoreFile = path.join(resolvedCache, ".gitignore");
-	let existing: string | undefined;
-	try {
-		existing = await fileSystem.readFile(ignoreFile, "utf8");
-	} catch {
-		// A missing ignore file is the normal case.
+	const [canonicalCache, canonicalBase] = await Promise.all([
+		canonicalizePath(resolvedCache),
+		canonicalizePath(resolvedBase),
+	]);
+	const overlaps =
+		isSameOrInside(resolvedCache, resolvedBase)
+		|| isSameOrInside(resolvedBase, resolvedCache)
+		|| isSameOrInside(canonicalCache, canonicalBase)
+		|| isSameOrInside(canonicalBase, canonicalCache);
+	if (overlaps) {
+		throw new Error(`Unsafe cache path ${cacheDir} overlaps the checkout ${baseDir}. Choose a cache directory outside the checkout.`);
 	}
-	if (existing !== undefined) {
-		const ignoresEverything = existing.split(/\r?\n/).some((line) => line.trim() === "*");
-		if (ignoresEverything) return;
-		// Preserve a user's existing rules; the final rule is the belt-and-braces
-		// cache guard. We never replace an existing .gitignore wholesale.
-		await fileSystem.writeFile(ignoreFile, `${existing.replace(/\s*$/, "")}\n*\n`, "utf8");
-		return;
-	}
-	await fileSystem.writeFile(ignoreFile, "*\n", "utf8");
 }
 
 export { isInside as isCacheInside };

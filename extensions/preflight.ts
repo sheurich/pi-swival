@@ -6,6 +6,7 @@ import { execFile as nodeExecFile } from "node:child_process";
 
 export type PreflightStatus = "pass" | "failure" | "indeterminate";
 export type PreflightProvider = "bedrock" | "chatgpt" | "vertexai" | "geap" | "generic" | "lmstudio" | "llamacpp" | "unknown";
+export type CredentialRoutingStatus = "resolved-explicit" | "resolved-profile" | "indeterminate";
 
 export interface PreflightResult {
 	status: PreflightStatus;
@@ -25,6 +26,29 @@ export interface CredentialPreflightInput {
 	connect?: TcpConnect;
 }
 
+export interface CredentialPreflightRoute {
+	provider: string | undefined;
+	baseUrl: string | undefined;
+	routingStatus: CredentialRoutingStatus;
+	message?: string;
+}
+
+export interface ResolveCredentialPreflightRouteInput {
+	agent: {
+		provider?: string;
+		baseUrl?: string;
+		profile?: string;
+		baseDir?: string;
+	};
+	overrides: {
+		provider?: string;
+		baseUrl?: string;
+		profile?: string;
+	};
+	cwd: string | undefined;
+	execFile?: ExecFile;
+}
+
 export interface CredentialFileSystem {
 	readFile(file: string, encoding: "utf8"): Promise<string>;
 }
@@ -36,6 +60,10 @@ export interface ExecFile {
 export interface TcpConnect {
 	(url: string, timeoutMs: number): Promise<boolean>;
 }
+
+const PROFILE_LIST_TIMEOUT_MS = 1500;
+const PROFILE_LIST_MAX_BUFFER = 64 * 1024;
+const ROUTING_INDETERMINATE_MESSAGE = "Credential preflight routing is indeterminate; dispatch was not blocked.";
 
 const realFs: CredentialFileSystem = {
 	readFile: (file, encoding) => fs.promises.readFile(file, encoding),
@@ -76,6 +104,89 @@ function failure(provider: string, missing: string, fix: string): PreflightResul
 
 function indeterminate(provider: string): PreflightResult {
 	return { status: "indeterminate", provider, message: `${provider} credential preflight is indeterminate; dispatch was not blocked.` };
+}
+
+function stripAnsi(s: string): string {
+	// Remove CSI / OSC / SGR sequences. Not exhaustive but covers swival's output.
+	return s.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, "");
+}
+
+function parseResolvedProfile(stdout: string): { provider: string; baseUrl: string | undefined } | undefined {
+	for (const rawLine of stdout.split(/\r?\n/u)) {
+		const line = stripAnsi(rawLine);
+		if (!line.startsWith("→ ")) continue;
+		const match = /^→\s+(\S+)\s+(\S+)\s+\/\s+\S+(?:\s+base=(\S+?))?(?:,|\s{2,}|$)/u.exec(line);
+		if (!match) return undefined;
+		const provider = match[2]?.trim();
+		if (!provider) return undefined;
+		const baseUrl = match[3]?.trim();
+		return { provider, baseUrl: baseUrl && baseUrl !== "-" ? baseUrl : undefined };
+	}
+	return undefined;
+}
+
+export async function resolveCredentialPreflightRoute(input: ResolveCredentialPreflightRouteInput): Promise<CredentialPreflightRoute> {
+	const { agent, overrides, cwd } = input;
+	const provider = overrides.provider ?? agent.provider;
+	const baseUrl = overrides.baseUrl ?? agent.baseUrl;
+	if (provider || baseUrl) {
+		return {
+			provider,
+			baseUrl,
+			routingStatus: "resolved-explicit",
+		};
+	}
+	const baseDir = agent.baseDir ?? cwd;
+	if (!baseDir) {
+		return {
+			provider: undefined,
+			baseUrl: undefined,
+			routingStatus: "indeterminate",
+			message: ROUTING_INDETERMINATE_MESSAGE,
+		};
+	}
+	const args = ["--base-dir", baseDir];
+	const profile = overrides.profile ?? agent.profile;
+	if (profile) args.push("--profile", profile);
+	args.push("--list-profiles");
+	try {
+		const resolved = await new Promise<CredentialPreflightRoute>((resolve) => {
+			(input.execFile ?? realExecFile)("swival", args, { timeout: PROFILE_LIST_TIMEOUT_MS, maxBuffer: PROFILE_LIST_MAX_BUFFER }, (error, stdout) => {
+				if (error) {
+					resolve({
+						provider: undefined,
+						baseUrl: undefined,
+						routingStatus: "indeterminate",
+						message: ROUTING_INDETERMINATE_MESSAGE,
+					});
+					return;
+				}
+				const route = parseResolvedProfile(stdout);
+				if (!route) {
+					resolve({
+						provider: undefined,
+						baseUrl: undefined,
+						routingStatus: "indeterminate",
+						message: ROUTING_INDETERMINATE_MESSAGE,
+					});
+					return;
+				}
+				resolve({
+					provider: route.provider,
+					baseUrl: route.baseUrl,
+					routingStatus: "resolved-profile",
+				});
+			});
+		});
+		return resolved;
+	} catch {
+		return {
+			provider: undefined,
+			baseUrl: undefined,
+			routingStatus: "indeterminate",
+			message: ROUTING_INDETERMINATE_MESSAGE,
+		};
+	}
 }
 
 function execCheck(
@@ -172,7 +283,7 @@ async function checkAdc(input: CredentialPreflightInput, provider: string): Prom
 
 export async function credentialPreflight(input: CredentialPreflightInput): Promise<PreflightResult> {
 	const provider = providerName(input.provider);
-	if (provider === "unknown") return { status: "pass", provider: input.provider ?? "unknown" };
+	if (provider === "unknown") return { status: "indeterminate", provider: input.provider ?? "unknown", message: `${input.provider ?? "unknown"} credential preflight is indeterminate; dispatch was not blocked.` };
 	try {
 		if (provider === "bedrock") return await checkBedrock(input, provider);
 		if (provider === "chatgpt") return await checkChatgpt(input, provider);

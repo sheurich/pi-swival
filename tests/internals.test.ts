@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mapWithConcurrency, computeErrorMessage, TaskItem, ChainItem } from "../extensions/index.js";
+import { mapWithConcurrency, computeErrorMessage, TaskItem, ChainItem } from "../extensions/runtime.js";
 
 describe("TaskItem schema", () => {
 	it("forbids additional properties (rejects silently-dropped unknown fields)", () => {

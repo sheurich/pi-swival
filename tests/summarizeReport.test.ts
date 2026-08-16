@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { classifyFailure, isRunFailure, summarizeReport } from "../extensions/index.js";
+import { classifyFailure, isRunFailure, summarizeReport } from "../extensions/runtime.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // Fixture provenance: both JSON files were introduced by commit ac55843 as test
