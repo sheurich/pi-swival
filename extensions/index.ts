@@ -40,6 +40,7 @@ import {
 	discoverSwivalAgents,
 	type SwivalAgentConfig,
 } from "./agents.js";
+import { createSwivalNotifier, startSwivalReconciler, type SwivalNotifier } from "./notify.js";
 
 // Maximum array size of tasks[] and chain[] params.
 const MAX_PARALLEL_TASKS = 8;
@@ -70,6 +71,7 @@ export interface RunMeta {
 	/** PID of the spawned swival process. Stored so we can probe it with
 	 *  `process.kill(pid, 0)` after the in-memory entry is gone. */
 	pid: number | undefined;
+	sessionId?: string;
 	artifactDir: string;
 	stdoutFile: string;
 	stderrFile: string;
@@ -80,6 +82,15 @@ interface AsyncRunEntry {
 	proc: ChildProcess;
 	exited: boolean;
 	exitCode: number | null;
+}
+
+export function mapSwivalActiveWork(
+	entries: readonly { meta: Pick<RunMeta, "runId" | "sessionId">; exited: boolean }[],
+	sessionId: string,
+): readonly { id: string; sessionId: string }[] {
+	return entries
+		.filter((entry) => !entry.exited && entry.meta.sessionId === sessionId)
+		.map((entry) => ({ id: entry.meta.runId, sessionId }));
 }
 
 /** Written to `<artifactDir>/completed.json` when an async run exits (or fails to start). */
@@ -103,7 +114,7 @@ interface RunStateInfo {
 
 /**
  * Module-level registry of in-flight and recently completed async runs.
- * Keyed by runId (`swival-run-<timestamp>`). Entries are added when a
+ * Keyed by the artifact-directory basename. Entries are added when a
  * background spawn succeeds and updated (exited=true, exitCode set) when the
  * process closes. Entries survive only for the lifetime of the Pi process;
  * cross-session recovery falls back to scanning `run-meta.json` files in the
@@ -941,7 +952,7 @@ interface ArtifactDirMint {
  * The runId includes the suffix so two runs starting within the same millisecond
  * produce distinct IDs.
  */
-function mintArtifactDir(
+export function mintArtifactDir(
 	agentName: string,
 	artifactRoot: string = ARTIFACT_ROOT,
 	ts: number = Date.now(),
@@ -952,8 +963,8 @@ function mintArtifactDir(
 			.replace(/\.+/g, ".")
 			.replace(/^[._-]+/, "") || "swival";
 	const suffix = randomBytes(4).toString("hex");
-	const runId = `swival-run-${ts}-${suffix}`;
 	const artifactDir = path.join(artifactRoot, `${safeAgent}-${ts}-${suffix}`);
+	const runId = path.basename(artifactDir);
 	return { artifactDir, ts, runId };
 }
 
@@ -1206,6 +1217,8 @@ async function runSingleSwivalAsync(
 	task: string,
 	cwd: string | undefined,
 	overrides: SwivalOverrides,
+	sessionId: string | undefined,
+	onFinish: (meta: RunMeta, exitCode: number | null) => void,
 ): Promise<{ runId: string; artifactDir: string }> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
@@ -1263,6 +1276,7 @@ async function runSingleSwivalAsync(
 		task,
 		startedAt: ts,
 		pid: proc.pid,
+		sessionId,
 		artifactDir,
 		stdoutFile,
 		stderrFile,
@@ -1289,7 +1303,7 @@ async function runSingleSwivalAsync(
 		const marker: CompletedMarker = { exitCode: code, exitedAt: new Date().toISOString() };
 		fs.promises
 			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.catch(() => { /* best-effort */ });
+			.then(() => onFinish(meta, code), () => { /* best-effort */ });
 		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
 	});
 
@@ -1306,7 +1320,7 @@ async function runSingleSwivalAsync(
 		const marker: CompletedMarker = { exitCode: null, exitedAt: new Date().toISOString() };
 		fs.promises
 			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.catch(() => { /* best-effort */ });
+			.then(() => onFinish(meta, null), () => { /* best-effort */ });
 		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
 	});
 
@@ -1769,12 +1783,12 @@ const SwivalParams = Type.Object({
 	// ---- async / background execution ----
 
 	/** When true, spawn the swival process detached and return immediately with
-	 *  a `runId`. Only applies to single-agent mode (agent+task). Parallel and
+	 *  a `runId` (the artifact-directory basename). Only applies to single-agent mode (agent+task). Parallel and
 	 *  chain modes ignore this flag and always run synchronously. */
 	async: Type.Optional(
 		Type.Boolean({
 			description:
-				"Single mode only: spawn swival in the background and return immediately with a runId (e.g. swival-run-<timestamp>). Stdout/stderr are piped to files in the artifact dir so output is preserved. Use action:status/resume/interrupt with the returned runId to manage the run.",
+				"Single mode only: spawn swival in the background and return immediately with a runId (the artifact-directory basename). Stdout/stderr are piped to files in the artifact dir so output is preserved. Use action:status/resume/interrupt with the returned runId to manage the run.",
 		}),
 	),
 
@@ -1789,7 +1803,7 @@ const SwivalParams = Type.Object({
 	/** runId of the async run to query (returned by a prior async invocation). */
 	id: Type.Optional(
 		Type.String({
-			description: "runId returned by a previous async invocation (e.g. swival-run-1716326580000). Required when action is set.",
+			description: "runId returned by a previous async invocation (the artifact-directory basename). Required when action is set.",
 		}),
 	),
 });
@@ -1975,6 +1989,49 @@ export function buildParallelSummary(
 }
 
 export default function (pi: ExtensionAPI) {
+	let currentSessionId: string | undefined;
+	let stopReconciler: (() => void) | undefined;
+	let backgroundWorkDisposer: (() => void) | undefined;
+	let notifier: SwivalNotifier | undefined;
+
+	pi.on("session_start", async (_event, ctx) => {
+		currentSessionId = ctx.sessionManager.getSessionId();
+		notifier = createSwivalNotifier(pi, { currentSessionId });
+		stopReconciler = startSwivalReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
+		try {
+			const moduleName = "pi-subagents/background-work";
+			const module = await import(moduleName) as {
+				registerBackgroundWorkProvider(provider: {
+					name: string;
+					wakeChannels: readonly string[];
+					listActiveWork(): readonly { id: string; sessionId: string }[];
+					reconcile?: (context: { sessionId: string; nowMs: number }) => void;
+				}): () => void;
+			};
+			// Registration makes live runs count as active work for subagent_wait.
+			// Residual limit: subagent_wait resolves subagent run ids only, so
+			// { id: "<swival run id>" } still will not resolve. {} and
+			// { all: true } do block on swival work.
+			backgroundWorkDisposer = module.registerBackgroundWorkProvider({
+				name: "pi-swival",
+				wakeChannels: ["pi-swival:run-finished"],
+				listActiveWork: () => currentSessionId ? mapSwivalActiveWork([...asyncRuns.values()], currentSessionId) : [],
+				reconcile: () => { void notifier?.reconcile(ARTIFACT_ROOT); },
+			});
+		} catch {
+			/* pi-subagents is optional; swival remains usable without it */
+		}
+	});
+
+	pi.on("session_shutdown", () => {
+		stopReconciler?.();
+		stopReconciler = undefined;
+		backgroundWorkDisposer?.();
+		backgroundWorkDisposer = undefined;
+		notifier = undefined;
+		currentSessionId = undefined;
+	});
+
 	pi.registerTool({
 		name: "swival-subagent",
 		label: "Swival subagent",
@@ -2453,6 +2510,14 @@ export default function (pi: ExtensionAPI) {
 						task,
 						params.cwd,
 						overrides,
+						ctx.sessionManager.getSessionId(),
+						(meta, exitCode) => {
+							const status = exitCode === 0 ? "completed" : exitCode === null ? "stopped" : "failed";
+							if (notifier) {
+								void notifier.deliver({ runId: meta.runId, agent: meta.agent, artifactDir: meta.artifactDir, sessionId: meta.sessionId, status, stdoutFile: meta.stdoutFile });
+							}
+							pi.events.emit("pi-swival:run-finished", { runId: meta.runId, sessionId: meta.sessionId });
+						},
 					));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
