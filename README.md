@@ -54,10 +54,11 @@ A Pi tool that dispatches single, parallel, or chained tasks to swival processes
 Key features beyond pi's example subagent extension:
 
 - Reviewer loop (`selfReview` or test-as-contract `reviewer`) that retries until the reviewer accepts.
-- AgentFS sandbox (`sandbox: agentfs`) that captures writes in a per-session SQLite overlay.
+- AgentFS sandbox (`sandbox: agentfs`, or per-call `isolation`) that captures writes in a per-session SQLite overlay.
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
-- Async / background runs with cross-session `status` / `resume` / `interrupt`.
+- Async / background runs with cross-session `status` / `resume` / `interrupt`, and a completion notice pushed into the caller's session.
+- A credential preflight that refuses to dispatch against an expired or missing provider credential.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
 
@@ -92,6 +93,24 @@ The first four were extracted from the original `swival-subagent` Pi extension. 
 
 Audit agents include built-in self-review with JSON / structure contract enforcement, an AgentFS sandbox, and a read-only command allowlist.
 
+## Background runs
+
+`async: true` returns a `runId` that is also the artifact directory basename, so `~/.pi/agent/swival-artifacts/<runId>/` holds the report, trace, stdout, and stderr for that run.
+
+When a background run finishes, the extension pushes a completion notice into the session that launched it. The notice carries the outcome, a bounded output preview, and the artifact path, and it wakes an idle session so a failure cannot sit unnoticed. Delivery is acknowledged by a `notified.json` marker written only after Pi accepts the message, and a reconciler rescans the artifact root, because the in-process exit handler cannot fire if Pi itself has been restarted.
+
+When [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is installed, live runs also register as background work, so `subagent_wait({})` and `subagent_wait({ all: true })` block on them. `subagent_wait({ id })` resolves subagent run ids only and will not resolve a swival run id.
+
+`status` classifies a run as running, exited, or unknown. A live pid must corroborate against its process start time, so a reused pid cannot read as alive, and a run whose fate cannot be established is reported as unknown rather than as running. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
+
+Environment variables:
+
+| Variable | Effect |
+|----------|--------|
+| `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the default but not a per-call `cacheDirOverride` or agent `cacheDir`. |
+| `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight. |
+| `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. |
+
 ## Layout
 
 ```text
@@ -101,7 +120,11 @@ pi-swival/
 ├── LICENSE
 ├── extensions/
 │   ├── index.ts                # swival-subagent tool implementation
-│   └── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
+│   ├── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
+│   ├── notify.ts               # completion notices and the artifact-root reconciler
+│   ├── observability.ts        # liveness classification, cost and turn parsers, stderr filtering
+│   ├── cache.ts                # cache-location resolution and the in-repo ignore guard
+│   └── preflight.ts            # per-provider credential preflight
 ├── agents/                     # seven bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md, scripts/swival-proxy
@@ -113,7 +136,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers the pure functions in `extensions/index.ts` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, and bundled-agent integrity. The harness never spawns an actual `swival` process; everything under test is pure.
+The vitest harness covers the pure functions in `extensions/` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, bundled-agent integrity, completion-notice delivery, liveness classification, the cost and turn parsers, cache-location resolution, and the credential preflight. The harness never spawns an actual `swival` process; everything under test is pure or injected.
 
 ```bash
 cd tests
@@ -160,6 +183,9 @@ Pi does not ship a subagent tool by default. The closest reference points are th
 | Parallel execution        | yes                   | yes                   |
 | Chain mode (`{previous}`) | yes                   | yes                   |
 | Async / background runs   | no                    | yes (single-mode only) |
+| Completion notice to caller | n/a                 | yes                   |
+| Credential preflight      | no                    | yes                   |
+| Mid-run steering          | no                    | no                    |
 
 Use the example subagent (or a third-party equivalent) when fine-grained tool-call visibility matters more than correctness checks. Use `swival-subagent` when correctness or sandboxing matters more than display fidelity. The two coexist — install both and pick per task.
 
@@ -167,8 +193,11 @@ Use the example subagent (or a third-party equivalent) when fine-grained tool-ca
 
 - Per-tool-call streaming comes from tailing swival's `--trace-dir` JSONL output and may lag on filesystems with weak `fs.watch` semantics.
 - The system prompt body is passed as `--system-prompt` argv. Hundreds-of-KB bodies can hit platform `ARG_MAX`; split long guidance into a skills directory passed via `extraArgs` instead.
-- Parallel tasks share the host working tree (no git worktree isolation). Tasks that mutate overlapping files must be dispatched serially or run with per-task `cwd` pointing at pre-created worktrees.
+- Parallel tasks share the host working tree. `isolation: "agentfs"` gives each child its own overlay; without it, tasks that mutate overlapping files must be dispatched serially or given per-task `cwd` pointing at pre-created worktrees.
 - `async: true` is single-mode only. Parallel and chain modes always run synchronously.
+- Completion notices reach only the session that launched the run. A different session will not be told, by design.
+- Session cost is parsed from swival's stderr, because `report.json` carries neither cost nor token totals. A run whose calls are all unpriced reports no cost rather than zero.
+- There is no mid-run channel. swival exposes no control file, signal, or stdin reader outside its REPL, so a running child cannot be steered; `interrupt` and a fresh dispatch are the only options.
 - Artifact directories under `~/.pi/agent/swival-artifacts/` are auto-pruned at 7 days. Back up reports you need longer.
 - Swival's interactive `/goal` REPL command is not available here — the extension always invokes swival non-interactively.
 

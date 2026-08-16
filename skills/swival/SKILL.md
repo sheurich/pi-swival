@@ -93,19 +93,23 @@ Run a long task in the background and return immediately:
 swival-subagent with agent: "self-review-worker", task: "Refactor the auth module", async: true
 ```
 
-The tool returns a `runId` (e.g. `swival-run-1716326580000`). `async: true` is only supported in single-agent mode, not chain/parallel.
+The tool returns a `runId`, which is also the artifact directory basename, so the run's report, trace, stdout, and stderr live in `~/.pi/agent/swival-artifacts/<runId>/`. `async: true` is only supported in single-agent mode, not chain/parallel.
+
+When the run finishes, the extension pushes a completion notice into the session that launched it, so a failed or dead child does not wait for someone to poll. Notices reach only the launching session.
 
 Once started, manage it using `action` and `id`:
 
 | Action      | Description |
 |-------------|-------------|
-| `status`    | Check if running, or get the final outcome if done |
+| `status`    | Liveness plus progress: turn depth, last tool call, last activity, review round, and cost |
 | `resume`    | Get the final answer and reviewer feedback when finished |
 | `interrupt` | Cancel a running task via SIGTERM |
 
+`status` reports one of three states. `running` means a live process, corroborated against its start time so a reused pid cannot read as alive. `exited` means a completion marker exists. `unknown` means the fate cannot be established, usually because the owning Pi process exited before writing the marker; it is never reported as running.
+
 Example:
 ```
-swival-subagent with action: "status", id: "swival-run-1716326580000"
+swival-subagent with action: "status", id: "self-review-worker-1786846761-3f9c2a10"
 ```
 
 ### Dispatch-time overrides
@@ -130,6 +134,9 @@ definition:
 | `seedOverride` | Deterministic seed |
 | `reasoningEffortOverride` | Reasoning effort level |
 | `cacheOverride` | Enable LLM response caching |
+| `isolation` | Sandbox for this call: `inherit`, `builtin`, or `agentfs`. Outranks frontmatter and `yolo`. |
+| `sandboxSessionOverride` | AgentFS session id |
+| `noSandboxAutoSessionOverride` | AgentFS automatic session creation |
 | `cacheDirOverride` | Cache directory |
 
 ## Authoring Agent Definitions
@@ -342,6 +349,10 @@ Proxy manager: `swival-proxy start|stop|status|restart`.
 | `ContextOverflowError` | Prompt exceeds context after truncation retries | `--proactive-summaries`; larger-context model |
 | `ToolsNotSupportedError` | Model lacks function calling | Switch model; check `--extra-body` |
 | `LifecycleError` | Hook failed under `--lifecycle-fail-closed` | Inspect hook; drop fail-closed |
+| `credential preflight failed` | The resolved provider has no usable credential; dispatch was refused before spawn | Follow the fix named in the message; `PI_SWIVAL_NO_PREFLIGHT=1` skips the check |
+| Cloudflare challenge HTML from the ChatGPT backend | OAuth token missing or expired, or the model belongs to a different provider | Run `swival --provider chatgpt` once interactively; check the provider and model pair |
+
+A provider and a model are chosen independently, so a config model can reach a CLI-selected provider that has never heard of it. `--provider chatgpt` with a Bedrock model id produces a Cloudflare challenge, not a useful error.
 
 Infrastructure failures: expired AWS SSO, 401/403/429,
 `ECONNREFUSED` (proxy down), `E2BIG` (giant system prompt).
