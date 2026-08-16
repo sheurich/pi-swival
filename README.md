@@ -109,6 +109,7 @@ Environment variables:
 |----------|--------|
 | `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the default but not a per-call `cacheDirOverride` or agent `cacheDir`. |
 | `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight. |
+| `PI_SWIVAL_ARTIFACT_ROOT` | Redirect run artifacts away from `~/.pi/agent/swival-artifacts/`. |
 | `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. |
 
 ## Layout

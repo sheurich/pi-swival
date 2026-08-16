@@ -83,7 +83,13 @@ const STDERR_TAIL_LINES = 30;
 const STDOUT_RING_CHARS = 256 * 1024;
 // Artifacts are copied here before the per-run temp dir is deleted. Caller
 // sees report.json + trace JSONL under a timestamped subdir keyed by agent.
-const ARTIFACT_ROOT = path.join(os.homedir(), ".pi", "agent", "swival-artifacts");
+/**
+ * Where run artifacts live. `PI_SWIVAL_ARTIFACT_ROOT` redirects them, which
+ * also lets the wiring test drive the real reconciler against a scratch dir.
+ */
+const ARTIFACT_ROOT = process.env.PI_SWIVAL_ARTIFACT_ROOT
+	? path.resolve(process.env.PI_SWIVAL_ARTIFACT_ROOT)
+	: path.join(os.homedir(), ".pi", "agent", "swival-artifacts");
 
 // ------------------------------------------------- async run tracking --
 
