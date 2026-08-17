@@ -3,7 +3,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
-import { isSwivalPreflightDisabled } from "../extensions/runtime.js";
+import {
+	BACKGROUND_WORK_PROTOCOL_VERSION,
+	BACKGROUND_WORK_REGISTER_EVENT,
+	BACKGROUND_WORK_UNREGISTER_EVENT,
+	isSwivalPreflightDisabled,
+	mapSwivalActiveWorkForAliases,
+	registerBackgroundWorkProviderViaEvents,
+	resolveConfirmProjectAgents,
+	type BackgroundWorkRegistrationPayload,
+} from "../extensions/runtime.js";
 
 /**
  * Wiring test for the parts the pure-function tests cannot reach: the
@@ -173,7 +182,72 @@ function writeCompletedRun(root: string, runId: string, sessionId: string | unde
 	return dir;
 }
 
+describe("background-work event registration", () => {
+	const provider = { name: "pi-swival", wakeChannels: ["pi-swival:run-finished"], listActiveWork: () => [] };
+
+	it("requires a synchronous acceptance and unregisters with the same opaque token", () => {
+		const emitted: Array<{ channel: string; data: unknown }> = [];
+		const bus = { emit(channel: string, data: unknown) {
+			emitted.push({ channel, data });
+			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
+				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: true });
+			}
+		} };
+		const dispose = registerBackgroundWorkProviderViaEvents(bus, provider);
+		const registration = emitted[0]!.data as BackgroundWorkRegistrationPayload;
+		expect(registration.version).toBe(BACKGROUND_WORK_PROTOCOL_VERSION);
+		expect(registration.registrationId).toMatch(/^[0-9a-f]{32}$/);
+		dispose();
+		const unregister = emitted[1]!;
+		expect(unregister).toMatchObject({ channel: BACKGROUND_WORK_UNREGISTER_EVENT });
+		expect(unregister.data).toMatchObject({
+			version: BACKGROUND_WORK_PROTOCOL_VERSION,
+			registrationId: registration.registrationId,
+		});
+	});
+
+	it("throws when no event bridge acknowledges synchronously", () => {
+		expect(() => registerBackgroundWorkProviderViaEvents({ emit: () => {} }, provider))
+			.toThrow("Background-work provider 'pi-swival' has no background-work event bridge.");
+	});
+
+	it("propagates bridge rejection text", () => {
+		const bus = { emit(channel: string, data: unknown) {
+			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
+				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: false, error: "provider collision" });
+			}
+		} };
+		expect(() => registerBackgroundWorkProviderViaEvents(bus, provider)).toThrow("provider collision");
+	});
+
+	it("returns an idempotent unregister disposer", () => {
+		const unregister = vi.fn();
+		const bus = { emit(channel: string, data: unknown) {
+			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
+				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: true });
+			} else if (channel === BACKGROUND_WORK_UNREGISTER_EVENT) unregister(data);
+		} };
+		const dispose = registerBackgroundWorkProviderViaEvents(bus, provider);
+		dispose();
+		dispose();
+		expect(unregister).toHaveBeenCalledTimes(1);
+	});
+});
+
 describe("extension wiring", () => {
+	it("maps active runs owned by a session alias under every exact alias", () => {
+		const entries = [
+			{ meta: { runId: "mine", sessionId: "/sessions/current.jsonl" }, exited: false },
+			{ meta: { runId: "theirs", sessionId: "another-session" }, exited: false },
+			{ meta: { runId: "finished", sessionId: "/sessions/current.jsonl" }, exited: true },
+		];
+
+		expect(mapSwivalActiveWorkForAliases(entries, ["/sessions/current.jsonl", "session-uuid", "", "session-uuid"])).toEqual([
+			{ id: "mine", sessionId: "/sessions/current.jsonl" },
+			{ id: "mine", sessionId: "session-uuid" },
+		]);
+	});
+
 	it("only disables preflight for case-insensitive 1 or true", () => {
 		expect(isSwivalPreflightDisabled("1")).toBe(true);
 		expect(isSwivalPreflightDisabled("TRUE")).toBe(true);
@@ -186,6 +260,95 @@ describe("extension wiring", () => {
 		expect(pi.registerTool).toHaveBeenCalledTimes(1);
 		expect(typeof handlers.session_start).toBe("function");
 		expect(typeof handlers.session_shutdown).toBe("function");
+	});
+
+	it("activates wiring from execute without session_start and does not duplicate it", async () => {
+		const startReconciler = vi.fn(() => () => {});
+		const registerBackgroundWorkProvider = vi.fn(() => () => {});
+		const factory = await loadExtension();
+		const { pi, ctx, registered } = stubPi("session-1");
+		factory(pi as never, {
+			startReconciler,
+			registerBackgroundWorkProvider,
+			loadRunState: async () => undefined,
+		});
+
+		await registered.current?.execute("call-1", { action: "status", id: "missing" }, undefined, undefined, ctx);
+		await registered.current?.execute("call-2", { action: "status", id: "missing" }, undefined, undefined, ctx);
+
+		expect(startReconciler).toHaveBeenCalledTimes(1);
+		expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(1);
+	});
+
+	it("publishes a file-scoped active run through current file and UUID aliases", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-aliases-"));
+		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+		let provider: { listActiveWork(): readonly { id: string; sessionId: string }[] } | undefined;
+		const { spawn } = installAsyncSpawn(() => {
+			const proc = makeFakeChildProcess() as EventEmitter & {
+				stdout: EventEmitter;
+				stderr: EventEmitter;
+				pid?: number;
+				unref: ReturnType<typeof vi.fn>;
+			};
+			proc.pid = 61234;
+			proc.unref = vi.fn();
+			queueMicrotask(() => { proc.emit("spawn"); });
+			return proc;
+		});
+		try {
+			process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+			const factory = await loadExtension();
+			const { pi, ctx, registered, handlers } = stubPi("session-uuid");
+			const sessionFile = path.join(root, "session.jsonl");
+			const aliasedCtx = {
+				...ctx,
+				sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "session-uuid" },
+			};
+			const registerBackgroundWorkProvider = vi.fn((value: typeof provider) => {
+				provider = value;
+				return () => {};
+			});
+			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider });
+			await handlers.session_start?.({}, aliasedCtx);
+			const result = await registered.current?.execute(
+				"call",
+				{ agent: "self-review-worker", task: "background task", async: true },
+				undefined,
+				undefined,
+				aliasedCtx,
+			) as { content: Array<{ text: string }> };
+			const runId = /^runId:\s+(\S+)$/m.exec(result.content[0]?.text ?? "")?.[1];
+			expect(runId).toBeDefined();
+			expect(provider?.listActiveWork()).toEqual([
+				{ id: runId, sessionId: sessionFile },
+				{ id: runId, sessionId: "session-uuid" },
+			]);
+
+			await handlers.session_start?.({}, {
+				...aliasedCtx,
+				sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "reloaded-uuid" },
+			});
+			expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(1);
+			expect(provider?.listActiveWork()).toEqual([
+				{ id: runId, sessionId: sessionFile },
+				{ id: runId, sessionId: "reloaded-uuid" },
+			]);
+			handlers.session_shutdown?.({}, aliasedCtx);
+			expect(provider?.listActiveWork()).toEqual([]);
+			expect(spawn).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+			fs.rmSync(root, { recursive: true, force: true });
+			vi.doUnmock("node:child_process");
+		}
+	});
+
+	it("resolves project-agent confirmation policy", () => {
+		expect(resolveConfirmProjectAgents(false, undefined)).toBe(false);
+		expect(resolveConfirmProjectAgents(undefined, undefined)).toBe(true);
+		expect(resolveConfirmProjectAgents(undefined, "1")).toBe(false);
 	});
 
 	it("rejects same-CWD parallel tasks that resolve to the same named AgentFS session before spawn", async () => {
@@ -446,25 +609,24 @@ describe("extension wiring", () => {
 		expect(calls).toContain("provider-2:dispose");
 	});
 
-	it("does not register background work after shutdown", async () => {
-		let releaseLoader: ((register: (provider: unknown) => () => void) => void) | undefined;
-		const registerBackgroundWorkProvider = vi.fn(() => () => {});
-		const loadBackgroundWorkProvider = vi.fn(() => new Promise<(provider: unknown) => () => void>((resolve) => {
-			releaseLoader = resolve;
-		}));
+	it("keeps stale registration disposers replacement-safe and idempotent", async () => {
+		const disposers: Array<() => void> = [];
+		const registerBackgroundWorkProvider = vi.fn(() => {
+			let disposed = false;
+			const dispose = vi.fn(() => { disposed = true; });
+			disposers.push(() => { if (!disposed) dispose(); });
+			return disposers.at(-1)!;
+		});
 		const factory = await loadExtension();
 		const { pi, ctx, handlers } = stubPi("session-1");
-		factory(pi as never, {
-			startReconciler: () => () => {},
-			loadBackgroundWorkProvider,
-		});
-		const starting = handlers.session_start?.({}, ctx);
-		await Promise.resolve();
+		factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider });
+		handlers.session_start?.({}, ctx);
+		const stale = disposers[0]!;
+		handlers.session_start?.({}, { ...ctx, sessionManager: { getSessionId: () => "session-2" } });
+		stale();
+		stale();
 		handlers.session_shutdown?.({}, ctx);
-		releaseLoader?.(registerBackgroundWorkProvider);
-		await starting;
-		expect(loadBackgroundWorkProvider).toHaveBeenCalledTimes(1);
-		expect(registerBackgroundWorkProvider).not.toHaveBeenCalled();
+		expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(2);
 	});
 
 	it("labels resume output possibly incomplete when liveness is unknown", async () => {

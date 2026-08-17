@@ -17,6 +17,7 @@ export interface SwivalCompletionSummary {
 
 export interface SwivalNotifierDeps {
 	currentSessionId: string;
+	sessionIds?: readonly string[];
 	batchWindowMs?: number;
 	ackTimeoutMs?: number;
 }
@@ -162,6 +163,10 @@ export function createSwivalNotifier(
 ): SwivalNotifier {
 	const batchWindowMs = deps.batchWindowMs ?? 1500;
 	const ackTimeoutMs = deps.ackTimeoutMs ?? ACK_TIMEOUT_MS;
+	const sessionIds = new Set([
+		deps.currentSessionId,
+		...(deps.sessionIds ?? []).filter((sessionId) => typeof sessionId === "string" && sessionId.length > 0),
+	]);
 	const seen = new Map<string, number>();
 	const pending = new Map<string, PendingDelivery>();
 	const awaiting = new Map<string, AwaitingDelivery>();
@@ -189,7 +194,7 @@ export function createSwivalNotifier(
 	const handleAck = async (event: unknown, ctx?: { sessionManager?: { getSessionId?: () => string } }) => {
 		if (disposed) return;
 		const sessionId = ctx?.sessionManager?.getSessionId?.();
-		if (sessionId && sessionId !== deps.currentSessionId) return;
+		if (sessionId && !sessionIds.has(sessionId)) return;
 		const message = (event as { message?: { role?: unknown; customType?: unknown; details?: unknown } })?.message;
 		if (message?.role !== "custom" || message.customType !== "swival-notify") return;
 		const details = (message.details ?? {}) as { runIds?: unknown; batchId?: unknown; sessionId?: unknown };

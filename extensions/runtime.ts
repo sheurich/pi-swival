@@ -119,11 +119,64 @@ interface AsyncRunEntry {
 	exitCode: number | null;
 }
 
-interface BackgroundWorkProvider {
+export const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
+export const BACKGROUND_WORK_REGISTER_EVENT = "pi-subagents:background-work:v1:register";
+export const BACKGROUND_WORK_UNREGISTER_EVENT = "pi-subagents:background-work:v1:unregister";
+
+export interface BackgroundWorkEventBus {
+	emit(channel: string, data: unknown): void;
+}
+
+export interface BackgroundWorkProvider {
 	name: string;
 	wakeChannels: readonly string[];
 	listActiveWork(): readonly { id: string; sessionId: string }[];
 	reconcile?: (context: { sessionId: string; nowMs: number }) => void;
+}
+
+export type BackgroundWorkRegistrationAck = { ok: true } | { ok: false; error: string };
+
+export interface BackgroundWorkRegistrationPayload {
+	version: typeof BACKGROUND_WORK_PROTOCOL_VERSION;
+	registrationId: string;
+	provider: BackgroundWorkProvider;
+	acknowledge(result: BackgroundWorkRegistrationAck): void;
+}
+
+export interface BackgroundWorkUnregisterPayload {
+	version: typeof BACKGROUND_WORK_PROTOCOL_VERSION;
+	registrationId: string;
+}
+
+export function registerBackgroundWorkProviderViaEvents(
+	bus: BackgroundWorkEventBus,
+	provider: BackgroundWorkProvider,
+): () => void {
+	const registrationId = randomBytes(16).toString("hex");
+	let acknowledgement: BackgroundWorkRegistrationAck | undefined;
+	bus.emit(BACKGROUND_WORK_REGISTER_EVENT, {
+		version: BACKGROUND_WORK_PROTOCOL_VERSION,
+		registrationId,
+		provider,
+		acknowledge(result: BackgroundWorkRegistrationAck): void {
+			acknowledgement = result;
+		},
+	} satisfies BackgroundWorkRegistrationPayload);
+	if (acknowledgement === undefined) {
+		throw new Error("Background-work provider 'pi-swival' has no background-work event bridge.");
+	}
+	if (!acknowledgement.ok) {
+		throw new Error(`Background-work provider 'pi-swival' registration was rejected: ${acknowledgement.error}`);
+	}
+	let disposed = false;
+	return () => {
+		if (disposed) return;
+		disposed = true;
+		bus.emit(BACKGROUND_WORK_UNREGISTER_EVENT, {
+			version: BACKGROUND_WORK_PROTOCOL_VERSION,
+			registrationId,
+		} satisfies BackgroundWorkUnregisterPayload);
+	};
 }
 
 type RegisterBackgroundWorkProvider = (provider: BackgroundWorkProvider) => () => void;
@@ -131,7 +184,6 @@ type RegisterBackgroundWorkProvider = (provider: BackgroundWorkProvider) => () =
 interface ExtensionWiringDeps {
 	startReconciler?: typeof startSwivalReconciler;
 	registerBackgroundWorkProvider?: RegisterBackgroundWorkProvider;
-	loadBackgroundWorkProvider?: () => Promise<RegisterBackgroundWorkProvider>;
 	loadRunState?: (runId: string) => Promise<RunStateInfo | undefined>;
 	revalidateRunIdentity?: (meta: RunMeta) => Promise<boolean>;
 	killProcessGroup?: (pid: number, signal: NodeJS.Signals) => void;
@@ -144,6 +196,23 @@ export function mapSwivalActiveWork(
 	return entries
 		.filter((entry) => !entry.exited && entry.meta.sessionId === sessionId)
 		.map((entry) => ({ id: entry.meta.runId, sessionId }));
+}
+
+/**
+ * Map active work owned by any exact alias of the current Pi session under
+ * every alias. Consumers select one exact sessionId from the provider
+ * snapshot, so emitting the same run once per alias bridges Pi identity
+ * changes without making work from unrelated sessions visible.
+ */
+export function mapSwivalActiveWorkForAliases(
+	entries: readonly { meta: Pick<RunMeta, "runId" | "sessionId">; exited: boolean }[],
+	sessionAliases: readonly string[],
+): readonly { id: string; sessionId: string }[] {
+	const aliases = [...new Set(sessionAliases.filter((alias) => alias.length > 0))];
+	const aliasSet = new Set(aliases);
+	return entries
+		.filter((entry) => !entry.exited && entry.meta.sessionId !== undefined && aliasSet.has(entry.meta.sessionId))
+		.flatMap((entry) => aliases.map((sessionId) => ({ id: entry.meta.runId, sessionId })));
 }
 
 /** Written to `<artifactDir>/completed.json` when an async run exits (or fails to start). */
@@ -191,6 +260,13 @@ async function prepareCache(agent: SwivalAgentConfig, cwd: string, overrides: Sw
 
 export function isSwivalPreflightDisabled(value: string | undefined = process.env.PI_SWIVAL_NO_PREFLIGHT): boolean {
 	return /^(?:1|true)$/i.test(value ?? "");
+}
+
+export function resolveConfirmProjectAgents(
+	explicit: boolean | undefined,
+	trustedEnv: string | undefined = process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS,
+): boolean {
+	return explicit ?? !trustedEnv;
 }
 
 async function runCredentialPreflight(agent: SwivalAgentConfig, overrides: SwivalOverrides, cwd: string | undefined): Promise<string | undefined> {
@@ -2380,54 +2456,59 @@ export function buildParallelSummary(
 
 export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {}) {
 	let currentSessionId: string | undefined;
+	let currentSessionAliases: string[] = [];
 	let stopReconciler: (() => void) | undefined;
 	let backgroundWorkDisposer: (() => void) | undefined;
 	let notifier: SwivalNotifier | undefined;
-	let sessionGeneration = 0;
 
-	pi.on("session_start", async (_event, ctx) => {
-		const generation = ++sessionGeneration;
-		stopReconciler?.();
-		stopReconciler = undefined;
-		backgroundWorkDisposer?.();
-		backgroundWorkDisposer = undefined;
-		notifier = undefined;
-		currentSessionId = ctx.sessionManager.getSessionId();
-		notifier = createSwivalNotifier(pi, { currentSessionId });
-		const startReconciler = wiringDeps.startReconciler ?? startSwivalReconciler;
-		stopReconciler = startReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
-		try {
-			let registerBackgroundWorkProvider = wiringDeps.registerBackgroundWorkProvider;
-			if (!registerBackgroundWorkProvider) {
-				if (wiringDeps.loadBackgroundWorkProvider) {
-					registerBackgroundWorkProvider = await wiringDeps.loadBackgroundWorkProvider();
-				} else {
-					const moduleName = "pi-subagents/background-work";
-					const module = await import(moduleName) as { registerBackgroundWorkProvider: RegisterBackgroundWorkProvider };
-					registerBackgroundWorkProvider = module.registerBackgroundWorkProvider;
-				}
-			}
-			if (generation !== sessionGeneration) return;
-			// Registration makes live runs count as active work for subagent_wait.
-			backgroundWorkDisposer = registerBackgroundWorkProvider({
-				name: "pi-swival",
-				wakeChannels: ["pi-swival:run-finished"],
-				listActiveWork: () => currentSessionId ? mapSwivalActiveWork([...asyncRuns.values()], currentSessionId) : [],
-				reconcile: () => { void notifier?.reconcile(ARTIFACT_ROOT); },
-			});
-		} catch {
-			/* pi-subagents is optional; swival remains usable without it */
+	const activateSession = (ctx: { sessionManager: { getSessionFile?: () => string | undefined; getSessionId: () => string } }) => {
+		const sessionFile = ctx.sessionManager.getSessionFile?.();
+		const sessionUuid = ctx.sessionManager.getSessionId();
+		const sessionId = sessionFile ?? sessionUuid;
+		currentSessionAliases = [...new Set([sessionFile, sessionUuid].filter((alias): alias is string => typeof alias === "string" && alias.length > 0))];
+		if (currentSessionId !== sessionId || !notifier || !stopReconciler) {
+			stopReconciler?.();
+			stopReconciler = undefined;
+			backgroundWorkDisposer?.();
+			backgroundWorkDisposer = undefined;
+			notifier = undefined;
+			currentSessionId = sessionId;
+			notifier = createSwivalNotifier(pi, { currentSessionId, sessionIds: currentSessionAliases });
+			const startReconciler = wiringDeps.startReconciler ?? startSwivalReconciler;
+			stopReconciler = startReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
 		}
+
+		if (!backgroundWorkDisposer) {
+			try {
+				const registerBackgroundWorkProvider = wiringDeps.registerBackgroundWorkProvider
+					?? ((provider: BackgroundWorkProvider) => registerBackgroundWorkProviderViaEvents(pi.events, provider));
+				// Registration makes live runs count as active work for subagent_wait.
+				backgroundWorkDisposer = registerBackgroundWorkProvider({
+					name: "pi-swival",
+					wakeChannels: ["pi-swival:run-finished"],
+					listActiveWork: () => mapSwivalActiveWorkForAliases([...asyncRuns.values()], currentSessionAliases),
+					reconcile: () => { void notifier?.reconcile(ARTIFACT_ROOT); },
+				});
+			} catch (error) {
+				const cause = error instanceof Error ? error.message : String(error);
+				console.error(`pi-swival background-work registration failed: ${cause}`);
+				/* pi-subagents is optional; swival remains usable without it */
+			}
+		}
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		activateSession(ctx);
 	});
 
 	pi.on("session_shutdown", () => {
-		sessionGeneration += 1;
 		stopReconciler?.();
 		stopReconciler = undefined;
 		backgroundWorkDisposer?.();
 		backgroundWorkDisposer = undefined;
 		notifier = undefined;
 		currentSessionId = undefined;
+		currentSessionAliases = [];
 	});
 
 	pi.registerTool({
@@ -2452,6 +2533,7 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			activateSession(ctx);
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
 			void pruneOldArtifacts(ARTIFACT_ROOT);
 			const loadRunStateImpl = wiringDeps.loadRunState ?? loadRunState;
@@ -2468,7 +2550,7 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 			const discoveryCwd = params.cwd ?? ctx.cwd;
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents = !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
+			const confirmProjectAgents = resolveConfirmProjectAgents(params.confirmProjectAgents);
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
 			const makeDetails =
@@ -2943,7 +3025,7 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 						task,
 						params.cwd,
 						overrides,
-						ctx.sessionManager.getSessionId(),
+						currentSessionId,
 						(meta, exitCode) => {
 							const status = exitCode === 0 ? "completed" : exitCode === null ? "stopped" : "failed";
 							if (notifier) {

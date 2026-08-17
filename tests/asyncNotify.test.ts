@@ -12,9 +12,9 @@ interface SentRecord {
 }
 
 interface NotifyHarness {
-	pi: { sendMessage: (message: unknown, options: unknown) => void; on: (event: string, handler: (event: unknown) => void) => () => void };
+	pi: { sendMessage: (message: unknown, options: unknown) => void; on: (event: string, handler: (event: unknown, ctx?: { sessionManager: { getSessionId: () => string } }) => void) => () => void };
 	sent: SentRecord[];
-	emitAck: (message: SentRecord["message"]) => void;
+	emitAck: (message: SentRecord["message"], sessionId?: string) => void;
 	waitForSent: (count: number) => Promise<void>;
 }
 
@@ -50,7 +50,7 @@ function fakePi(sendMessage: (message: unknown, options: unknown) => void) {
 
 function makeNotifyHarness(options: { autoAck?: boolean } = {}): NotifyHarness {
 	const sent: SentRecord[] = [];
-	const listeners = new Set<(event: unknown) => void>();
+	const listeners = new Set<(event: unknown, ctx?: { sessionManager: { getSessionId: () => string } }) => void>();
 	const sentWaiters: Array<{ count: number; resolve: () => void }> = [];
 	const releaseSentWaiters = () => {
 		for (let i = sentWaiters.length - 1; i >= 0; i--) {
@@ -60,7 +60,7 @@ function makeNotifyHarness(options: { autoAck?: boolean } = {}): NotifyHarness {
 			}
 		}
 	};
-	const emitAck = (message: SentRecord["message"]) => {
+	const emitAck = (message: SentRecord["message"], sessionId?: string) => {
 		for (const listener of listeners) {
 			listener({
 				type: "message_end",
@@ -71,7 +71,7 @@ function makeNotifyHarness(options: { autoAck?: boolean } = {}): NotifyHarness {
 					display: message.display,
 					details: message.details,
 				},
-			});
+			}, sessionId === undefined ? undefined : { sessionManager: { getSessionId: () => sessionId } });
 		}
 	};
 	return {
@@ -194,6 +194,44 @@ describe("swival completion notifier", () => {
 		expect(fs.existsSync(path.join(dir, "notified.json"))).toBe(true);
 		expect(await notifier.deliver({ runId: "same", agent: "a", artifactDir: dir, sessionId: "s", status: "completed" })).toBe(false);
 		expect(harness.sent).toHaveLength(1);
+		notifier.dispose();
+	});
+
+	it("writes notified after an acknowledgement whose ctx session is an exact UUID alias of the primary session-file path", async () => {
+		const harness = makeNotifyHarness({ autoAck: false });
+		const dir = tempDir();
+		const sessionFile = "/sessions/current.jsonl";
+		const sessionUuid = "11111111-2222-4333-8444-555555555555";
+		const notifier = createSwivalNotifier(harness.pi as never, {
+			currentSessionId: sessionFile,
+			sessionIds: [sessionUuid],
+			batchWindowMs: 0,
+		});
+		const delivered = notifier.deliver({ runId: "transitioned", agent: "a", artifactDir: dir, sessionId: sessionFile, status: "completed" });
+		await harness.waitForSent(1);
+		harness.emitAck(harness.sent[0]!.message, sessionUuid);
+		expect(await delivered).toBe(true);
+		expect(fs.existsSync(path.join(dir, "notified.json"))).toBe(true);
+		notifier.dispose();
+	});
+
+	it("rejects an acknowledgement from an unrelated ctx session despite matching message details", async () => {
+		vi.useFakeTimers();
+		const harness = makeNotifyHarness({ autoAck: false });
+		const dir = tempDir();
+		const sessionFile = "/sessions/current.jsonl";
+		const notifier = createSwivalNotifier(harness.pi as never, {
+			currentSessionId: sessionFile,
+			sessionIds: ["11111111-2222-4333-8444-555555555555"],
+			batchWindowMs: 0,
+			ackTimeoutMs: 25,
+		});
+		const delivered = notifier.deliver({ runId: "unrelated", agent: "a", artifactDir: dir, sessionId: sessionFile, status: "completed" });
+		await harness.waitForSent(1);
+		harness.emitAck(harness.sent[0]!.message, "99999999-8888-4777-8666-555555555555");
+		await vi.runAllTimersAsync();
+		expect(await delivered).toBe(false);
+		expect(fs.existsSync(path.join(dir, "notified.json"))).toBe(false);
 		notifier.dispose();
 	});
 

@@ -99,7 +99,9 @@ Audit agents include built-in self-review with JSON / structure contract enforce
 
 When a background run finishes, the extension pushes a completion notice into the caller session. The notice carries the status, agent, run ID, and artifact path. It does not include output. Use `resume` to read the final answer. Notice status is derived from the exit marker plus `report.json`: reviewer-approved success becomes `accepted`, success without reviewer rounds becomes `completed`, `outcome: failed` becomes `rejected`, `outcome: error` becomes `error`, non-zero exits become `failed`, spawn errors become `failed`, and a null exit without `spawn-error.txt` becomes `stopped`. Delivery is acknowledged only after Pi emits the matching persisted `message_end` for that custom message. The notifier writes `notified.json` after that acknowledgement. A void `sendMessage` call is not enough. A reconciler scans completed artifacts for the active session.
 
-When [`pi-subagents`](https://github.com/nicobailon/pi-subagents) is installed, live runs also register as background work, so `subagent_wait({})` and `subagent_wait({ all: true })` block on them. `subagent_wait({ id })` resolves subagent run ids only and will not resolve a swival run id.
+Cross-extension `subagent_wait` visibility uses the versioned `pi.events` background-work bridge. The bridge survives Pi extension reload realms and scopes work to exact session UUID and session-file aliases. `subagent_wait({})` and `subagent_wait({ all: true })` wait for swival work; `subagent_wait({ id })` remains limited to pi-subagents run IDs.
+
+[`pi-subagents`](https://github.com/nicobailon/pi-subagents) 0.50.0 does not include this bridge. Until a release includes `BackgroundWorkEventBridge`, pi-swival remains usable, but it logs a diagnostic naming `pi-swival` and stating that no background-work event bridge acknowledged registration, and `subagent_wait` cannot see swival runs.
 
 `status` classifies a run as running, exited, or unknown. A run is `running` only when the PID is alive and its observed start time agrees with the persisted start time. A reused PID cannot read as alive, and an uncertain fate reads as unknown. `interrupt` revalidates that identity before `SIGTERM` and again before a delayed `SIGKILL`. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
 
@@ -110,7 +112,7 @@ Environment variables:
 | `PI_SWIVAL_CACHE_DIR` | Cache root, overriding the repository-specific default but not a per-call `cacheDirOverride` or agent `cacheDir`. The resolved cache path must stay outside the real checkout. |
 | `PI_SWIVAL_NO_PREFLIGHT` | Skip the credential preflight when set to `1` or `true`; other values do not disable it. |
 | `PI_SWIVAL_ARTIFACT_ROOT` | Redirect run artifacts away from `~/.pi/agent/swival-artifacts/`. |
-| `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. |
+| `PI_SWIVAL_TRUST_PROJECT_AGENTS` | Skip the confirmation prompt for project-local agents. `confirmProjectAgents: false` also suppresses the prompt, independently of this variable. |
 
 ## Layout
 
@@ -138,7 +140,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers pure functions and stub Pi runtime wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. It uses real temporary files, harmless spawn sentinels, and one real ENOENT `ChildProcess` probe. It never starts an actual `swival` task or provider request.
+The vitest harness covers pure functions and stub Pi runtime wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. It uses real temporary files, harmless spawn sentinels, and one real ENOENT `ChildProcess` probe. It never starts an actual `swival` task or provider request. The harness pins `pi-subagents` 0.50.0 and applies the coordinated source patch only for bridge regression tests; pi-swival does not patch production dependencies automatically.
 
 ```bash
 cd tests
