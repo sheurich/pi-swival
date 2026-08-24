@@ -99,9 +99,7 @@ When the run finishes, the extension pushes a completion notice into the session
 
 Delivery is acknowledged only after Pi emits the matching persisted `message_end` for that custom message. The notifier writes `notified.json` after that acknowledgement. A void `sendMessage` call is not enough.
 
-Cross-extension `subagent_wait` visibility uses the versioned `pi.events` background-work bridge. It survives Pi extension reload realms and scopes work to exact session UUID and session-file aliases. `subagent_wait({})` and `subagent_wait({ all: true })` wait for swival work; `subagent_wait({ id })` remains limited to pi-subagents run IDs.
-
-`pi-subagents` 0.50.0 lacks this bridge. Until a release includes `BackgroundWorkEventBridge`, pi-swival remains usable, but it logs a diagnostic naming `pi-swival` and stating that no background-work event bridge acknowledged registration, and `subagent_wait` cannot see swival runs. The test harness pins 0.50.0 and applies the coordinated source patch only for regression tests. Production dependencies are not patched automatically.
+pi-swival and pi-subagents are independent extensions. `subagent_wait` manages pi-subagents work only; it does not wait for or see swival async runs. Use `swival-subagent` with `action: "status"`, `"resume"`, or `"interrupt"` to check progress, retrieve results, or cancel a swival run. Headless pi-swival sessions drain their own owned active runs during `agent_end`, up to an internal limit (30 minutes by default). The drain never kills or interrupts a run; if a run outlives that limit, `agent_end` simply returns and the process may exit while the run is still going, so its completion notice can go undelivered.
 
 Once started, manage it using `action` and `id`:
 

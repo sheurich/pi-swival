@@ -119,74 +119,17 @@ interface AsyncRunEntry {
 	exitCode: number | null;
 }
 
-export const BACKGROUND_WORK_PROTOCOL_VERSION = 1;
-export const BACKGROUND_WORK_REGISTER_EVENT = "pi-subagents:background-work:v1:register";
-export const BACKGROUND_WORK_UNREGISTER_EVENT = "pi-subagents:background-work:v1:unregister";
-
-export interface BackgroundWorkEventBus {
-	emit(channel: string, data: unknown): void;
-}
-
-export interface BackgroundWorkProvider {
-	name: string;
-	wakeChannels: readonly string[];
-	listActiveWork(): readonly { id: string; sessionId: string }[];
-	reconcile?: (context: { sessionId: string; nowMs: number }) => void;
-}
-
-export type BackgroundWorkRegistrationAck = { ok: true } | { ok: false; error: string };
-
-export interface BackgroundWorkRegistrationPayload {
-	version: typeof BACKGROUND_WORK_PROTOCOL_VERSION;
-	registrationId: string;
-	provider: BackgroundWorkProvider;
-	acknowledge(result: BackgroundWorkRegistrationAck): void;
-}
-
-export interface BackgroundWorkUnregisterPayload {
-	version: typeof BACKGROUND_WORK_PROTOCOL_VERSION;
-	registrationId: string;
-}
-
-export function registerBackgroundWorkProviderViaEvents(
-	bus: BackgroundWorkEventBus,
-	provider: BackgroundWorkProvider,
-): () => void {
-	const registrationId = randomBytes(16).toString("hex");
-	let acknowledgement: BackgroundWorkRegistrationAck | undefined;
-	bus.emit(BACKGROUND_WORK_REGISTER_EVENT, {
-		version: BACKGROUND_WORK_PROTOCOL_VERSION,
-		registrationId,
-		provider,
-		acknowledge(result: BackgroundWorkRegistrationAck): void {
-			acknowledgement = result;
-		},
-	} satisfies BackgroundWorkRegistrationPayload);
-	if (acknowledgement === undefined) {
-		throw new Error("Background-work provider 'pi-swival' has no background-work event bridge.");
-	}
-	if (!acknowledgement.ok) {
-		throw new Error(`Background-work provider 'pi-swival' registration was rejected: ${acknowledgement.error}`);
-	}
-	let disposed = false;
-	return () => {
-		if (disposed) return;
-		disposed = true;
-		bus.emit(BACKGROUND_WORK_UNREGISTER_EVENT, {
-			version: BACKGROUND_WORK_PROTOCOL_VERSION,
-			registrationId,
-		} satisfies BackgroundWorkUnregisterPayload);
-	};
-}
-
-type RegisterBackgroundWorkProvider = (provider: BackgroundWorkProvider) => () => void;
-
 interface ExtensionWiringDeps {
 	startReconciler?: typeof startSwivalReconciler;
-	registerBackgroundWorkProvider?: RegisterBackgroundWorkProvider;
 	loadRunState?: (runId: string) => Promise<RunStateInfo | undefined>;
 	revalidateRunIdentity?: (meta: RunMeta) => Promise<boolean>;
 	killProcessGroup?: (pid: number, signal: NodeJS.Signals) => void;
+	/** Overrides the `agent_end` headless drain ceiling. Defaults to `DEFAULT_AGENT_END_DRAIN_TIMEOUT_MS`. */
+	agentEndDrainTimeoutMs?: number;
+	/** Overrides the `agent_end` headless drain fallback poll interval. Defaults to `AGENT_END_DRAIN_POLL_MS`. */
+	agentEndDrainPollIntervalMs?: number;
+	/** Clock injection for the `agent_end` drain, so tests can control elapsed time deterministically. */
+	now?: () => number;
 }
 
 export function mapSwivalActiveWork(
@@ -199,20 +142,100 @@ export function mapSwivalActiveWork(
 }
 
 /**
- * Map active work owned by any exact alias of the current Pi session under
- * every alias. Consumers select one exact sessionId from the provider
- * snapshot, so emitting the same run once per alias bridges Pi identity
- * changes without making work from unrelated sessions visible.
+ * True when at least one non-exited entry in `entries` is owned by any of
+ * `sessionAliases` under an exact sessionId match (empty/undefined aliases
+ * never match), so a run "owned by another session" can never block a drain
+ * for this one.
  */
-export function mapSwivalActiveWorkForAliases(
-	entries: readonly { meta: Pick<RunMeta, "runId" | "sessionId">; exited: boolean }[],
+export function hasOwnedActiveRun(
+	entries: Iterable<{ meta: Pick<RunMeta, "sessionId">; exited: boolean }>,
 	sessionAliases: readonly string[],
-): readonly { id: string; sessionId: string }[] {
-	const aliases = [...new Set(sessionAliases.filter((alias) => alias.length > 0))];
-	const aliasSet = new Set(aliases);
-	return entries
-		.filter((entry) => !entry.exited && entry.meta.sessionId !== undefined && aliasSet.has(entry.meta.sessionId))
-		.flatMap((entry) => aliases.map((sessionId) => ({ id: entry.meta.runId, sessionId })));
+): boolean {
+	const aliasSet = new Set(sessionAliases.filter((alias) => alias.length > 0));
+	if (aliasSet.size === 0) return false;
+	for (const entry of entries) {
+		if (!entry.exited && entry.meta.sessionId !== undefined && aliasSet.has(entry.meta.sessionId)) return true;
+	}
+	return false;
+}
+
+/** Ceiling for how long `agent_end` will block a headless session draining its own async runs. */
+export const DEFAULT_AGENT_END_DRAIN_TIMEOUT_MS = 30 * 60 * 1000;
+/** Fallback poll granularity while draining, used only when a `pi-swival:run-finished` event is missed. */
+export const AGENT_END_DRAIN_POLL_MS = 1_000;
+
+export function validateDrainTimeoutMs(value: number): number {
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new Error(`agent_end drain timeout must be a positive, finite number of milliseconds (got ${value}).`);
+	}
+	return value;
+}
+
+/** Rejects a poll interval that would make the drain loop busy-spin (non-positive, NaN, or infinite). */
+export function validateDrainPollIntervalMs(value: number): number {
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new Error(`agent_end drain poll interval must be a positive, finite number of milliseconds (got ${value}).`);
+	}
+	return value;
+}
+
+export interface DrainAgentEndDeps {
+	now?: () => number;
+	pollIntervalMs?: number;
+	/** Subscribe for a prompt wake signal (e.g. `pi-swival:run-finished`). Called once per wait cycle; must return an unsubscribe. */
+	onWake?: (listener: () => void) => () => void;
+}
+
+/**
+ * Resolve after `waitMs`, or sooner if `onWake` fires first. Always tears
+ * down its own timer and wake subscription before resolving — regardless of
+ * which one fired — so no listener or timer outlives a single wait cycle.
+ */
+function waitForWakeOrTimeout(waitMs: number, onWake?: (listener: () => void) => () => void): Promise<void> {
+	return new Promise<void>((resolve) => {
+		let settled = false;
+		let unsubscribe: (() => void) | undefined;
+		const finish = () => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			unsubscribe?.();
+			resolve();
+		};
+		const timer = setTimeout(finish, waitMs);
+		unsubscribe = onWake?.(finish);
+	});
+}
+
+/**
+ * Block until every non-exited run owned by `sessionAliases` — as reported
+ * by `listEntries()` — has completed, or `timeoutMs` elapses, whichever is
+ * first. `listEntries` is re-invoked on every wake, so runs added while
+ * draining (not just the initial set) are also awaited. Wakes promptly via
+ * `deps.onWake` and otherwise falls back to bounded polling at
+ * `deps.pollIntervalMs`. Throws synchronously, before any waiting begins, if
+ * `timeoutMs` or the effective poll interval is not a positive finite
+ * number (a non-positive/NaN poll interval would otherwise busy-loop).
+ * Once running, it never kills or interrupts a run: on timeout it simply
+ * returns, leaving any still-active runs untouched and removing its own
+ * wake listener first.
+ */
+export async function drainOwnedAsyncRuns(
+	listEntries: () => Iterable<{ meta: Pick<RunMeta, "sessionId">; exited: boolean }>,
+	sessionAliases: readonly string[],
+	timeoutMs: number,
+	deps: DrainAgentEndDeps = {},
+): Promise<void> {
+	validateDrainTimeoutMs(timeoutMs);
+	const now = deps.now ?? Date.now;
+	const pollIntervalMs = validateDrainPollIntervalMs(deps.pollIntervalMs ?? AGENT_END_DRAIN_POLL_MS);
+	const deadlineAt = now() + timeoutMs;
+
+	while (hasOwnedActiveRun(listEntries(), sessionAliases)) {
+		const remainingMs = deadlineAt - now();
+		if (remainingMs <= 0) return;
+		await waitForWakeOrTimeout(Math.min(pollIntervalMs, remainingMs), deps.onWake);
+	}
 }
 
 /** Written to `<artifactDir>/completed.json` when an async run exits (or fails to start). */
@@ -2458,7 +2481,6 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 	let currentSessionId: string | undefined;
 	let currentSessionAliases: string[] = [];
 	let stopReconciler: (() => void) | undefined;
-	let backgroundWorkDisposer: (() => void) | undefined;
 	let notifier: SwivalNotifier | undefined;
 
 	const activateSession = (ctx: { sessionManager: { getSessionFile?: () => string | undefined; getSessionId: () => string } }) => {
@@ -2469,31 +2491,11 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 		if (currentSessionId !== sessionId || !notifier || !stopReconciler) {
 			stopReconciler?.();
 			stopReconciler = undefined;
-			backgroundWorkDisposer?.();
-			backgroundWorkDisposer = undefined;
 			notifier = undefined;
 			currentSessionId = sessionId;
 			notifier = createSwivalNotifier(pi, { currentSessionId, sessionIds: currentSessionAliases });
 			const startReconciler = wiringDeps.startReconciler ?? startSwivalReconciler;
 			stopReconciler = startReconciler(notifier, { artifactRoot: ARTIFACT_ROOT });
-		}
-
-		if (!backgroundWorkDisposer) {
-			try {
-				const registerBackgroundWorkProvider = wiringDeps.registerBackgroundWorkProvider
-					?? ((provider: BackgroundWorkProvider) => registerBackgroundWorkProviderViaEvents(pi.events, provider));
-				// Registration makes live runs count as active work for subagent_wait.
-				backgroundWorkDisposer = registerBackgroundWorkProvider({
-					name: "pi-swival",
-					wakeChannels: ["pi-swival:run-finished"],
-					listActiveWork: () => mapSwivalActiveWorkForAliases([...asyncRuns.values()], currentSessionAliases),
-					reconcile: () => { void notifier?.reconcile(ARTIFACT_ROOT); },
-				});
-			} catch (error) {
-				const cause = error instanceof Error ? error.message : String(error);
-				console.error(`pi-swival background-work registration failed: ${cause}`);
-				/* pi-subagents is optional; swival remains usable without it */
-			}
 		}
 	};
 
@@ -2504,11 +2506,33 @@ export default function (pi: ExtensionAPI, wiringDeps: ExtensionWiringDeps = {})
 	pi.on("session_shutdown", () => {
 		stopReconciler?.();
 		stopReconciler = undefined;
-		backgroundWorkDisposer?.();
-		backgroundWorkDisposer = undefined;
 		notifier = undefined;
 		currentSessionId = undefined;
 		currentSessionAliases = [];
+	});
+
+	// Headless auto-drain: block agent_end until this session's own async
+	// swival runs have finished, so a headless invocation doesn't exit while
+	// background work it started is still in flight. Interactive sessions
+	// (ctx.hasUI) never block here — the user drives their own session
+	// lifecycle and can check on background runs via the tool's
+	// status/resume actions. No pi-subagents integration is involved: this
+	// only ever looks at pi-swival's own `asyncRuns` registry.
+	pi.on("agent_end", async (_event, ctx) => {
+		if (ctx.hasUI) return;
+		const aliases = currentSessionAliases;
+		if (aliases.length === 0) return;
+		const timeoutMs = wiringDeps.agentEndDrainTimeoutMs ?? DEFAULT_AGENT_END_DRAIN_TIMEOUT_MS;
+		await drainOwnedAsyncRuns(
+			() => asyncRuns.values(),
+			aliases,
+			timeoutMs,
+			{
+				now: wiringDeps.now,
+				pollIntervalMs: wiringDeps.agentEndDrainPollIntervalMs,
+				onWake: (listener) => pi.events.on("pi-swival:run-finished", listener),
+			},
+		);
 	});
 
 	pi.registerTool({

@@ -4,14 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
 import {
-	BACKGROUND_WORK_PROTOCOL_VERSION,
-	BACKGROUND_WORK_REGISTER_EVENT,
-	BACKGROUND_WORK_UNREGISTER_EVENT,
 	isSwivalPreflightDisabled,
-	mapSwivalActiveWorkForAliases,
-	registerBackgroundWorkProviderViaEvents,
 	resolveConfirmProjectAgents,
-	type BackgroundWorkRegistrationPayload,
 } from "../extensions/runtime.js";
 
 /**
@@ -43,6 +37,7 @@ interface Handlers {
 	session_start?: (event: unknown, ctx: unknown) => unknown;
 	session_shutdown?: (event: unknown, ctx: unknown) => unknown;
 	message_end?: (event: unknown, ctx: unknown) => unknown;
+	agent_end?: (event: unknown, ctx: unknown) => unknown;
 }
 
 interface RegisteredTool {
@@ -140,6 +135,11 @@ function stubPi(sessionId: string) {
 	const emitted: Array<{ channel: string; data: unknown }> = [];
 	const registered: { current?: RegisteredTool } = {};
 	const ctx = { cwd: process.cwd(), sessionManager: { getSessionId: () => sessionId } };
+	// Real (in-memory) pub/sub, not just a recorder: the agent_end drain
+	// subscribes to "pi-swival:run-finished" to wake promptly, so the stub
+	// must actually deliver emits to listeners and let tests assert no
+	// listener is left registered once a wait cycle ends.
+	const eventListeners = new Map<string, Set<(data: unknown) => void>>();
 	const pi = {
 		on: (event: string, handler: (e: unknown, c: unknown) => unknown) => {
 			handlers[event as keyof Handlers] = handler;
@@ -156,11 +156,23 @@ function stubPi(sessionId: string) {
 			});
 		},
 		events: {
-			emit: (channel: string, data: unknown) => { emitted.push({ channel, data }); },
-			on: () => () => {},
+			emit: (channel: string, data: unknown) => {
+				emitted.push({ channel, data });
+				for (const listener of eventListeners.get(channel) ?? []) listener(data);
+			},
+			on: (channel: string, listener: (data: unknown) => void) => {
+				let set = eventListeners.get(channel);
+				if (!set) {
+					set = new Set();
+					eventListeners.set(channel, set);
+				}
+				set.add(listener);
+				return () => { set!.delete(listener); };
+			},
 		},
 	};
-	return { pi, ctx, handlers, sent, emitted, registered };
+	const eventListenerCount = (channel: string) => eventListeners.get(channel)?.size ?? 0;
+	return { pi, ctx, handlers, sent, emitted, registered, eventListenerCount };
 }
 
 function writeCompletedRun(root: string, runId: string, sessionId: string | undefined): string {
@@ -182,72 +194,7 @@ function writeCompletedRun(root: string, runId: string, sessionId: string | unde
 	return dir;
 }
 
-describe("background-work event registration", () => {
-	const provider = { name: "pi-swival", wakeChannels: ["pi-swival:run-finished"], listActiveWork: () => [] };
-
-	it("requires a synchronous acceptance and unregisters with the same opaque token", () => {
-		const emitted: Array<{ channel: string; data: unknown }> = [];
-		const bus = { emit(channel: string, data: unknown) {
-			emitted.push({ channel, data });
-			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
-				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: true });
-			}
-		} };
-		const dispose = registerBackgroundWorkProviderViaEvents(bus, provider);
-		const registration = emitted[0]!.data as BackgroundWorkRegistrationPayload;
-		expect(registration.version).toBe(BACKGROUND_WORK_PROTOCOL_VERSION);
-		expect(registration.registrationId).toMatch(/^[0-9a-f]{32}$/);
-		dispose();
-		const unregister = emitted[1]!;
-		expect(unregister).toMatchObject({ channel: BACKGROUND_WORK_UNREGISTER_EVENT });
-		expect(unregister.data).toMatchObject({
-			version: BACKGROUND_WORK_PROTOCOL_VERSION,
-			registrationId: registration.registrationId,
-		});
-	});
-
-	it("throws when no event bridge acknowledges synchronously", () => {
-		expect(() => registerBackgroundWorkProviderViaEvents({ emit: () => {} }, provider))
-			.toThrow("Background-work provider 'pi-swival' has no background-work event bridge.");
-	});
-
-	it("propagates bridge rejection text", () => {
-		const bus = { emit(channel: string, data: unknown) {
-			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
-				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: false, error: "provider collision" });
-			}
-		} };
-		expect(() => registerBackgroundWorkProviderViaEvents(bus, provider)).toThrow("provider collision");
-	});
-
-	it("returns an idempotent unregister disposer", () => {
-		const unregister = vi.fn();
-		const bus = { emit(channel: string, data: unknown) {
-			if (channel === BACKGROUND_WORK_REGISTER_EVENT) {
-				(data as BackgroundWorkRegistrationPayload).acknowledge({ ok: true });
-			} else if (channel === BACKGROUND_WORK_UNREGISTER_EVENT) unregister(data);
-		} };
-		const dispose = registerBackgroundWorkProviderViaEvents(bus, provider);
-		dispose();
-		dispose();
-		expect(unregister).toHaveBeenCalledTimes(1);
-	});
-});
-
 describe("extension wiring", () => {
-	it("maps active runs owned by a session alias under every exact alias", () => {
-		const entries = [
-			{ meta: { runId: "mine", sessionId: "/sessions/current.jsonl" }, exited: false },
-			{ meta: { runId: "theirs", sessionId: "another-session" }, exited: false },
-			{ meta: { runId: "finished", sessionId: "/sessions/current.jsonl" }, exited: true },
-		];
-
-		expect(mapSwivalActiveWorkForAliases(entries, ["/sessions/current.jsonl", "session-uuid", "", "session-uuid"])).toEqual([
-			{ id: "mine", sessionId: "/sessions/current.jsonl" },
-			{ id: "mine", sessionId: "session-uuid" },
-		]);
-	});
-
 	it("only disables preflight for case-insensitive 1 or true", () => {
 		expect(isSwivalPreflightDisabled("1")).toBe(true);
 		expect(isSwivalPreflightDisabled("TRUE")).toBe(true);
@@ -264,12 +211,10 @@ describe("extension wiring", () => {
 
 	it("activates wiring from execute without session_start and does not duplicate it", async () => {
 		const startReconciler = vi.fn(() => () => {});
-		const registerBackgroundWorkProvider = vi.fn(() => () => {});
 		const factory = await loadExtension();
 		const { pi, ctx, registered } = stubPi("session-1");
 		factory(pi as never, {
 			startReconciler,
-			registerBackgroundWorkProvider,
 			loadRunState: async () => undefined,
 		});
 
@@ -277,72 +222,6 @@ describe("extension wiring", () => {
 		await registered.current?.execute("call-2", { action: "status", id: "missing" }, undefined, undefined, ctx);
 
 		expect(startReconciler).toHaveBeenCalledTimes(1);
-		expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(1);
-	});
-
-	it("publishes a file-scoped active run through current file and UUID aliases", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-aliases-"));
-		const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
-		let provider: { listActiveWork(): readonly { id: string; sessionId: string }[] } | undefined;
-		const { spawn } = installAsyncSpawn(() => {
-			const proc = makeFakeChildProcess() as EventEmitter & {
-				stdout: EventEmitter;
-				stderr: EventEmitter;
-				pid?: number;
-				unref: ReturnType<typeof vi.fn>;
-			};
-			proc.pid = 61234;
-			proc.unref = vi.fn();
-			queueMicrotask(() => { proc.emit("spawn"); });
-			return proc;
-		});
-		try {
-			process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
-			const factory = await loadExtension();
-			const { pi, ctx, registered, handlers } = stubPi("session-uuid");
-			const sessionFile = path.join(root, "session.jsonl");
-			const aliasedCtx = {
-				...ctx,
-				sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "session-uuid" },
-			};
-			const registerBackgroundWorkProvider = vi.fn((value: typeof provider) => {
-				provider = value;
-				return () => {};
-			});
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider });
-			await handlers.session_start?.({}, aliasedCtx);
-			const result = await registered.current?.execute(
-				"call",
-				{ agent: "self-review-worker", task: "background task", async: true },
-				undefined,
-				undefined,
-				aliasedCtx,
-			) as { content: Array<{ text: string }> };
-			const runId = /^runId:\s+(\S+)$/m.exec(result.content[0]?.text ?? "")?.[1];
-			expect(runId).toBeDefined();
-			expect(provider?.listActiveWork()).toEqual([
-				{ id: runId, sessionId: sessionFile },
-				{ id: runId, sessionId: "session-uuid" },
-			]);
-
-			await handlers.session_start?.({}, {
-				...aliasedCtx,
-				sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => "reloaded-uuid" },
-			});
-			expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(1);
-			expect(provider?.listActiveWork()).toEqual([
-				{ id: runId, sessionId: sessionFile },
-				{ id: runId, sessionId: "reloaded-uuid" },
-			]);
-			handlers.session_shutdown?.({}, aliasedCtx);
-			expect(provider?.listActiveWork()).toEqual([]);
-			expect(spawn).toHaveBeenCalledTimes(1);
-		} finally {
-			if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
-			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
-			fs.rmSync(root, { recursive: true, force: true });
-			vi.doUnmock("node:child_process");
-		}
 	});
 
 	it("resolves project-agent confirmation policy", () => {
@@ -356,7 +235,7 @@ describe("extension wiring", () => {
 		try {
 			const factory = await loadExtension();
 			const { pi, ctx, registered } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			const result = await registered.current?.execute(
 				"call",
 				{
@@ -387,7 +266,7 @@ describe("extension wiring", () => {
 		try {
 			const factory = await loadExtension();
 			const { pi, ctx, registered } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			const result = await registered.current?.execute(
 				"call",
 				{
@@ -438,7 +317,7 @@ describe("extension wiring", () => {
 		try {
 			const factory = await loadExtension();
 			const { pi, ctx, registered, emitted, sent, handlers } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			await handlers.session_start?.({}, ctx);
 			const result = await registered.current?.execute(
 				"call",
@@ -494,7 +373,7 @@ describe("extension wiring", () => {
 				}
 				return originalWriteFile(...args);
 			});
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {}, killProcessGroup });
+			factory(pi as never, { startReconciler: () => () => {}, killProcessGroup });
 			await handlers.session_start?.({}, ctx);
 			const pending = registered.current?.execute(
 				"call",
@@ -556,7 +435,7 @@ describe("extension wiring", () => {
 			});
 			const factory = await loadExtension();
 			const { pi, ctx, registered, sent, emitted, handlers } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			await handlers.session_start?.({}, ctx);
 			const result = await registered.current?.execute(
 				"call",
@@ -581,52 +460,23 @@ describe("extension wiring", () => {
 		}
 	});
 
-	it("disposes both previous registrations before replacing them", async () => {
+	it("disposes the previous reconciler before replacing it", async () => {
 		const calls: string[] = [];
 		let reconcilerNumber = 0;
-		let providerNumber = 0;
 		const startReconciler = vi.fn(() => {
 			const name = `reconciler-${++reconcilerNumber}`;
 			calls.push(`${name}:start`);
 			return () => { calls.push(`${name}:dispose`); };
 		});
-		const registerBackgroundWorkProvider = vi.fn(() => {
-			const name = `provider-${++providerNumber}`;
-			calls.push(`${name}:register`);
-			return () => { calls.push(`${name}:dispose`); };
-		});
 		const factory = await loadExtension();
 		const { pi, ctx, handlers } = stubPi("session-1");
-		factory(pi as never, { startReconciler, registerBackgroundWorkProvider });
+		factory(pi as never, { startReconciler });
 		await handlers.session_start?.({}, ctx);
 		await handlers.session_start?.({}, { ...ctx, sessionManager: { getSessionId: () => "session-2" } });
 		expect(startReconciler).toHaveBeenCalledTimes(2);
-		expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(2);
 		expect(calls.indexOf("reconciler-1:dispose")).toBeLessThan(calls.indexOf("reconciler-2:start"));
-		expect(calls.indexOf("provider-1:dispose")).toBeLessThan(calls.indexOf("provider-2:register"));
 		handlers.session_shutdown?.({}, ctx);
 		expect(calls).toContain("reconciler-2:dispose");
-		expect(calls).toContain("provider-2:dispose");
-	});
-
-	it("keeps stale registration disposers replacement-safe and idempotent", async () => {
-		const disposers: Array<() => void> = [];
-		const registerBackgroundWorkProvider = vi.fn(() => {
-			let disposed = false;
-			const dispose = vi.fn(() => { disposed = true; });
-			disposers.push(() => { if (!disposed) dispose(); });
-			return disposers.at(-1)!;
-		});
-		const factory = await loadExtension();
-		const { pi, ctx, handlers } = stubPi("session-1");
-		factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider });
-		handlers.session_start?.({}, ctx);
-		const stale = disposers[0]!;
-		handlers.session_start?.({}, { ...ctx, sessionManager: { getSessionId: () => "session-2" } });
-		stale();
-		stale();
-		handlers.session_shutdown?.({}, ctx);
-		expect(registerBackgroundWorkProvider).toHaveBeenCalledTimes(2);
 	});
 
 	it("labels resume output possibly incomplete when liveness is unknown", async () => {
@@ -644,7 +494,7 @@ describe("extension wiring", () => {
 			process.env.PI_SWIVAL_ARTIFACT_ROOT = artifactRoot;
 			const factory = await loadExtension();
 			const { pi, ctx, registered } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			const result = await registered.current?.execute("call", { action: "resume", id: "unknown-run" }, undefined, undefined, ctx);
 			const text = (result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
 			expect(text).toContain("possibly incomplete");
@@ -674,7 +524,7 @@ describe("extension wiring", () => {
 			process.env.PI_SWIVAL_ARTIFACT_ROOT = artifactRoot;
 			const factory = await loadExtension();
 			const { pi, ctx, registered } = stubPi("session-1");
-			factory(pi as never, { startReconciler: () => () => {}, registerBackgroundWorkProvider: () => () => {} });
+			factory(pi as never, { startReconciler: () => () => {} });
 			const result = await registered.current?.execute("call", { action: "status", id: "review-round-run" }, undefined, undefined, ctx);
 			const text = (result as { content: Array<{ text: string }> }).content[0]?.text ?? "";
 			expect(text).toContain("review round: 3");
@@ -714,7 +564,6 @@ describe("extension wiring", () => {
 			const killProcessGroup = vi.fn();
 			factory(pi as never, {
 				startReconciler: () => () => {},
-				registerBackgroundWorkProvider: () => () => {},
 				loadRunState,
 				revalidateRunIdentity: revalidate,
 				killProcessGroup,
@@ -795,5 +644,184 @@ describe("extension wiring", () => {
 			else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
 			fs.rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	describe("agent_end headless drain", () => {
+		/** Spawns an async run that reaches "spawn" but never "close", for tests that drive its exit manually. */
+		function installNeverClosingAsyncSpawn(pid: number) {
+			let procRef: (EventEmitter & { stdout: EventEmitter; stderr: EventEmitter; pid?: number; kill: ReturnType<typeof vi.fn> }) | undefined;
+			const { spawn } = installAsyncSpawn((spec) => {
+				const proc = makeFakeChildProcess() as EventEmitter & {
+					stdout: EventEmitter;
+					stderr: EventEmitter;
+					pid?: number;
+					unref: ReturnType<typeof vi.fn>;
+				};
+				proc.pid = pid;
+				proc.unref = vi.fn();
+				const reportIndex = spec.args.indexOf("--report");
+				const reportPath = reportIndex >= 0 ? spec.args[reportIndex + 1] : undefined;
+				if (reportPath) {
+					fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+					fs.writeFileSync(reportPath, JSON.stringify({ result: { outcome: "success", answer: "ok" }, stats: { review_rounds: 0 } }));
+				}
+				queueMicrotask(() => { proc.emit("spawn"); });
+				procRef = proc as never;
+				return proc;
+			});
+			return { spawn, getProc: () => procRef };
+		}
+
+		it("returns immediately for interactive sessions, even with an owned run still active", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-agentend-ui-"));
+			const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			try {
+				process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+				const { spawn } = installNeverClosingAsyncSpawn(11111);
+				const factory = await loadExtension();
+				const { pi, ctx, registered, handlers, eventListenerCount } = stubPi("session-1");
+				factory(pi as never, { startReconciler: () => () => {} });
+				await handlers.session_start?.({}, ctx);
+				const spawned = await registered.current?.execute(
+					"call",
+					{ agent: "self-review-worker", task: "background task", async: true },
+					undefined,
+					undefined,
+					ctx,
+				) as { isError?: boolean };
+				expect(spawned.isError).not.toBe(true);
+				expect(spawn).toHaveBeenCalledTimes(1);
+
+				const started = Date.now();
+				await handlers.agent_end?.({ type: "agent_end", messages: [] }, { ...ctx, hasUI: true });
+				expect(Date.now() - started).toBeLessThan(200);
+				// hasUI must short-circuit before ever subscribing to the wake channel.
+				expect(eventListenerCount("pi-swival:run-finished")).toBe(0);
+			} finally {
+				if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+				else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+				fs.rmSync(root, { recursive: true, force: true });
+				vi.doUnmock("node:child_process");
+			}
+		});
+
+		it("does not block agent_end on a run owned by a different session", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-agentend-othersession-"));
+			const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			try {
+				process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+				installNeverClosingAsyncSpawn(22222);
+				const factory = await loadExtension();
+				const { pi, ctx, registered, handlers } = stubPi("session-1");
+				factory(pi as never, { startReconciler: () => () => {} });
+				await handlers.session_start?.({}, ctx);
+				const spawned = await registered.current?.execute(
+					"call",
+					{ agent: "self-review-worker", task: "background task", async: true },
+					undefined,
+					undefined,
+					ctx,
+				) as { isError?: boolean };
+				expect(spawned.isError).not.toBe(true);
+
+				// A different session becomes current before agent_end fires — the
+				// run above is no longer "ours" under the exact-alias ownership model.
+				const ctx2 = { ...ctx, sessionManager: { getSessionId: () => "session-2" } };
+				await handlers.session_start?.({}, ctx2);
+
+				const started = Date.now();
+				await handlers.agent_end?.({ type: "agent_end", messages: [] }, { ...ctx2, hasUI: false });
+				expect(Date.now() - started).toBeLessThan(500);
+			} finally {
+				if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+				else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+				fs.rmSync(root, { recursive: true, force: true });
+				vi.doUnmock("node:child_process");
+			}
+		});
+
+		it("drains an owned async run at agent_end, waking on pi-swival:run-finished, and leaves no listener behind", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-agentend-drain-"));
+			const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			try {
+				process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+				const { getProc } = installNeverClosingAsyncSpawn(33333);
+				const factory = await loadExtension();
+				const { pi, ctx, registered, handlers, eventListenerCount } = stubPi("session-1");
+				factory(pi as never, { startReconciler: () => () => {}, agentEndDrainPollIntervalMs: 20 });
+				await handlers.session_start?.({}, ctx);
+				const spawned = await registered.current?.execute(
+					"call",
+					{ agent: "self-review-worker", task: "background task", async: true },
+					undefined,
+					undefined,
+					ctx,
+				) as { isError?: boolean };
+				expect(spawned.isError).not.toBe(true);
+
+				let resolved = false;
+				const drainPromise = Promise.resolve(
+					handlers.agent_end?.({ type: "agent_end", messages: [] }, { ...ctx, hasUI: false }),
+				).then(() => { resolved = true; });
+
+				await waitFor(() => eventListenerCount("pi-swival:run-finished") > 0);
+				expect(resolved).toBe(false);
+
+				getProc()?.emit("close", 0, null);
+
+				await drainPromise;
+				expect(resolved).toBe(true);
+				expect(eventListenerCount("pi-swival:run-finished")).toBe(0);
+			} finally {
+				if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+				else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+				fs.rmSync(root, { recursive: true, force: true });
+				vi.doUnmock("node:child_process");
+			}
+		});
+
+		it("times out cleanly on a stuck owned run without killing it or leaking a listener", async () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-agentend-timeout-"));
+			const previousRoot = process.env.PI_SWIVAL_ARTIFACT_ROOT;
+			try {
+				process.env.PI_SWIVAL_ARTIFACT_ROOT = path.join(root, "artifacts");
+				const { getProc } = installNeverClosingAsyncSpawn(44444);
+				const factory = await loadExtension();
+				const { pi, ctx, registered, handlers, eventListenerCount } = stubPi("session-1");
+				factory(pi as never, {
+					startReconciler: () => () => {},
+					agentEndDrainTimeoutMs: 40,
+					agentEndDrainPollIntervalMs: 10,
+				});
+				await handlers.session_start?.({}, ctx);
+				const spawned = await registered.current?.execute(
+					"call",
+					{ agent: "self-review-worker", task: "background task", async: true },
+					undefined,
+					undefined,
+					ctx,
+				) as { isError?: boolean };
+				expect(spawned.isError).not.toBe(true);
+
+				// Fake timers make the 40 ms drain timeout deterministic instead of a
+				// real wall-clock wait (both `setTimeout` and `Date.now` are virtualized).
+				vi.useFakeTimers();
+				try {
+					const agentEndDone = handlers.agent_end?.({ type: "agent_end", messages: [] }, { ...ctx, hasUI: false });
+					await vi.advanceTimersByTimeAsync(40);
+					await agentEndDone;
+				} finally {
+					vi.useRealTimers();
+				}
+
+				expect(getProc()?.kill).not.toHaveBeenCalled();
+				expect(eventListenerCount("pi-swival:run-finished")).toBe(0);
+			} finally {
+				if (previousRoot === undefined) delete process.env.PI_SWIVAL_ARTIFACT_ROOT;
+				else process.env.PI_SWIVAL_ARTIFACT_ROOT = previousRoot;
+				fs.rmSync(root, { recursive: true, force: true });
+				vi.doUnmock("node:child_process");
+			}
+		});
 	});
 });

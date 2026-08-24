@@ -99,9 +99,15 @@ Audit agents include built-in self-review with JSON / structure contract enforce
 
 When a background run finishes, the extension pushes a completion notice into the caller session. The notice carries the status, agent, run ID, and artifact path. It does not include output. Use `resume` to read the final answer. Notice status is derived from the exit marker plus `report.json`: reviewer-approved success becomes `accepted`, success without reviewer rounds becomes `completed`, `outcome: failed` becomes `rejected`, `outcome: error` becomes `error`, non-zero exits become `failed`, spawn errors become `failed`, and a null exit without `spawn-error.txt` becomes `stopped`. Delivery is acknowledged only after Pi emits the matching persisted `message_end` for that custom message. The notifier writes `notified.json` after that acknowledgement. A void `sendMessage` call is not enough. A reconciler scans completed artifacts for the active session.
 
-Cross-extension `subagent_wait` visibility uses the versioned `pi.events` background-work bridge. The bridge survives Pi extension reload realms and scopes work to exact session UUID and session-file aliases. `subagent_wait({})` and `subagent_wait({ all: true })` wait for swival work; `subagent_wait({ id })` remains limited to pi-subagents run IDs.
+### Background-work lifecycle
 
-[`pi-subagents`](https://github.com/nicobailon/pi-subagents) 0.50.0 does not include this bridge. Until a release includes `BackgroundWorkEventBridge`, pi-swival remains usable, but it logs a diagnostic naming `pi-swival` and stating that no background-work event bridge acknowledged registration, and `subagent_wait` cannot see swival runs.
+pi-swival and [`pi-subagents`](https://github.com/nicobailon/pi-subagents) are independent Pi extensions. Each tracks only the background work it started; neither observes the other's runs.
+
+A foreground `swival-subagent` call (no `async`) blocks until the run finishes and returns the final report directly.
+
+An async pi-swival run is tracked entirely by pi-swival's own per-session registry. In a headless session (no UI), pi-swival's `agent_end` handler waits for that session's own active async runs to finish, up to an internal drain limit, before letting the agent end. Interactive sessions never block on this; check background runs with `status`, `resume`, or `interrupt`.
+
+pi-subagents' `subagent_wait` tool manages only pi-subagents' own run IDs. It has no visibility into pi-swival's async runs. To track or manage a pi-swival async run, use `swival-subagent`'s `status`, `resume`, and `interrupt` actions instead of `subagent_wait`.
 
 `status` classifies a run as running, exited, or unknown. A run is `running` only when the PID is alive and its observed start time agrees with the persisted start time. A reused PID cannot read as alive, and an uncertain fate reads as unknown. `interrupt` revalidates that identity before `SIGTERM` and again before a delayed `SIGKILL`. Where the data exists, `status` also reports elapsed time, turn depth, last tool call, last activity, review round, and session cost.
 
@@ -140,7 +146,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers pure functions and stub Pi runtime wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. It uses real temporary files, harmless spawn sentinels, and one real ENOENT `ChildProcess` probe. It never starts an actual `swival` task or provider request. The harness pins `pi-subagents` 0.50.0 and applies the coordinated source patch only for bridge regression tests; pi-swival does not patch production dependencies automatically.
+The vitest harness covers pure functions and stub Pi runtime wiring. It tests argument building, report summaries, artifact persistence, trace parsing, bundled agents, completion notices, liveness, cache paths, credential preflight, and session lifecycle behavior. It uses real temporary files, harmless spawn sentinels, and one real ENOENT `ChildProcess` probe. It never starts an actual `swival` task or provider request. The harness has no dependency on `pi-subagents`; pi-swival and pi-subagents are tested and versioned independently.
 
 ```bash
 cd tests

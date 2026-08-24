@@ -11,50 +11,11 @@ if ! command -v npm >/dev/null 2>&1; then
 fi
 
 # 1. Install the local test dependencies.
-PI_SUBAGENTS_DIR="${PWD}/node_modules/pi-subagents"
-PI_SUBAGENTS_SOURCE="${PI_SUBAGENTS_DIR}/src/api/background-work.ts"
-PI_SUBAGENTS_PATCH="${PWD}/fixtures/pi-subagents-background-work-events.patch"
-FINAL_PATCH_MARKER='export interface BackgroundWorkEventBridge'
-OLD_PATCH_MARKER='export const BACKGROUND_WORK_REGISTER_EVENT = '
-
-if [[ ! -d node_modules/vitest || ! -d "$PI_SUBAGENTS_DIR" ]]; then
+if [[ ! -d node_modules/vitest ]]; then
 	if ! npm install --silent --ignore-scripts; then
 		echo "error: npm install failed while restoring test dependencies." >&2
 		exit 1
 	fi
-fi
-
-# An earlier fixture used the register-event constant as its marker. Restore the
-# pinned package before applying the final patch when that stale patch is found.
-if [[ -f "$PI_SUBAGENTS_SOURCE" ]] \
-	&& grep -q "^${OLD_PATCH_MARKER}" "$PI_SUBAGENTS_SOURCE" \
-	&& ! grep -q "^${FINAL_PATCH_MARKER}" "$PI_SUBAGENTS_SOURCE"; then
-	rm -rf "$PI_SUBAGENTS_DIR"
-	if ! npm install --silent --ignore-scripts; then
-		echo "error: npm install failed while restoring pinned pi-subagents 0.50.0 after removing the stale patch." >&2
-		exit 1
-	fi
-fi
-
-# Apply the committed source-only patch to the pinned pi-subagents fixture.
-# BackgroundWorkEventBridge is the final contract and idempotency marker.
-if [[ ! -f "$PI_SUBAGENTS_SOURCE" ]]; then
-	echo "error: pinned pi-subagents 0.50.0 source is missing after npm install: ${PI_SUBAGENTS_SOURCE}" >&2
-	exit 1
-fi
-if ! grep -q "^${FINAL_PATCH_MARKER}" "$PI_SUBAGENTS_SOURCE"; then
-	if ! patch --dry-run --silent -p1 -d "$PI_SUBAGENTS_DIR" < "$PI_SUBAGENTS_PATCH"; then
-		echo "error: failed to apply ${PI_SUBAGENTS_PATCH} to pinned pi-subagents 0.50.0." >&2
-		exit 1
-	fi
-	if ! patch --silent -p1 -d "$PI_SUBAGENTS_DIR" < "$PI_SUBAGENTS_PATCH"; then
-		echo "error: failed to apply ${PI_SUBAGENTS_PATCH} to pinned pi-subagents 0.50.0." >&2
-		exit 1
-	fi
-fi
-if ! grep -q "^${FINAL_PATCH_MARKER}" "$PI_SUBAGENTS_SOURCE"; then
-	echo "error: pi-subagents fixture patch applied without the final BackgroundWorkEventBridge contract." >&2
-	exit 1
 fi
 
 # 2. Find the Pi install so we can symlink the peer packages the extension
