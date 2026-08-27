@@ -185,6 +185,67 @@ export function isRunFailure(r: { exitCode: number; report?: { outcome?: string 
 }
 
 /**
+ * Detect an AgentFS sandbox that was requested but never proven to have
+ * actually re-exec'd. `sandbox.mode` in the report is written straight from
+ * argv (`report.py:349`), so it reads "agentfs" whether or not the re-exec
+ * happened — it is not evidence. `sandbox.agentfs_version` is set only by
+ * the code path inside `maybe_reexec()` that runs *after* the re-exec into
+ * the overlay, so its presence is the fact that can't be faked from argv.
+ * `diff_hint` is the same kind of re-exec-only evidence, but is only
+ * populated when the overlay actually captured a change, so it is not
+ * required on a no-op run.
+ *
+ * A run that requested "agentfs" and can't show this evidence is a
+ * bootstrap failure: the caller believed writes were isolated when they may
+ * not have been. Returns undefined when no sandbox was requested (nothing
+ * to check) or when the evidence is present.
+ */
+export function agentFsBootstrapFailure(
+	sandboxRequested: boolean,
+	report: ReportSummary | undefined,
+): FailureReason | undefined {
+	if (!sandboxRequested) return undefined;
+	if (!report) {
+		return {
+			code: "config_error",
+			text: "AgentFS sandbox was requested but no report was produced, so the re-exec into the overlay cannot be confirmed.",
+		};
+	}
+	if (report.sandbox?.mode !== "agentfs") {
+		return {
+			code: "config_error",
+			text: `AgentFS sandbox was requested but report.sandbox.mode is "${report.sandbox?.mode ?? "missing"}", not "agentfs".`,
+		};
+	}
+	if (typeof report.sandbox.agentfsVersion !== "string" || report.sandbox.agentfsVersion === "") {
+		return {
+			code: "config_error",
+			text: "AgentFS sandbox was requested and report.sandbox.mode says \"agentfs\", but sandbox.agentfs_version (re-exec-only evidence) is absent, so the overlay re-exec cannot be confirmed.",
+		};
+	}
+	return undefined;
+}
+
+/**
+ * Apply agentFsBootstrapFailure to a just-read report, folding any failure
+ * into the report shape isRunFailure already understands (outcome: "error")
+ * so a faked-looking "agentfs" run fails closed instead of reporting success.
+ * Extracted from runSingleSwival so the fail-closed behaviour is unit-testable
+ * without spawning a real (or fake) swival process.
+ */
+export function enforceAgentFsBootstrap(
+	sandboxRequested: boolean,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const failure = agentFsBootstrapFailure(sandboxRequested, report);
+	if (!failure) return { report };
+	return {
+		report: { ...(report ?? {}), outcome: "error", errorMessage: failure.text },
+		reason: failure,
+	};
+}
+
+/**
  * The exact `commands` allowlist that marks an agent as read-only at the
  * shell-allowlist level. Used by `isMutatingCwdAgent` to identify audit-style
  * agents whose only commands are read-only inspection. Drift-sensitive: if
@@ -458,6 +519,19 @@ interface ReportSummary {
 	// Model / provider recorded by swival.
 	model?: string;
 	provider?: string;
+	// From result.sandbox (report.py:349). `mode` is written straight from
+	// argv (--sandbox), so it is present whether or not AgentFS actually
+	// re-exec'd — it cannot prove isolation by itself. `agentfsVersion` and
+	// `diffHint` are set only by the re-exec'd process inside the overlay
+	// (swival/sandbox_agentfs.py maybe_reexec()), so their presence is the
+	// only evidence that the sandbox actually took effect. See
+	// agentFsBootstrapFailure, which fails the run closed when `mode` says
+	// "agentfs" but the re-exec-only fields are absent.
+	sandbox?: {
+		mode?: string;
+		agentfsVersion?: string;
+		diffHint?: string;
+	};
 	raw?: Record<string, unknown>;
 }
 
@@ -608,8 +682,19 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		answer: toStr(result.answer),
 		model: toStr(raw.model),
 		provider: toStr(raw.provider),
+		sandbox: summarizeSandbox(raw.sandbox),
 		raw,
 	};
+}
+
+function summarizeSandbox(raw: unknown): ReportSummary["sandbox"] {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const s = raw as Record<string, unknown>;
+	const mode = toStr(s.mode);
+	const agentfsVersion = toStr(s.agentfs_version);
+	const diffHint = toStr(s.diff_hint);
+	if (mode === undefined && agentfsVersion === undefined && diffHint === undefined) return undefined;
+	return { mode, agentfsVersion, diffHint };
 }
 
 function validateToolCallsByName(
@@ -1543,6 +1628,16 @@ async function runSingleSwival(
 		current.exitCode = exitCode;
 		current.durationMs = Date.now() - started;
 		current.report = await readReport(reportPath);
+
+		// Fail closed when the AgentFS sandbox was requested but the report
+		// can't prove the re-exec into the overlay happened (see
+		// agentFsBootstrapFailure). --yolo overrides --sandbox entirely
+		// (buildSwivalArgs never emits --sandbox when yolo is set), so it is
+		// not a bootstrap request even if agent.sandbox is also configured.
+		const sandboxRequested = !agent.yolo && agent.sandbox === "agentfs";
+		const bootstrapCheck = enforceAgentFsBootstrap(sandboxRequested, current.report);
+		current.report = bootstrapCheck.report;
+		if (bootstrapCheck.reason) current.reason = bootstrapCheck.reason;
 
 		// Prefer result.answer from the report JSON as the authoritative final
 		// output. Swival streams the answer to stdout too, but our 256 KB stdout

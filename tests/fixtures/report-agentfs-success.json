@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "mode": "oneshot",
+  "timestamp": "2026-08-27T13:10:00.000000+00:00",
+  "task": "Survey the repository read-only.",
+  "model": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "provider": "bedrock",
+  "sandbox": {
+    "mode": "agentfs",
+    "agentfs_version": "0.6.4",
+    "diff_hint": "2 files changed in overlay"
+  },
+  "result": {
+    "outcome": "success",
+    "answer": "Survey complete.",
+    "exit_code": 0
+  },
+  "stats": {
+    "turns": 2,
+    "tool_calls_total": 3,
+    "review_rounds": 0,
+    "llm_calls": 2,
+    "total_llm_time_s": 4.1,
+    "total_tool_time_s": 0.2,
+    "compactions": 0
+  },
+  "timeline": []
+}
