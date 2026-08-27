@@ -73,6 +73,9 @@ export interface RunMeta {
 	artifactDir: string;
 	stdoutFile: string;
 	stderrFile: string;
+	/** Whether this run effectively requested AgentFS. Optional for artifacts
+	 *  written before AgentFS intent was persisted. */
+	agentFsRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -243,6 +246,25 @@ export function enforceAgentFsBootstrap(
 		report: { ...(report ?? {}), outcome: "error", errorMessage: failure.text },
 		reason: failure,
 	};
+}
+
+/** Match buildSwivalArgs: yolo suppresses all sandbox arguments. */
+export function isAgentFsRequested(agent: Pick<SwivalAgentConfig, "sandbox" | "yolo">): boolean {
+	return agent.sandbox === "agentfs" && !agent.yolo;
+}
+
+/**
+ * Enforce bootstrap evidence when consuming a completed async report. New
+ * metadata records the effective request directly. For legacy metadata only,
+ * report.sandbox.mode preserves compatibility; a missing report does not imply
+ * that AgentFS was requested.
+ */
+export function enforceCompletedAsyncAgentFs(
+	meta: Pick<RunMeta, "agentFsRequested">,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const requested = meta.agentFsRequested ?? (report?.sandbox?.mode === "agentfs");
+	return enforceAgentFsBootstrap(requested, report);
 }
 
 /**
@@ -1185,7 +1207,8 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 			if (
 				typeof parsed.runId !== "string" ||
 				typeof parsed.artifactDir !== "string" ||
-				!(parsed.pid == null || typeof parsed.pid === "number")
+				!(parsed.pid == null || typeof parsed.pid === "number") ||
+				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -1351,6 +1374,7 @@ async function runSingleSwivalAsync(
 		artifactDir,
 		stdoutFile,
 		stderrFile,
+		agentFsRequested: isAgentFsRequested(agent),
 	};
 	await fs.promises.writeFile(
 		path.join(artifactDir, "run-meta.json"),
@@ -1634,8 +1658,7 @@ async function runSingleSwival(
 		// agentFsBootstrapFailure). --yolo overrides --sandbox entirely
 		// (buildSwivalArgs never emits --sandbox when yolo is set), so it is
 		// not a bootstrap request even if agent.sandbox is also configured.
-		const sandboxRequested = !agent.yolo && agent.sandbox === "agentfs";
-		const bootstrapCheck = enforceAgentFsBootstrap(sandboxRequested, current.report);
+		const bootstrapCheck = enforceAgentFsBootstrap(isAgentFsRequested(agent), current.report);
 		current.report = bootstrapCheck.report;
 		if (bootstrapCheck.reason) current.reason = bootstrapCheck.reason;
 
@@ -1796,7 +1819,7 @@ const SwivalParams = Type.Object({
 		}),
 	),
 	profileOverride: Type.Optional(
-		Type.String({ description: "Override the agent's named Swival profile for this call, such as fast or heavy." }),
+		Type.String({ description: "Override the agent's named Swival profile for this call, such as budget or frontier." }),
 	),
 	providerOverride: Type.Optional(Type.String({ description: "Override the agent's provider for this call." })),
 	baseUrlOverride: Type.Optional(
@@ -2176,7 +2199,15 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 					const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
-					const outcome = report?.outcome ?? "unknown";
+					const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
+					if (bootstrapCheck.reason) {
+						return {
+							content: [{ type: "text", text: `Run ${runId} failed AgentFS bootstrap validation: ${bootstrapCheck.reason.text}\nArtifact dir: ${state.meta.artifactDir}` }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					const outcome = bootstrapCheck.report?.outcome ?? "unknown";
 					const exitedAt = state.completed?.exitedAt ?? "unknown";
 					return {
 						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}` }],
@@ -2255,10 +2286,18 @@ export default function (pi: ExtensionAPI) {
 					}
 					// Read final output: prefer report.result.answer, fall back to stdout file.
 					const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
+					const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
+					if (bootstrapCheck.reason) {
+						return {
+							content: [{ type: "text", text: `Run ${runId} failed AgentFS bootstrap validation: ${bootstrapCheck.reason.text}\nArtifact dir: ${state.meta.artifactDir}` }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
 					const stdoutContent = await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
-					const finalOutput = (report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
-					const feedback = report?.lastReviewFeedback;
-					const outcome = report?.outcome ?? "unknown";
+					const finalOutput = (bootstrapCheck.report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
+					const feedback = bootstrapCheck.report?.lastReviewFeedback;
+					const outcome = bootstrapCheck.report?.outcome ?? "unknown";
 					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
 					if (feedback) text += `\n\n─── reviewer feedback ───\n${feedback}`;
 					return {

@@ -37,20 +37,27 @@ trap cleanup EXIT
 
 echo "=== AgentFS integration canary (session: ${session}) ==="
 
-printf 'original' > "${base}/original.txt"
+original_content="original-${session}"
+printf '%s' "$original_content" > "${base}/original.txt"
 
-agentfs run --no-default-allows --allow "$base" --session "$session" -- \
-  python3 - <<'PY'
-import os, pathlib
+(
+  cd "$base"
+  agentfs run --no-default-allows --session "$session" -- \
+    python3 - "$original_content" <<'PY'
+import os, pathlib, sys
 assert os.environ.get("AGENTFS") == "1", "AGENTFS=1 not set inside the sandbox"
 cwd = pathlib.Path.cwd()
-(cwd / "original.txt").write_text("changed-in-overlay")
+original = cwd / "original.txt"
+expected = sys.argv[1]
+assert original.read_text() == expected, f"sandbox cwd {cwd} does not expose the fixture sentinel"
+original.write_text("changed-in-overlay")
 (cwd / "overlay-only.txt").write_text("new-in-overlay")
-print("agentfs-env-and-writes: OK")
+print("agentfs-env-fixture-and-writes: OK")
 PY
+)
 
 # The real fixture filesystem must be untouched by the overlay writes.
-if [[ "$(cat "${base}/original.txt")" != "original" ]]; then
+if [[ "$(cat "${base}/original.txt")" != "$original_content" ]]; then
   echo "FAIL: overlay write to an existing file leaked into the real fixture filesystem" >&2
   exit 1
 fi

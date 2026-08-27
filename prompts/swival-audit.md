@@ -145,7 +145,7 @@ Use the same dispatch overrides used for `audit-worker` so the consolidation run
   "cwd": "<workspace dir containing reports/>",
   "task": "Read every file under reports/. For each finding, dedupe across buckets and produce a consolidated report matching the contract.",
   "output": "<workspace>/consolidated-findings.md",
-  "profileOverride": "heavy",
+  "profileOverride": "frontier",
   "reasoningEffortOverride": "high",
   "temperatureOverride": 0.2,
   "maxReviewRoundsOverride": 2,
