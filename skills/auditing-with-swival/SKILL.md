@@ -72,13 +72,13 @@ Pass these as dispatch-time overrides on every worker. Do not hardcode model nam
 
 | Override | Value | Rationale |
 |---|---|---|
-| `profileOverride` | `"heavy"` | Frontier-tier judgment. Audit is novel reasoning across call graphs; review loop alone doesn't compensate for a weaker model. |
+| `profileOverride` | `"frontier"` | Frontier-tier judgment. Audit is novel reasoning across call graphs; review loop alone doesn't compensate for a weaker model. |
 | `reasoningEffortOverride` | `"high"` | Multi-step exploit reasoning needs extended thinking. |
 | `temperatureOverride` | `0.2` | Audit reports should be deterministic; suppress confident hallucination. |
 | `maxReviewRoundsOverride` | `2` | One review pass catches attention-lapse errors without unbounded spend. |
 | `seedOverride` | `<fixed int>` | Reproducibility on re-run. Pick a date-based int. |
 
-Verify `swival --list-profiles` includes `heavy` before Stage 1. If not, halt — do not silently fall back.
+Verify `swival --list-profiles` includes `frontier` before Stage 1. If not, halt — do not silently fall back.
 
 ## Stage 1 — recon
 
@@ -90,7 +90,7 @@ swival-subagent with
   cwd: "<repo absolute path>"
   task: "<contents of recon prompt — see below>"
   output: "$WORKSPACE/recon.json"
-  profileOverride: "heavy"
+  profileOverride: "frontier"
   reasoningEffortOverride: "high"
   temperatureOverride: 0.2
   maxReviewRoundsOverride: 2
@@ -117,7 +117,7 @@ Parse `recon.json`. For each bucket, render the prompt template (`references/aud
 swival-subagent with
   agent: "audit-worker"
   concurrency: 3
-  profileOverride: "heavy"
+  profileOverride: "frontier"
   reasoningEffortOverride: "high"
   temperatureOverride: 0.2
   maxReviewRoundsOverride: 2
@@ -133,7 +133,7 @@ swival-subagent with
 
 The `audit-worker` agent is the existing read-only auditor (see `~/.pi/agent/swival-agents/audit-worker.md`). The leading `/audit` is required by that agent.
 
-Set `concurrency` based on token budget and rate limits. Defaults: 3 for `heavy` profile, 4 for lighter.
+Set `concurrency` based on token budget and rate limits. Defaults: 3 for `frontier` profile, 4 for lighter.
 
 AgentFS parallel-dispatch warning: `audit-worker` runs under `sandbox: agentfs`, and AgentFS keeps its overlay state in a per-session SQLite database. When several invocations share a session id they fight over the same lock and most workers die before they can read anything. The bundled `audit-worker.md` ships with `noSandboxAutoSession: true` so each parallel invocation gets its own overlay; if you fork the agent into your own scope, keep that flag or every fan-out larger than one will fail. The same rule applies to any other `sandbox: agentfs` agent you fan out in parallel against a shared cwd. The dispatcher will refuse parallel dispatches of write-capable agents against a shared cwd unless one of these escapes is in effect (serial dispatch, per-task cwd, or `noSandboxAutoSession: true`).
 
@@ -151,7 +151,7 @@ swival-subagent with
   cwd: "$WORKSPACE"
   task: "<consolidation prompt — see below>"
   output: "$WORKSPACE/consolidated-findings.md"
-  profileOverride: "heavy"
+  profileOverride: "frontier"
   reasoningEffortOverride: "high"
   temperatureOverride: 0.2
   maxReviewRoundsOverride: 2

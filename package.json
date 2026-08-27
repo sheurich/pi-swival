@@ -28,7 +28,8 @@
     "test": "cd tests && ./setup.sh && npx vitest run",
     "test:watch": "cd tests && ./setup.sh && npx vitest",
     "smoke": "./scripts/smoke-test.sh",
-    "ci": "npm run smoke && npm test"
+    "agentfs-integration": "./scripts/agentfs-integration-test.sh",
+    "ci": "npm run smoke && npm run agentfs-integration && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
