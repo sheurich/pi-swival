@@ -56,6 +56,23 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent({ sandbox: "agentfs" }))).toBe(true);
 	});
 
+	it("treats typed and extraArgs named AgentFS sessions as shared overlays", () => {
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				sandbox: "agentfs",
+				noSandboxAutoSession: true,
+				sandboxSession: "shared-session",
+			})),
+		).toBe(true);
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				sandbox: "agentfs",
+				noSandboxAutoSession: true,
+				extraArgs: ["--sandbox-session=shared-session"],
+			})),
+		).toBe(true);
+	});
+
 	it("returns true when noSandboxAutoSession is set without an agentfs sandbox", () => {
 		expect(isMutatingCwdAgent(makeAgent({ noSandboxAutoSession: true }))).toBe(true);
 	});

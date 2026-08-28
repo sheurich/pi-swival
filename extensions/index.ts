@@ -316,7 +316,11 @@ export function isMutatingCwdAgent(
 	overrides: SwivalOverrides = {},
 ): boolean {
 	const args = buildSwivalArgs(agent, "", undefined, overrides);
-	if (isAgentFsRequested(args) && hasCliFlag(args, "--no-sandbox-auto-session")) return false;
+	const hasFreshAgentFsOverlay =
+		isAgentFsRequested(args) &&
+		hasCliFlag(args, "--no-sandbox-auto-session") &&
+		lastCliOptionValue(args, "--sandbox-session") === undefined;
+	if (hasFreshAgentFsOverlay) return false;
 
 	const files = lastCliOptionValue(args, "--files");
 	const commands = lastCliOptionValue(args, "--commands");
