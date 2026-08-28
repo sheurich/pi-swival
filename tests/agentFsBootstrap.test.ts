@@ -68,7 +68,8 @@ describe("enforceAgentFsBootstrap + isRunFailure integration", () => {
 		const enforced = enforceAgentFsBootstrap(true, report);
 		expect(enforced.reason).toBeDefined();
 		// The exact failure mode this test guards against: a sandbox bootstrap
-		// failure must never look like a successful result.
+		// failure must never look like a successful or accepted result.
+		expect(enforced.report?.accepted).toBe(false);
 		expect(isRunFailure({ exitCode: 0, report: enforced.report })).toBe(true);
 	});
 

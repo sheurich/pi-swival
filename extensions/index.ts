@@ -242,7 +242,12 @@ export function enforceAgentFsBootstrap(
 	const failure = agentFsBootstrapFailure(sandboxRequested, report);
 	if (!failure) return { report };
 	return {
-		report: { ...(report ?? {}), outcome: "error", errorMessage: failure.text },
+		report: {
+			...(report ?? {}),
+			outcome: "error",
+			accepted: false,
+			errorMessage: failure.text,
+		},
 		reason: failure,
 	};
 }
@@ -2205,9 +2210,9 @@ export function renderStatus(r: SwivalResult): RunStatus {
 		const rounds = r.report.reviewRounds ?? 0;
 		return rounds > 0 ? "accepted" : "completed";
 	}
-	// exit=0 with no or unknown report: the run didn't fail, but we can't
-	// confirm a reviewer approved it. Treat as "completed" (ran to end).
-	return "completed";
+	// Exit zero with a missing or unknown report fails closed because no
+	// valid terminal outcome proves that the run completed successfully.
+	return "error";
 }
 
 /**

@@ -47,6 +47,24 @@ describe("buildParallelSummary", () => {
 		expect(summary).toMatch(/=== \[0\] worker \(accepted, 18\/20 turns\) ===/);
 	});
 
+	it.each([
+		["missing", undefined],
+		["unknown", { outcome: "unknown" as const }],
+	])("labels an exit-zero %s report failure as error", (_label, report) => {
+		const summary = buildParallelSummary([
+			makeResult({
+				report,
+				errorMessage: "Swival did not produce a valid terminal report.",
+				reason: {
+					code: "config_error",
+					text: "Swival did not produce a valid terminal report.",
+				},
+			}),
+		]);
+		expect(summary).toMatch(/=== \[0\] worker \(error\/config_error/);
+		expect(summary).not.toMatch(/completed\/config_error/);
+	});
+
 	it("includes the reason code in the header for failed tasks", () => {
 		const results = [
 			makeResult({
