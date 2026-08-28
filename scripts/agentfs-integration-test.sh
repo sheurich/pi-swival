@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Integration canary for the AgentFS sandbox, independent of Swival and any
-# model call. Skips (exit 0) when the `agentfs` binary is not on PATH, so it
-# is safe to wire into `npm run ci` on hosts without AgentFS installed.
+# model call. Local runs skip when `agentfs` is unavailable. CI sets
+# REQUIRE_AGENTFS=1 so a missing binary fails the required canary.
 #
 # What this proves, and what it deliberately does NOT assume:
 #   - AGENTFS=1 is set inside the sandboxed process (env evidence that the
@@ -22,25 +22,38 @@
 set -euo pipefail
 
 if ! command -v agentfs >/dev/null 2>&1; then
+  if [[ "${REQUIRE_AGENTFS:-0}" == "1" ]]; then
+    echo "FAIL: agentfs not found on PATH; required AgentFS canary cannot run." >&2
+    exit 1
+  fi
   echo "SKIP: agentfs not found on PATH; AgentFS integration canary not run."
   exit 0
 fi
 
 base="$(mktemp -d)"
-session="agentfs-ci-canary-$$"
+session="${AGENTFS_CANARY_SESSION:-agentfs-ci-canary-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 run_dir="${HOME}/.agentfs/run/${session}"
+owns_run_dir=false
 
 cleanup() {
-  rm -rf "$base" "$run_dir"
+  rm -rf "$base"
+  if [[ "$owns_run_dir" == true ]]; then
+    rm -rf "$run_dir"
+  fi
 }
 trap cleanup EXIT
+
+if [[ -e "$run_dir" ]]; then
+  echo "FAIL: refusing to reuse pre-existing AgentFS session directory: ${run_dir}" >&2
+  exit 1
+fi
 
 echo "=== AgentFS integration canary (session: ${session}) ==="
 
 original_content="original-${session}"
 printf '%s' "$original_content" > "${base}/original.txt"
 
-(
+if ! (
   cd "$base"
   agentfs run --no-default-allows --session "$session" -- \
     python3 - "$original_content" <<'PY'
@@ -54,7 +67,12 @@ original.write_text("changed-in-overlay")
 (cwd / "overlay-only.txt").write_text("new-in-overlay")
 print("agentfs-env-fixture-and-writes: OK")
 PY
-)
+); then
+  [[ -e "$run_dir" ]] && owns_run_dir=true
+  echo "FAIL: AgentFS integration command failed." >&2
+  exit 1
+fi
+[[ -e "$run_dir" ]] && owns_run_dir=true
 
 # The real fixture filesystem must be untouched by the overlay writes.
 if [[ "$(cat "${base}/original.txt")" != "$original_content" ]]; then

@@ -3,6 +3,8 @@ import {
 	checkRequiresReviewer,
 	isMutatingCwdAgent,
 	READ_ONLY_AUDIT_COMMANDS,
+	resolveAgentBaseDir,
+	resolveDispatchCwd,
 	unknownAgentMessage,
 } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
@@ -23,14 +25,21 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent())).toBe(true);
 	});
 
-	it("returns false when files=none disables the write surface", () => {
-		expect(isMutatingCwdAgent(makeAgent({ files: "none" }))).toBe(false);
+	it("treats files=none with unrestricted commands as mutating", () => {
+		expect(isMutatingCwdAgent(makeAgent({ files: "none" }))).toBe(true);
 	});
 
-	it("returns false when commands matches the read-only audit allowlist", () => {
+	it("returns false only when file writes and mutating commands are both disabled", () => {
+		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "none" }))).toBe(false);
 		expect(
-			isMutatingCwdAgent(makeAgent({ commands: READ_ONLY_AUDIT_COMMANDS })),
+			isMutatingCwdAgent(makeAgent({ files: "none", commands: READ_ONLY_AUDIT_COMMANDS })),
 		).toBe(false);
+	});
+
+	it("treats a read-only command allowlist with file writes enabled as mutating", () => {
+		expect(
+			isMutatingCwdAgent(makeAgent({ files: "some", commands: READ_ONLY_AUDIT_COMMANDS })),
+		).toBe(true);
 	});
 
 	it("returns true for a partial commands allowlist that is not the canonical read-only set", () => {
@@ -49,6 +58,55 @@ describe("isMutatingCwdAgent", () => {
 
 	it("returns true when noSandboxAutoSession is set without an agentfs sandbox", () => {
 		expect(isMutatingCwdAgent(makeAgent({ noSandboxAutoSession: true }))).toBe(true);
+	});
+
+	it("uses extraArgs overrides when classifying sandbox isolation", () => {
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				sandbox: "agentfs",
+				noSandboxAutoSession: true,
+				extraArgs: ["--sandbox", "builtin"],
+			})),
+		).toBe(true);
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				noSandboxAutoSession: true,
+				extraArgs: ["--sandbox=agentfs"],
+			})),
+		).toBe(false);
+	});
+
+	it("uses extraArgs overrides when classifying file and command write surfaces", () => {
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				files: "none",
+				commands: "none",
+				extraArgs: ["--files", "all"],
+			})),
+		).toBe(true);
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				files: "none",
+				commands: READ_ONLY_AUDIT_COMMANDS,
+				extraArgs: ["--commands=all"],
+			})),
+		).toBe(true);
+	});
+});
+
+describe("resolveAgentBaseDir", () => {
+	it("uses per-task, top-level, then Pi cwd precedence", () => {
+		expect(resolveDispatchCwd("../task", "/tmp/top", "/repo/pi")).toBe("/repo/task");
+		expect(resolveDispatchCwd(undefined, "/tmp/top", "/repo/pi")).toBe("/tmp/top");
+		expect(resolveDispatchCwd(undefined, undefined, "/repo/pi")).toBe("/repo/pi");
+	});
+
+	it("resolves typed and extraArgs base directories from the process cwd", () => {
+		expect(resolveAgentBaseDir(makeAgent({ baseDir: "../shared" }), "/tmp/worktree-a")).toBe("/tmp/shared");
+		expect(resolveAgentBaseDir(makeAgent({
+			baseDir: "ignored",
+			extraArgs: ["--base-dir", "../shared"],
+		}), "/tmp/worktree-b")).toBe("/tmp/shared");
 	});
 });
 
@@ -93,6 +151,44 @@ describe("checkRequiresReviewer", () => {
 		expect(
 			checkRequiresReviewer(makeAgent({ requiresReviewer: true }), { selfReview: true }),
 		).toBeUndefined();
+	});
+
+	it("rejects when an override disables the only configured reviewer", () => {
+		expect(
+			checkRequiresReviewer(makeAgent({ requiresReviewer: true, selfReview: true }), { selfReview: false }),
+		).toMatch(/requires a reviewer/);
+		expect(
+			checkRequiresReviewer(makeAgent({ requiresReviewer: true, reviewer: "/bin/true" }), { reviewer: "" }),
+		).toMatch(/requires a reviewer/);
+	});
+
+	it("rejects conflicting effective reviewer modes", () => {
+		expect(
+			checkRequiresReviewer(
+				makeAgent({ requiresReviewer: true, reviewer: "/bin/true" }),
+				{ selfReview: true },
+			),
+		).toMatch(/mutually exclusive/);
+		expect(
+			checkRequiresReviewer(makeAgent({
+				requiresReviewer: true,
+				selfReview: true,
+				extraArgs: ["--reviewer=/bin/true"],
+			}), {}),
+		).toMatch(/mutually exclusive/);
+	});
+
+	it("uses final extraArgs reviewer semantics", () => {
+		expect(
+			checkRequiresReviewer(makeAgent({ requiresReviewer: true, extraArgs: ["--self-review"] }), {}),
+		).toBeUndefined();
+		expect(
+			checkRequiresReviewer(makeAgent({
+				requiresReviewer: true,
+				reviewer: "/bin/true",
+				extraArgs: ["--reviewer="],
+			}), {}),
+		).toMatch(/requires a reviewer/);
 	});
 });
 

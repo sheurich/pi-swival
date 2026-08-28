@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { mapWithConcurrency, computeErrorMessage, TaskItem, ChainItem } from "../extensions/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import {
+	mapWithConcurrency,
+	computeErrorMessage,
+	scheduleProcessGroupKillEscalation,
+	terminateProcessGroup,
+	TaskItem,
+	ChainItem,
+} from "../extensions/index.js";
 
 describe("TaskItem schema", () => {
 	it("forbids additional properties (rejects silently-dropped unknown fields)", () => {
@@ -58,6 +66,65 @@ describe("mapWithConcurrency", () => {	it("never runs more than `concurrency` ta
 			return item * 2;
 		});
 		expect(results).toEqual([20, 40, 60, 80]);
+	});
+});
+
+describe("scheduleProcessGroupKillEscalation", () => {
+	afterEach(() => vi.useRealTimers());
+
+	it("cancels SIGKILL when the tracked process closes", () => {
+		vi.useFakeTimers();
+		const proc = new EventEmitter();
+		const kill = vi.fn();
+		scheduleProcessGroupKillEscalation(proc, 1234, kill);
+		proc.emit("close");
+		vi.advanceTimersByTime(5000);
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	it("escalates a still-running process group after five seconds", () => {
+		vi.useFakeTimers();
+		const proc = new EventEmitter();
+		const kill = vi.fn();
+		scheduleProcessGroupKillEscalation(proc, 1234, kill);
+		vi.advanceTimersByTime(5000);
+		expect(kill).toHaveBeenCalledWith(-1234, "SIGKILL");
+	});
+});
+
+describe("terminateProcessGroup", () => {
+	afterEach(() => vi.useRealTimers());
+
+	it("waits for close after SIGTERM", async () => {
+		const proc = new EventEmitter();
+		const kill = vi.fn((_pid: number, signal: string) => {
+			if (signal === "SIGTERM") proc.emit("close");
+		});
+		await expect(terminateProcessGroup(proc, 1234, kill, 100, 50)).resolves.toBe(true);
+		expect(kill).toHaveBeenCalledWith(-1234, "SIGTERM");
+		expect(kill).not.toHaveBeenCalledWith(-1234, "SIGKILL");
+	});
+
+	it("escalates a TERM-ignoring process and waits for close", async () => {
+		vi.useFakeTimers();
+		const proc = new EventEmitter();
+		const kill = vi.fn((_pid: number, signal: string) => {
+			if (signal === "SIGKILL") proc.emit("close");
+		});
+		const termination = terminateProcessGroup(proc, 1234, kill, 100, 50);
+		await vi.advanceTimersByTimeAsync(100);
+		await expect(termination).resolves.toBe(true);
+		expect(kill).toHaveBeenCalledWith(-1234, "SIGTERM");
+		expect(kill).toHaveBeenCalledWith(-1234, "SIGKILL");
+	});
+
+	it("returns false when no close is observed after SIGKILL", async () => {
+		vi.useFakeTimers();
+		const proc = new EventEmitter();
+		const kill = vi.fn();
+		const termination = terminateProcessGroup(proc, 1234, kill, 100, 50);
+		await vi.advanceTimersByTimeAsync(150);
+		await expect(termination).resolves.toBe(false);
 	});
 });
 
