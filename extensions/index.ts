@@ -987,25 +987,36 @@ export function terminalFailureReason(
 	};
 }
 
-/** Schedule SIGKILL, but cancel escalation as soon as the tracked child exits. */
+/** Schedule SIGKILL until a process-group probe confirms that the group is gone. */
 export function scheduleProcessGroupKillEscalation(
 	proc: { once(event: "close", listener: () => void): unknown },
 	pid: number,
-	killProcessGroup: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+	killProcessGroup: (pid: number, signal: NodeJS.Signals | 0) => unknown = process.kill,
 ): NodeJS.Timeout {
+	const groupIsGone = (): boolean => {
+		try {
+			killProcessGroup(-pid, 0);
+			return false;
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code === "ESRCH";
+		}
+	};
 	const timer = setTimeout(() => {
+		if (groupIsGone()) return;
 		try { killProcessGroup(-pid, "SIGKILL"); } catch { /* already exited */ }
 	}, 5000);
 	timer.unref?.();
-	proc.once("close", () => clearTimeout(timer));
+	proc.once("close", () => {
+		if (groupIsGone()) clearTimeout(timer);
+	});
 	return timer;
 }
 
-/** Terminate a tracked process group and wait for close before forgetting it. */
+/** Terminate a tracked process group and verify its absence before forgetting it. */
 export async function terminateProcessGroup(
 	proc: { once(event: "close", listener: () => void): unknown },
 	pid: number,
-	killProcessGroup: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+	killProcessGroup: (pid: number, signal: NodeJS.Signals | 0) => unknown = process.kill,
 	graceMs = 5000,
 	settleMs = 1000,
 ): Promise<boolean> {
@@ -1020,6 +1031,14 @@ export async function terminateProcessGroup(
 			if (settleTimer) clearTimeout(settleTimer);
 			resolve(verified);
 		};
+		const groupIsGone = (): boolean => {
+			try {
+				killProcessGroup(-pid, 0);
+				return false;
+			} catch (err) {
+				return (err as NodeJS.ErrnoException).code === "ESRCH";
+			}
+		};
 		const signal = (name: NodeJS.Signals): boolean => {
 			try {
 				killProcessGroup(-pid, name);
@@ -1029,10 +1048,17 @@ export async function terminateProcessGroup(
 				return false;
 			}
 		};
-		proc.once("close", () => finish(true));
+		proc.once("close", () => {
+			if (groupIsGone()) finish(true);
+		});
 		killTimer = setTimeout(() => {
-			settleTimer = setTimeout(() => finish(false), settleMs);
-			signal("SIGKILL");
+			if (groupIsGone()) {
+				finish(true);
+				return;
+			}
+			if (signal("SIGKILL") && !finished) {
+				settleTimer = setTimeout(() => finish(groupIsGone()), settleMs);
+			}
 		}, graceMs);
 		signal("SIGTERM");
 	});
