@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -241,6 +241,48 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("--sanitize-thinking");
 	});
 
+	it("derives AgentFS intent from sandbox flags supplied through extraArgs", () => {
+		const splitArgs = buildSwivalArgs(
+			makeAgent({ extraArgs: ["--sandbox", "agentfs"] }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		const equalsArgs = buildSwivalArgs(
+			makeAgent({ yolo: true, extraArgs: ["--sandbox=agentfs"] }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(isAgentFsRequested(splitArgs)).toBe(true);
+		expect(isAgentFsRequested(equalsArgs)).toBe(true);
+	});
+
+	it("uses the final sandbox option and ignores values after the option terminator", () => {
+		expect(isAgentFsRequested(["--sandbox", "agentfs", "--sandbox=builtin"])).toBe(false);
+		expect(isAgentFsRequested(["--sandbox", "builtin", "--sandbox=agentfs"])).toBe(true);
+		expect(isAgentFsRequested(["--", "--sandbox", "agentfs"])).toBe(false);
+	});
+
+	it("rejects an option terminator in extraArgs", () => {
+		expect(() => buildSwivalArgs(
+			makeAgent({ extraArgs: ["--"] }),
+			"/tmp/private-report.json",
+			"/cwd",
+		)).toThrow(/option terminator/i);
+	});
+
+	it("keeps the extension-owned report path effective after extraArgs", () => {
+		for (const extraArgs of [
+			["--report", "/tmp/diverted.json"],
+			["--report=/tmp/diverted.json"],
+		]) {
+			const args = buildSwivalArgs(makeAgent({ extraArgs }), "/tmp/private-report.json", "/cwd");
+			const reportIndex = args.lastIndexOf("--report");
+			expect(reportIndex).toBeGreaterThan(-1);
+			expect(args[reportIndex + 1]).toBe("/tmp/private-report.json");
+			expect(args.slice(reportIndex + 2)).not.toContain("--report=/tmp/diverted.json");
+		}
+	});
+
 	it("passes --proactive-summaries when set", () => {
 		const args = buildSwivalArgs(
 			makeAgent({ proactiveSummaries: true }),
@@ -280,25 +322,23 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("--self-review");
 	});
 
-	it("selfReview override suppresses --reviewer when both would conflict", () => {
-		const args = buildSwivalArgs(
+	it("rejects conflicting reviewer and self-review configuration", () => {
+		expect(() => buildSwivalArgs(
 			makeAgent({ reviewer: "/bin/true" }),
 			"/tmp/r.json",
 			"/cwd",
 			{ selfReview: true },
-		);
-		expect(args).toContain("--self-review");
-		expect(args).not.toContain("--reviewer");
-	});
-
-	it("frontmatter selfReview=true suppresses --reviewer even when reviewer is set", () => {
-		const args = buildSwivalArgs(
+		)).toThrow(/mutually exclusive/);
+		expect(() => buildSwivalArgs(
 			makeAgent({ selfReview: true, reviewer: "/bin/true" }),
 			"/tmp/r.json",
 			"/cwd",
-		);
-		expect(args).toContain("--self-review");
-		expect(args).not.toContain("--reviewer");
+		)).toThrow(/mutually exclusive/);
+		expect(() => buildSwivalArgs(
+			makeAgent({ selfReview: true, extraArgs: ["--reviewer=/bin/true"] }),
+			"/tmp/r.json",
+			"/cwd",
+		)).toThrow(/mutually exclusive/);
 	});
 
 	it("emits --reviewer when only reviewer is set (no selfReview)", () => {

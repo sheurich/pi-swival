@@ -30,6 +30,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -55,6 +56,10 @@ const STDOUT_RING_CHARS = 256 * 1024;
 // Artifacts are copied here before the per-run temp dir is deleted. Caller
 // sees report.json + trace JSONL under a timestamped subdir keyed by agent.
 const ARTIFACT_ROOT = path.join(os.homedir(), ".pi", "agent", "swival-artifacts");
+const ASYNC_RUNNER_PATH = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../scripts/async-runner.cjs",
+);
 
 // ------------------------------------------------- async run tracking --
 
@@ -67,12 +72,15 @@ export interface RunMeta {
 	agent: string;
 	task: string;
 	startedAt: number;
-	/** PID of the spawned swival process. Stored so we can probe it with
-	 *  `process.kill(pid, 0)` after the in-memory entry is gone. */
+	/** PID of the durable async wrapper and its process group. Interrupt uses it
+	 *  only while the same Pi process still holds the matching ChildProcess. */
 	pid: number | undefined;
 	artifactDir: string;
 	stdoutFile: string;
 	stderrFile: string;
+	/** Whether this run effectively requested AgentFS. Optional for artifacts
+	 *  written before AgentFS intent was persisted. */
+	agentFsRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -170,47 +178,181 @@ async function writeRunOutput(
 }
 
 /**
- * A run is considered a failure if swival exited non-zero OR the report
- * recorded a non-success outcome. Reviewer rejection and AgentError
- * subclasses can produce `outcome: "failed" | "error"` with exit 0
- * (e.g. review budget exhausted but the CLI itself completed fine).
- * `outcome: "unknown"` — from a missing or malformed report — is NOT
- * treated as failure so a misconfigured report flag doesn't mask a
- * successful run.
+ * A run succeeds only when Swival exits zero and its required report records
+ * outcome=success. Reviewer rejection and AgentError subclasses can exit zero,
+ * so missing, malformed, or unknown reports must fail closed.
  */
 export function isRunFailure(r: { exitCode: number; report?: { outcome?: string } }): boolean {
-	if (r.exitCode !== 0) return true;
-	const o = r.report?.outcome;
-	return o === "failed" || o === "error";
+	return r.exitCode !== 0 || r.report?.outcome !== "success";
 }
 
 /**
- * The exact `commands` allowlist that marks an agent as read-only at the
- * shell-allowlist level. Used by `isMutatingCwdAgent` to identify audit-style
- * agents whose only commands are read-only inspection. Drift-sensitive: if
- * the bundled audit-worker's allowlist changes, update this constant in
- * lockstep so the parallel-cwd guard keeps recognising it as read-only.
+ * Detect an AgentFS sandbox that was requested but never proven to have
+ * actually re-exec'd. `sandbox.mode` in the report is written straight from
+ * argv (`report.py:349`), so it reads "agentfs" whether or not the re-exec
+ * happened — it is not evidence. `sandbox.agentfs_version` is set only by
+ * the code path inside `maybe_reexec()` that runs *after* the re-exec into
+ * the overlay, so its presence is the fact that can't be faked from argv.
+ * `diff_hint` is the same kind of re-exec-only evidence, but is only
+ * populated when the overlay actually captured a change, so it is not
+ * required on a no-op run.
+ *
+ * A run that requested "agentfs" and can't show this evidence is a
+ * bootstrap failure: the caller believed writes were isolated when they may
+ * not have been. Returns undefined when no sandbox was requested (nothing
+ * to check) or when the evidence is present.
+ */
+export function agentFsBootstrapFailure(
+	sandboxRequested: boolean,
+	report: ReportSummary | undefined,
+): FailureReason | undefined {
+	if (!sandboxRequested) return undefined;
+	if (!report) {
+		return {
+			code: "config_error",
+			text: "AgentFS sandbox was requested but no report was produced, so the re-exec into the overlay cannot be confirmed.",
+		};
+	}
+	if (report.sandbox?.mode !== "agentfs") {
+		return {
+			code: "config_error",
+			text: `AgentFS sandbox was requested but report.sandbox.mode is "${report.sandbox?.mode ?? "missing"}", not "agentfs".`,
+		};
+	}
+	if (typeof report.sandbox.agentfsVersion !== "string" || report.sandbox.agentfsVersion === "") {
+		return {
+			code: "config_error",
+			text: "AgentFS sandbox was requested and report.sandbox.mode says \"agentfs\", but sandbox.agentfs_version (re-exec-only evidence) is absent, so the overlay re-exec cannot be confirmed.",
+		};
+	}
+	return undefined;
+}
+
+/**
+ * Apply agentFsBootstrapFailure to a just-read report, folding any failure
+ * into the report shape isRunFailure already understands (outcome: "error")
+ * so a faked-looking "agentfs" run fails closed instead of reporting success.
+ * Extracted from runSingleSwival so the fail-closed behaviour is unit-testable
+ * without spawning a real (or fake) swival process.
+ */
+export function enforceAgentFsBootstrap(
+	sandboxRequested: boolean,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const failure = agentFsBootstrapFailure(sandboxRequested, report);
+	if (!failure) return { report };
+	return {
+		report: {
+			...(report ?? {}),
+			outcome: "error",
+			accepted: false,
+			errorMessage: failure.text,
+		},
+		reason: failure,
+	};
+}
+
+function lastCliOptionValue(args: readonly string[], option: string): string | undefined {
+	let value: string | undefined;
+	const equalsPrefix = `${option}=`;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") break;
+		if (arg.startsWith(equalsPrefix)) {
+			value = arg.slice(equalsPrefix.length);
+			continue;
+		}
+		if (arg !== option) continue;
+		const next = args[i + 1];
+		if (next === undefined || next === "--" || next.startsWith("-")) {
+			value = undefined;
+			continue;
+		}
+		value = next;
+		i++;
+	}
+	return value;
+}
+
+function hasCliFlag(args: readonly string[], flag: string): boolean {
+	for (const arg of args) {
+		if (arg === "--") return false;
+		if (arg === flag) return true;
+	}
+	return false;
+}
+
+/** Derive effective AgentFS intent from the arguments emitted to Swival. */
+export function isAgentFsRequested(args: readonly string[]): boolean {
+	return lastCliOptionValue(args, "--sandbox") === "agentfs";
+}
+
+/**
+ * Enforce bootstrap evidence when consuming a completed async report. The
+ * persisted value covers CLI intent; report.sandbox.mode also covers AgentFS
+ * selected by Swival configuration and legacy metadata.
+ */
+export function enforceCompletedAsyncAgentFs(
+	meta: Pick<RunMeta, "agentFsRequested">,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const requested = meta.agentFsRequested === true || report?.sandbox?.mode === "agentfs";
+	return enforceAgentFsBootstrap(requested, report);
+}
+
+/**
+ * The exact `commands` allowlist that marks shell execution as read-only.
+ * Drift-sensitive: if the bundled audit-worker's allowlist changes, update
+ * this constant in lockstep.
  */
 export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
 
 /**
- * True when an agent could plausibly mutate its cwd — the inverse of the
- * conditions that make parallel dispatch on a shared cwd safe.
+ * True when an agent could plausibly mutate its cwd. Safety classification is
+ * based on the final emitted arguments because extraArgs can override typed
+ * frontmatter fields.
  *
- * Safe (i.e. NOT mutating-cwd):
- *   1. files: "none" — no filesystem write surface at all.
- *   2. commands == READ_ONLY_AUDIT_COMMANDS — read-only shell allowlist.
- *   3. sandbox: "agentfs" + noSandboxAutoSession — each invocation gets its
- *      own AgentFS overlay session, so writes don't collide on the cwd.
- *
- * Anything else is treated as write-capable for the purposes of the
- * parallel-cwd collision guard.
+ * A shared cwd is safe only when each run has a separate AgentFS overlay, or
+ * when both file writes and mutating shell commands are disabled. Anything
+ * else is treated as write-capable.
  */
-export function isMutatingCwdAgent(agent: SwivalAgentConfig): boolean {
-	if (agent.files === "none") return false;
-	if (agent.commands === READ_ONLY_AUDIT_COMMANDS) return false;
-	if (agent.sandbox === "agentfs" && agent.noSandboxAutoSession) return false;
-	return true;
+export function isMutatingCwdAgent(
+	agent: SwivalAgentConfig,
+	overrides: SwivalOverrides = {},
+): boolean {
+	const args = buildSwivalArgs(agent, "", undefined, overrides);
+	const hasFreshAgentFsOverlay =
+		isAgentFsRequested(args) &&
+		hasCliFlag(args, "--no-sandbox-auto-session") &&
+		lastCliOptionValue(args, "--sandbox-session") === undefined;
+	if (hasFreshAgentFsOverlay) return false;
+
+	const files = lastCliOptionValue(args, "--files");
+	const commands = lastCliOptionValue(args, "--commands");
+	const fileWritesDisabled = files === "none";
+	const mutatingCommandsDisabled = commands === "none" || commands === READ_ONLY_AUDIT_COMMANDS;
+	return !(fileWritesDisabled && mutatingCommandsDisabled);
+}
+
+/** Resolve one process cwd with per-item, top-level, then Pi precedence. */
+export function resolveDispatchCwd(
+	itemCwd: string | undefined,
+	topLevelCwd: string | undefined,
+	piCwd: string,
+): string {
+	const configured = itemCwd ?? topLevelCwd ?? piCwd;
+	return path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(piCwd, configured);
+}
+
+/** Resolve Swival's effective base directory relative to its process cwd. */
+export function resolveAgentBaseDir(
+	agent: SwivalAgentConfig,
+	runCwd: string,
+	overrides: SwivalOverrides = {},
+): string {
+	const args = buildSwivalArgs(agent, "", runCwd, overrides);
+	const configured = lastCliOptionValue(args, "--base-dir") ?? runCwd;
+	return path.resolve(runCwd, configured);
 }
 
 /**
@@ -232,6 +374,13 @@ export function unknownAgentMessage(agentName: string, agents: SwivalAgentConfig
 	return `Unknown swival agent: "${agentName}". Available: ${available}`;
 }
 
+class SwivalArgumentError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SwivalArgumentError";
+	}
+}
+
 /**
  * Validate that an agent declaring `requiresReviewer: true` actually has a
  * reviewer attached for this call. Returns an error string when the gate
@@ -247,8 +396,15 @@ export function checkRequiresReviewer(
 	overrides: SwivalOverrides,
 ): string | undefined {
 	if (!agent.requiresReviewer) return undefined;
-	if (overrides.reviewer || agent.reviewer) return undefined;
-	if (overrides.selfReview || agent.selfReview) return undefined;
+	let args: string[];
+	try {
+		args = buildSwivalArgs(agent, "", undefined, overrides);
+	} catch (err) {
+		if (err instanceof SwivalArgumentError) return err.message;
+		throw err;
+	}
+	const reviewer = lastCliOptionValue(args, "--reviewer");
+	if (hasCliFlag(args, "--self-review") || reviewer?.trim()) return undefined;
 	return (
 		`Agent "${agent.name}" requires a reviewer (frontmatter sets requiresReviewer: true) ` +
 		`but the call did not supply one. Pass reviewerOverride with a path to a reviewer ` +
@@ -289,6 +445,11 @@ export function buildSwivalArgs(
 	cwd: string | undefined,
 	overrides: SwivalOverrides = {},
 ): string[] {
+	if (agent.extraArgs?.includes("--")) {
+		throw new SwivalArgumentError(
+			`Agent "${agent.name}" extraArgs must not include the option terminator "--".`,
+		);
+	}
 	const args: string[] = [];
 
 	// Nested-invocation hygiene: default to disabling lifecycle / MCP / A2A /
@@ -337,16 +498,12 @@ export function buildSwivalArgs(
 	if (agent.proactiveSummaries) args.push("--proactive-summaries");
 	if (agent.retries !== undefined) args.push("--retries", String(agent.retries));
 
-	// Reviewer loop — --self-review and --reviewer are mutually exclusive in
-	// swival's argparse (hard crash: "cannot be used together"). When
-	// selfReview is truthy, skip --reviewer even if the agent sets one.
+	// Reviewer loop. Emit both effective settings, then reject conflicts after
+	// extraArgs so an external acceptance gate is never silently discarded.
 	const selfReview = overrides.selfReview ?? agent.selfReview;
 	const reviewer = overrides.reviewer ?? agent.reviewer;
-	if (selfReview) {
-		args.push("--self-review");
-	} else if (reviewer) {
-		args.push("--reviewer", reviewer);
-	}
+	if (selfReview) args.push("--self-review");
+	if (reviewer) args.push("--reviewer", reviewer);
 	const reviewPrompt = overrides.reviewPrompt ?? agent.reviewPrompt;
 	if (reviewPrompt) args.push("--review-prompt", reviewPrompt);
 	const verify = overrides.verify ?? agent.verify;
@@ -379,6 +536,10 @@ export function buildSwivalArgs(
 	if (agent.noInstructions) args.push("--no-instructions");
 	if (agent.noSkills) args.push("--no-skills");
 
+	// Escape hatch. Extension-owned protocol options follow this block so
+	// extraArgs cannot redirect reports or traces away from the paths we read.
+	for (const a of agent.extraArgs ?? []) args.push(a);
+
 	// Output shape: we want stdout to carry the final answer.
 	// --no-color keeps stderr clean for forwarding to Pi's UI.
 	args.push("--no-color");
@@ -393,10 +554,24 @@ export function buildSwivalArgs(
 		args.push("--system-prompt", agent.systemPrompt);
 	}
 
-	// Escape hatch
-	for (const a of agent.extraArgs ?? []) args.push(a);
-
+	if (hasCliFlag(args, "--self-review") && lastCliOptionValue(args, "--reviewer")?.trim()) {
+		throw new SwivalArgumentError("--self-review and --reviewer are mutually exclusive.");
+	}
 	return args;
+}
+
+function getSwivalArgumentError(
+	agent: SwivalAgentConfig,
+	cwd: string | undefined,
+	overrides: SwivalOverrides,
+): string | undefined {
+	try {
+		buildSwivalArgs(agent, "", cwd, overrides);
+		return undefined;
+	} catch (err) {
+		if (err instanceof SwivalArgumentError) return err.message;
+		throw err;
+	}
 }
 
 // --------------------------------------------------------------- types --
@@ -458,6 +633,19 @@ interface ReportSummary {
 	// Model / provider recorded by swival.
 	model?: string;
 	provider?: string;
+	// From result.sandbox (report.py:349). `mode` is written straight from
+	// argv (--sandbox), so it is present whether or not AgentFS actually
+	// re-exec'd — it cannot prove isolation by itself. `agentfsVersion` and
+	// `diffHint` are set only by the re-exec'd process inside the overlay
+	// (swival/sandbox_agentfs.py maybe_reexec()), so their presence is the
+	// only evidence that the sandbox actually took effect. See
+	// agentFsBootstrapFailure, which fails the run closed when `mode` says
+	// "agentfs" but the re-exec-only fields are absent.
+	sandbox?: {
+		mode?: string;
+		agentfsVersion?: string;
+		diffHint?: string;
+	};
 	raw?: Record<string, unknown>;
 }
 
@@ -608,8 +796,19 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		answer: toStr(result.answer),
 		model: toStr(raw.model),
 		provider: toStr(raw.provider),
+		sandbox: summarizeSandbox(raw.sandbox),
 		raw,
 	};
+}
+
+function summarizeSandbox(raw: unknown): ReportSummary["sandbox"] {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const s = raw as Record<string, unknown>;
+	const mode = toStr(s.mode);
+	const agentfsVersion = toStr(s.agentfs_version);
+	const diffHint = toStr(s.diff_hint);
+	if (mode === undefined && agentfsVersion === undefined && diffHint === undefined) return undefined;
+	return { mode, agentfsVersion, diffHint };
 }
 
 function validateToolCallsByName(
@@ -699,7 +898,7 @@ export function classifyFailure(
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
 			return { code: "config_error", text: `Lifecycle hook failed — ${reportMsg}` };
-		if (/configerror|unknown provider|invalid provider|agentfs binary not found/i.test(reportMsg))
+		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested/i.test(reportMsg))
 			return { code: "config_error", text: reportMsg };
 		return { code: "unknown", text: reportMsg };
 	}
@@ -765,6 +964,113 @@ export function computeErrorMessage(args: {
 			? `swival exited ${exitCode}`
 			: `swival reported outcome=${outcome ?? "unknown"}`;
 	return (classifiedText || "").trim() || stderrTail.trim() || fallback;
+}
+
+/** Apply one failure policy to synchronous and completed asynchronous runs. */
+export function terminalFailureReason(
+	exitCode: number,
+	report: ReportSummary | undefined,
+	stderrLines: readonly string[],
+	existingReason?: FailureReason,
+): FailureReason | undefined {
+	if (!isRunFailure({ exitCode, report })) return undefined;
+	if (existingReason) return existingReason;
+	const classified = classifyFailure(stderrLines, report);
+	if (classified) return classified;
+	if (!report || report.outcome === "unknown") {
+		return {
+			code: "config_error",
+			text: "Swival did not produce a valid terminal report.",
+		};
+	}
+	const stderrTail = stderrLines.filter(Boolean).slice(-5).join("\n");
+	const text = computeErrorMessage({
+		classifiedText: undefined,
+		stderrTail,
+		exitCode,
+		outcome: report.outcome,
+	}) ?? "Swival run failed.";
+	return {
+		code: exitCode !== 0 ? "non_zero_exit" : "unknown",
+		text,
+	};
+}
+
+/** Schedule SIGKILL until a process-group probe confirms that the group is gone. */
+export function scheduleProcessGroupKillEscalation(
+	proc: { once(event: "close", listener: () => void): unknown },
+	pid: number,
+	killProcessGroup: (pid: number, signal: NodeJS.Signals | 0) => unknown = process.kill,
+): NodeJS.Timeout {
+	const groupIsGone = (): boolean => {
+		try {
+			killProcessGroup(-pid, 0);
+			return false;
+		} catch (err) {
+			return (err as NodeJS.ErrnoException).code === "ESRCH";
+		}
+	};
+	const timer = setTimeout(() => {
+		if (groupIsGone()) return;
+		try { killProcessGroup(-pid, "SIGKILL"); } catch { /* already exited */ }
+	}, 5000);
+	timer.unref?.();
+	proc.once("close", () => {
+		if (groupIsGone()) clearTimeout(timer);
+	});
+	return timer;
+}
+
+/** Terminate a tracked process group and verify its absence before forgetting it. */
+export async function terminateProcessGroup(
+	proc: { once(event: "close", listener: () => void): unknown },
+	pid: number,
+	killProcessGroup: (pid: number, signal: NodeJS.Signals | 0) => unknown = process.kill,
+	graceMs = 5000,
+	settleMs = 1000,
+): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		let finished = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		let settleTimer: NodeJS.Timeout | undefined;
+		const finish = (verified: boolean) => {
+			if (finished) return;
+			finished = true;
+			if (killTimer) clearTimeout(killTimer);
+			if (settleTimer) clearTimeout(settleTimer);
+			resolve(verified);
+		};
+		const groupIsGone = (): boolean => {
+			try {
+				killProcessGroup(-pid, 0);
+				return false;
+			} catch (err) {
+				return (err as NodeJS.ErrnoException).code === "ESRCH";
+			}
+		};
+		const signal = (name: NodeJS.Signals): boolean => {
+			try {
+				killProcessGroup(-pid, name);
+				return true;
+			} catch (err) {
+				finish((err as NodeJS.ErrnoException).code === "ESRCH");
+				return false;
+			}
+		};
+		proc.once("close", () => {
+			if (groupIsGone()) finish(true);
+		});
+		killTimer = setTimeout(() => {
+			if (groupIsGone()) {
+				finish(true);
+				return;
+			}
+			if (signal("SIGKILL") && !finished) {
+				settleTimer = setTimeout(() => finish(groupIsGone()), settleMs);
+			}
+		}, graceMs);
+		signal("SIGTERM");
+	});
 }
 
 // ---------------------------------------------------- trace tailing --
@@ -1100,7 +1406,8 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 			if (
 				typeof parsed.runId !== "string" ||
 				typeof parsed.artifactDir !== "string" ||
-				!(parsed.pid == null || typeof parsed.pid === "number")
+				!(parsed.pid == null || typeof parsed.pid === "number") ||
+				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -1141,7 +1448,10 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
  *
  * Returns `undefined` when the run cannot be found at all.
  */
-async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
+async function loadRunState(
+	runId: string,
+	artifactRoot: string = ARTIFACT_ROOT,
+): Promise<RunStateInfo | undefined> {
 	// In-memory fast path.
 	const entry = asyncRuns.get(runId);
 	if (entry) {
@@ -1166,7 +1476,7 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 	}
 
 	// Disk fallback: find run-meta.json, then read completed.json + spawn-error.txt.
-	const meta = await findRunMeta(runId, ARTIFACT_ROOT);
+	const meta = await findRunMeta(runId, artifactRoot);
 	if (!meta) return undefined;
 
 	let completed: CompletedMarker | undefined;
@@ -1185,13 +1495,42 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
 	return { meta, exited, exitCode, completed, spawnError };
 }
 
+interface CompletedAsyncInspection {
+	report: ReportSummary | undefined;
+	reason?: FailureReason;
+}
+
+async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
+	const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
+	const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
+	const stderr = await fs.promises.readFile(state.meta.stderrFile, "utf-8").catch(() => "");
+	const stderrLines = stderr.split("\n").filter(Boolean);
+	const reason = terminalFailureReason(
+		state.exitCode ?? 1,
+		bootstrapCheck.report,
+		stderrLines,
+		bootstrapCheck.reason,
+	);
+	return { report: bootstrapCheck.report, reason };
+}
+
+function formatCompletedAsyncFailure(
+	runId: string,
+	state: RunStateInfo,
+	reason: FailureReason,
+): string {
+	const label = reason.text.startsWith("AgentFS sandbox was requested")
+		? "failed AgentFS bootstrap validation"
+		: `failed (${reason.code})`;
+	return `Run ${runId} ${label}: ${reason.text}\nArtifact dir: ${state.meta.artifactDir}`;
+}
+
 // ------------------------------------------------ async (background) --
 
 /**
- * Spawn a swival run in the background (detached process). Returns immediately
- * with a `runId` and the pre-created `artifactDir`. Stdout and stderr are
- * redirected to files in the artifact dir via inherited file descriptors so
- * output is preserved without holding a pipe reference.
+ * Spawn Swival through a detached durable wrapper. The wrapper writes the
+ * completion marker itself, so status survives a Pi restart. Stdout and stderr
+ * use inherited file descriptors in the artifact directory.
  *
  * Only supported in single-agent mode. chain and parallel always run
  * synchronously.
@@ -1199,13 +1538,14 @@ async function loadRunState(runId: string): Promise<RunStateInfo | undefined> {
  * NOTE: `--goal` (swival REPL goal mode) is an interactive/REPL-only feature
  * and is NOT available via the CLI invocation used here. See README.
  */
-async function runSingleSwivalAsync(
+export async function runSingleSwivalAsync(
 	defaultCwd: string,
 	agents: SwivalAgentConfig[],
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
 	overrides: SwivalOverrides,
+	artifactRoot: string = ARTIFACT_ROOT,
 ): Promise<{ runId: string; artifactDir: string }> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
@@ -1215,20 +1555,23 @@ async function runSingleSwivalAsync(
 	if (reviewerError) {
 		throw new Error(reviewerError);
 	}
+	const runCwd = cwd ?? defaultCwd;
+	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
+	if (argumentError) throw new SwivalArgumentError(argumentError);
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
-	const { artifactDir, ts, runId } = mintArtifactDir(agentName, ARTIFACT_ROOT);
+	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
 	const traceDir = path.join(artifactDir, "trace");
 	await fs.promises.mkdir(traceDir, { recursive: true });
 
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
-	const runCwd = cwd ?? defaultCwd;
 
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
+	const agentFsRequested = isAgentFsRequested(args);
 	args.push("--", task);
 
 	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
@@ -1245,7 +1588,7 @@ async function runSingleSwivalAsync(
 	}
 	let proc: ChildProcess;
 	try {
-		proc = spawn("swival", args, {
+		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
 			cwd: runCwd,
 			shell: false,
 			stdio: ["ignore", stdoutFd, stderrFd],
@@ -1255,7 +1598,6 @@ async function runSingleSwivalAsync(
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		try { fs.closeSync(stderrFd!); } catch { /* ignore */ }
 	}
-	proc.unref();
 
 	const meta: RunMeta = {
 		runId,
@@ -1266,49 +1608,65 @@ async function runSingleSwivalAsync(
 		artifactDir,
 		stdoutFile,
 		stderrFile,
+		agentFsRequested,
 	};
-	await fs.promises.writeFile(
-		path.join(artifactDir, "run-meta.json"),
-		JSON.stringify(meta, null, 2),
-		"utf-8",
-	);
-
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
 
-	// TTL after which we remove a completed run from the in-memory map;
-	// long enough that same-session status/resume queries still work.
-	const ASYNC_RUN_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-	// Fix 6: write completed.json on close so cross-session fallback can
-	// determine whether the run finished without relying on process.kill probes.
-	// Fix 3: schedule asyncRuns.delete after 1 h (TTL).
-	proc.on("close", (code) => {
-		const e = asyncRuns.get(runId);
-		if (e) { e.exited = true; e.exitCode = code; }
-		const marker: CompletedMarker = { exitCode: code, exitedAt: new Date().toISOString() };
-		fs.promises
-			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.catch(() => { /* best-effort */ });
+	// Attach lifecycle handlers before any await. ChildProcess does not replay
+	// early close/error events, and an unhandled spawn error can terminate Pi.
+	const ASYNC_RUN_TTL_MS = 60 * 60 * 1000;
+	let ttlScheduled = false;
+	const scheduleExpiry = () => {
+		if (ttlScheduled) return;
+		ttlScheduled = true;
 		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
+	};
+	proc.once("close", (code) => {
+		const current = asyncRuns.get(runId);
+		if (current) {
+			current.exited = true;
+			current.exitCode = code;
+		}
+		scheduleExpiry();
 	});
+	proc.once("error", (err) => {
+		const current = asyncRuns.get(runId);
+		if (current) current.exited = true;
+		void fs.promises.writeFile(
+			path.join(artifactDir, "spawn-error.txt"),
+			`async runner failed to start: ${err.message}`,
+			"utf-8",
+		).catch(() => undefined);
+		void fs.promises.writeFile(
+			path.join(artifactDir, "completed.json"),
+			JSON.stringify({ exitCode: null, exitedAt: new Date().toISOString() }, null, 2),
+			"utf-8",
+		).catch(() => undefined);
+		scheduleExpiry();
+	});
+	proc.unref();
 
-	// Fix 5: capture spawn errors (e.g. ENOENT when swival is not on PATH)
-	// and persist them so status/resume can report the failure clearly.
-	// Fix 6: also write completed.json so cross-session tools see it as done.
-	// Fix 3: schedule asyncRuns.delete after TTL.
-	proc.on("error", (err) => {
-		const e = asyncRuns.get(runId);
-		if (e) { e.exited = true; }
-		fs.promises
-			.writeFile(path.join(artifactDir, "spawn-error.txt"), `swival failed to start: ${err.message}`, "utf-8")
-			.catch(() => { /* best-effort */ });
-		const marker: CompletedMarker = { exitCode: null, exitedAt: new Date().toISOString() };
-		fs.promises
-			.writeFile(path.join(artifactDir, "completed.json"), JSON.stringify(marker, null, 2), "utf-8")
-			.catch(() => { /* best-effort */ });
-		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
-	});
+	try {
+		await fs.promises.writeFile(
+			path.join(artifactDir, "run-meta.json"),
+			JSON.stringify(meta, null, 2),
+			"utf-8",
+		);
+	} catch (err) {
+		const terminated = proc.pid && proc.pid > 1
+			? await terminateProcessGroup(proc, proc.pid)
+			: false;
+		if (terminated) {
+			asyncRuns.delete(runId);
+			await fs.promises.rm(artifactDir, { recursive: true, force: true }).catch(() => undefined);
+			throw err;
+		}
+		const message = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`${message}. Async run ${runId} may still be active; tracking and artifacts were retained at ${artifactDir}.`,
+		);
+	}
 
 	return { runId, artifactDir };
 }
@@ -1325,6 +1683,7 @@ async function runSingleSwival(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SwivalResult[]) => SwivalDetails,
+	artifactRoot: string = ARTIFACT_ROOT,
 ): Promise<SwivalResult> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
@@ -1357,12 +1716,26 @@ async function runSingleSwival(
 			reason: { code: "config_error", text: reviewerError },
 		};
 	}
+	const runCwd = cwd ?? defaultCwd;
+	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
+	if (argumentError) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [argumentError],
+			durationMs: 0,
+			errorMessage: argumentError,
+			reason: { code: "config_error", text: argumentError },
+		};
+	}
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
 	const traceDir = path.join(tmpDir, "trace");
 	await fs.promises.mkdir(traceDir, { recursive: true });
-	const runCwd = cwd ?? defaultCwd;
 
 	const current: SwivalResult = {
 		agent: agent.name,
@@ -1431,6 +1804,7 @@ async function runSingleSwival(
 	// requested one (overrides.traceDir outranks us; mostly useful for tests).
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir: overrides.traceDir ?? traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
+	const agentFsRequested = isAgentFsRequested(args);
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
 	// flag (argv injection). We always emit the separator; swival tolerates
@@ -1544,6 +1918,13 @@ async function runSingleSwival(
 		current.durationMs = Date.now() - started;
 		current.report = await readReport(reportPath);
 
+		// Fail closed when emitted arguments or Swival configuration requested
+		// AgentFS but the report cannot prove the overlay re-exec happened.
+		const sandboxRequested = agentFsRequested || current.report?.sandbox?.mode === "agentfs";
+		const bootstrapCheck = enforceAgentFsBootstrap(sandboxRequested, current.report);
+		current.report = bootstrapCheck.report;
+		if (bootstrapCheck.reason) current.reason = bootstrapCheck.reason;
+
 		// Prefer result.answer from the report JSON as the authoritative final
 		// output. Swival streams the answer to stdout too, but our 256 KB stdout
 		// ring-buffer (STDOUT_RING_CHARS) silently truncates long answers.
@@ -1559,7 +1940,7 @@ async function runSingleSwival(
 		// expect report.json and <session>.jsonl to outlive the run so failure
 		// diagnosis has source material to point at.
 		try {
-			current.artifactDir = await persistArtifacts(tmpDir, agent.name);
+			current.artifactDir = await persistArtifacts(tmpDir, agent.name, artifactRoot);
 		} catch {
 			/* best-effort; skip artifact persistence on error */
 		}
@@ -1569,28 +1950,15 @@ async function runSingleSwival(
 		const configuredMaxTurns = overrides.maxTurns ?? agent.maxTurns;
 		if (configuredMaxTurns !== undefined) current.effectiveMaxTurns = configuredMaxTurns;
 
-		if (isRunFailure(current)) {
-			const classified = classifyFailure(stderrLines, current.report);
-			// `filter(Boolean)` here is defensive — upstream split already drops
-			// whitespace-only lines before they enter stderrLines, so this can't
-			// collapse multi-line errors that contain intentional blanks.
-			const stderrTail = stderrLines.filter(Boolean).slice(-5).join("\n");
-			if (!current.errorMessage) {
-				current.errorMessage = computeErrorMessage({
-					classifiedText: classified?.text,
-					stderrTail,
-					exitCode: current.exitCode,
-					outcome: current.report?.outcome,
-				});
-			}
-			if (classified) {
-				current.reason = classified;
-			} else {
-				current.reason = {
-					code: current.exitCode !== 0 ? "non_zero_exit" : "unknown",
-					text: current.errorMessage ?? "",
-				};
-			}
+		const terminalReason = terminalFailureReason(
+			current.exitCode,
+			current.report,
+			stderrLines,
+			current.reason,
+		);
+		if (terminalReason) {
+			current.reason = terminalReason;
+			if (!current.errorMessage) current.errorMessage = terminalReason.text;
 		}
 		// Success states (accepted / completed) leave `reason` undefined on
 		// purpose — status + reason are orthogonal, and the failure-only shape
@@ -1701,7 +2069,7 @@ const SwivalParams = Type.Object({
 		}),
 	),
 	profileOverride: Type.Optional(
-		Type.String({ description: "Override the agent's named Swival profile for this call, such as fast or heavy." }),
+		Type.String({ description: "Override the agent's named Swival profile for this call, such as budget or frontier." }),
 	),
 	providerOverride: Type.Optional(Type.String({ description: "Override the agent's provider for this call." })),
 	baseUrlOverride: Type.Optional(
@@ -1842,9 +2210,9 @@ export function renderStatus(r: SwivalResult): RunStatus {
 		const rounds = r.report.reviewRounds ?? 0;
 		return rounds > 0 ? "accepted" : "completed";
 	}
-	// exit=0 with no or unknown report: the run didn't fail, but we can't
-	// confirm a reviewer approved it. Treat as "completed" (ran to end).
-	return "completed";
+	// Exit zero with a missing or unknown report fails closed because no
+	// valid terminal outcome proves that the run completed successfully.
+	return "error";
 }
 
 /**
@@ -1974,7 +2342,12 @@ export function buildParallelSummary(
 	return [header, "", ...blocks].join("\n");
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SwivalExtensionOptions {
+	artifactRoot?: string;
+}
+
+export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
+	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
 	pi.registerTool({
 		name: "swival-subagent",
 		label: "Swival subagent",
@@ -1998,7 +2371,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
-			void pruneOldArtifacts(ARTIFACT_ROOT);
+			void pruneOldArtifacts(artifactRoot);
 
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			// Project-agent discovery must walk up from the effective working
@@ -2007,7 +2380,7 @@ export default function (pi: ExtensionAPI) {
 			// individual steps may override per-task, but we still anchor the
 			// initial discovery to the top-level params.cwd so e.g. dispatching
 			// from a repo root finds agents in .pi/swival-agents/.
-			const discoveryCwd = params.cwd ?? ctx.cwd;
+			const discoveryCwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
@@ -2059,7 +2432,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.action === "status") {
-					const state = await loadRunState(runId);
+					const state = await loadRunState(runId, artifactRoot);
 					if (!state) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} not found. It may have been pruned or was never started.` }],
@@ -2080,8 +2453,15 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
-					const outcome = report?.outcome ?? "unknown";
+					const inspection = await inspectCompletedAsyncRun(state);
+					if (inspection.reason) {
+						return {
+							content: [{ type: "text", text: formatCompletedAsyncFailure(runId, state, inspection.reason) }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					const outcome = inspection.report?.outcome ?? "unknown";
 					const exitedAt = state.completed?.exitedAt ?? "unknown";
 					return {
 						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}` }],
@@ -2090,10 +2470,17 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.action === "interrupt") {
-					const state = await loadRunState(runId);
+					const state = await loadRunState(runId, artifactRoot);
 					if (!state || state.exited) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is not running (already completed or not found) — nothing to interrupt.` }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					if (!state.entry) {
+						return {
+							content: [{ type: "text", text: `Run ${runId} was recovered from disk. Its process identity cannot be verified, so it cannot safely interrupt the recorded PID.` }],
 							details: makeDetails("single")([]),
 							isError: true,
 						};
@@ -2125,10 +2512,7 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const killTimer = setTimeout(() => {
-						try { process.kill(-pid, "SIGKILL"); } catch { /* already gone */ }
-					}, 5000);
-					killTimer.unref?.();
+					scheduleProcessGroupKillEscalation(state.entry.proc, pid);
 					return {
 						content: [{ type: "text", text: `Sent SIGTERM to process group of run ${runId} (pgid: ${pid}). SIGKILL escalation scheduled in 5 s.` }],
 						details: makeDetails("single")([]),
@@ -2136,7 +2520,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.action === "resume") {
-					const state = await loadRunState(runId);
+					const state = await loadRunState(runId, artifactRoot);
 					if (!state) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} not found. It may have been pruned or was never started.` }],
@@ -2158,12 +2542,19 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					// Read final output: prefer report.result.answer, fall back to stdout file.
-					const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
+					const inspection = await inspectCompletedAsyncRun(state);
+					if (inspection.reason) {
+						return {
+							content: [{ type: "text", text: formatCompletedAsyncFailure(runId, state, inspection.reason) }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+					// Read final output only after terminal success is established.
 					const stdoutContent = await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
-					const finalOutput = (report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
-					const feedback = report?.lastReviewFeedback;
-					const outcome = report?.outcome ?? "unknown";
+					const finalOutput = (inspection.report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
+					const feedback = inspection.report?.lastReviewFeedback;
+					const outcome = inspection.report?.outcome ?? "unknown";
 					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
 					if (feedback) text += `\n\n─── reviewer feedback ───\n${feedback}`;
 					return {
@@ -2265,18 +2656,19 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						step.agent,
 						taskWithContext,
-						step.cwd,
+						resolveDispatchCwd(step.cwd, params.cwd, ctx.cwd),
 						perStepOverrides,
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						artifactRoot,
 					);
 				results.push(r);
 
 					if (isRunFailure(r)) {
 					const stepOutput = step.output ?? params.output;
 					if (stepOutput) {
-						const resolveBase = step.cwd ?? params.cwd ?? ctx.cwd;
+						const resolveBase = resolveDispatchCwd(step.cwd, params.cwd, ctx.cwd);
 						await writeRunOutput(r, stepOutput, step.outputMode ?? params.outputMode, resolveBase);
 					}
 					const partial = r.finalOutput?.trim();
@@ -2294,7 +2686,7 @@ export default function (pi: ExtensionAPI) {
 				const stepOutput = step.output ?? (isLastStep ? params.output : undefined);
 				const stepOutputMode = step.outputMode ?? (isLastStep ? params.outputMode : undefined);
 				if (stepOutput) {
-					const resolveBase = step.cwd ?? params.cwd ?? ctx.cwd;
+					const resolveBase = resolveDispatchCwd(step.cwd, params.cwd, ctx.cwd);
 					await writeRunOutput(r, stepOutput, stepOutputMode, resolveBase);
 				}
 				previousOutput = r.finalOutput;
@@ -2329,17 +2721,27 @@ export default function (pi: ExtensionAPI) {
 				// they raced on the same filesystem. Read-only audit-style agents and
 				// AgentFS sessions with their own overlay (noSandboxAutoSession=true)
 				// are exempted by isMutatingCwdAgent.
-				const defaultCwd = params.cwd ?? ctx.cwd;
 				const cwdGroups = new Map<string, number[]>();
 				for (let i = 0; i < params.tasks.length; i++) {
 					const t = params.tasks[i];
 					const agent = agents.find((a) => a.name === t.agent);
 					if (!agent) continue; // unknown-agent diagnostics happen per-task in runSingleSwival
-					if (!isMutatingCwdAgent(agent)) continue;
-					const resolvedCwd = path.resolve(t.cwd ?? defaultCwd);
-					const existing = cwdGroups.get(resolvedCwd) ?? [];
+					const perTaskOverrides: SwivalOverrides =
+						t.seed !== undefined ? { ...overrides, seed: t.seed } : overrides;
+					const runCwd = resolveDispatchCwd(t.cwd, params.cwd, ctx.cwd);
+					const argumentError = getSwivalArgumentError(agent, runCwd, perTaskOverrides);
+					if (argumentError) {
+						return {
+							content: [{ type: "text", text: argumentError }],
+							details: makeDetails("parallel")([]),
+							isError: true,
+						};
+					}
+					if (!isMutatingCwdAgent(agent, perTaskOverrides)) continue;
+					const resolvedBaseDir = resolveAgentBaseDir(agent, runCwd, perTaskOverrides);
+					const existing = cwdGroups.get(resolvedBaseDir) ?? [];
 					existing.push(i);
-					cwdGroups.set(resolvedCwd, existing);
+					cwdGroups.set(resolvedBaseDir, existing);
 				}
 				for (const [resolvedCwd, indices] of cwdGroups) {
 					if (indices.length < 2) continue;
@@ -2402,7 +2804,7 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						t.agent,
 						t.task,
-						t.cwd,
+						resolveDispatchCwd(t.cwd, params.cwd, ctx.cwd),
 						perTaskOverrides,
 						signal,
 						(partial) => {
@@ -2412,12 +2814,13 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+						artifactRoot,
 					);
 				// Persist per-task output to a file when requested. The path
 				// resolves relative to the task's cwd (or the tool cwd) so
 				// caller-supplied relative paths behave like shell redirections.
 				if (t.output) {
-					const resolveBase = t.cwd ?? params.cwd ?? ctx.cwd;
+					const resolveBase = resolveDispatchCwd(t.cwd, params.cwd, ctx.cwd);
 					await writeRunOutput(r, t.output, t.outputMode, resolveBase);
 				}
 					placeholders[idx] = r;
@@ -2451,8 +2854,9 @@ export default function (pi: ExtensionAPI) {
 						agents,
 						agentName,
 						task,
-						params.cwd,
+						discoveryCwd,
 						overrides,
+						artifactRoot,
 					));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
@@ -2486,16 +2890,22 @@ export default function (pi: ExtensionAPI) {
 				agents,
 				params.agent as string,
 				params.task as string,
-				params.cwd,
+				discoveryCwd,
 				overrides,
 				signal,
 				onUpdate,
 				makeDetails("single"),
+				artifactRoot,
 			);
 			const isError = isRunFailure(result);
 			if (isError) {
 				if (params.output) {
-					await writeRunOutput(result, params.output, params.outputMode, params.cwd ?? ctx.cwd);
+					await writeRunOutput(
+						result,
+						params.output,
+						params.outputMode,
+						resolveDispatchCwd(undefined, params.cwd, ctx.cwd),
+					);
 				}
 				return {
 					content: [
@@ -2509,7 +2919,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			if (params.output) {
-				await writeRunOutput(result, params.output, params.outputMode, params.cwd ?? ctx.cwd);
+				await writeRunOutput(
+					result,
+					params.output,
+					params.outputMode,
+					resolveDispatchCwd(undefined, params.cwd, ctx.cwd),
+				);
 			}
 			const fileOnly = result.outputPath && result.outputMode === "file-only";
 			const contentText = fileOnly

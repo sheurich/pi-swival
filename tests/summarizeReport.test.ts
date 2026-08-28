@@ -240,10 +240,9 @@ describe("isRunFailure", () => {
 		expect(isRunFailure({ exitCode: 0, report: { outcome: "success" } })).toBe(false);
 	});
 
-	it("does NOT treat exit=0 + missing report (outcome=unknown) as failure", () => {
-		// A malformed or missing report shouldn't mask a successful run; the
-		// CLI's own exit code stays authoritative in that degenerate case.
-		expect(isRunFailure({ exitCode: 0 })).toBe(false);
-		expect(isRunFailure({ exitCode: 0, report: {} })).toBe(false);
+	it("fails closed for exit=0 with a missing or unknown report", () => {
+		expect(isRunFailure({ exitCode: 0 })).toBe(true);
+		expect(isRunFailure({ exitCode: 0, report: {} })).toBe(true);
+		expect(isRunFailure({ exitCode: 0, report: { outcome: "unknown" } })).toBe(true);
 	});
 });

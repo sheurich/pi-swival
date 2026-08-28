@@ -33,3 +33,32 @@ jobs:
 
       - name: Vitest
         run: npm test
+
+  agentfs:
+    # AgentFS 0.6.4 needs unprivileged mount namespaces, which Ubuntu 24.04
+    # blocks through its default AppArmor policy.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+
+      - name: Install pinned AgentFS
+        env:
+          AGENTFS_VERSION: v0.6.4
+          AGENTFS_TRIPLE: x86_64-unknown-linux-gnu
+        run: |
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cd "$work"
+          base="https://github.com/tursodatabase/agentfs/releases/download/${AGENTFS_VERSION}"
+          archive="agentfs-${AGENTFS_TRIPLE}.tar.xz"
+          curl -fsSLO "${base}/${archive}"
+          curl -fsSLO "${base}/sha256.sum"
+          grep " \*${archive}\$" sha256.sum | sha256sum -c -
+          tar -xJf "$archive"
+          install -D -m 0755 "agentfs-${AGENTFS_TRIPLE}/agentfs" "$HOME/.local/bin/agentfs"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: AgentFS integration canary
+        env:
+          REQUIRE_AGENTFS: "1"
+        run: npm run agentfs-integration

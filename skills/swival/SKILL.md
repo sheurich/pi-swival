@@ -281,7 +281,7 @@ dispatch time with `profileOverride` or `modelOverride`.
 Named profiles:
 
 ```toml
-[profiles.fast]
+[profiles.budget]
 provider = "generic"
 model = "claude-haiku-4-5"
 base_url = "http://127.0.0.1:4000"
@@ -291,7 +291,7 @@ provider = "lmstudio"
 model = "qwen3-30b"
 ```
 
-Switch at dispatch: `profileOverride: "fast"`.
+Switch at dispatch: `profileOverride: "budget"`.
 
 Native providers (no proxy needed): `lmstudio`, `llamacpp`,
 `huggingface`, `openrouter`, `google` (Gemini API), `chatgpt`,
