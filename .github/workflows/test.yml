@@ -51,7 +51,7 @@ jobs:
           archive="agentfs-${AGENTFS_TRIPLE}.tar.xz"
           curl -fsSLO "${base}/${archive}"
           curl -fsSLO "${base}/sha256.sum"
-          grep " ${archive}\$" sha256.sum | sha256sum -c -
+          grep " \*${archive}\$" sha256.sum | sha256sum -c -
           tar -xJf "$archive"
           install -D -m 0755 "agentfs-${AGENTFS_TRIPLE}/agentfs" "$HOME/.local/bin/agentfs"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
