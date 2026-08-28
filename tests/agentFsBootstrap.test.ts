@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	agentFsBootstrapFailure,
+	classifyFailure,
 	enforceAgentFsBootstrap,
 	isRunFailure,
 	summarizeReport,
@@ -69,6 +70,14 @@ describe("enforceAgentFsBootstrap + isRunFailure integration", () => {
 		// The exact failure mode this test guards against: a sandbox bootstrap
 		// failure must never look like a successful result.
 		expect(isRunFailure({ exitCode: 0, report: enforced.report })).toBe(true);
+	});
+
+	it("classifies a bootstrap evidence failure as a config error", () => {
+		const report = summarizeReport(loadFixture("report-agentfs-missing-evidence.json"));
+		const enforced = enforceAgentFsBootstrap(true, report);
+		const classified = classifyFailure([], enforced.report);
+		expect(classified).toEqual(enforced.reason);
+		expect(classified?.code).toBe("config_error");
 	});
 
 	it("leaves a genuine agentfs success alone", () => {

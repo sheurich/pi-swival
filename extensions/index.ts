@@ -806,7 +806,7 @@ export function classifyFailure(
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
 			return { code: "config_error", text: `Lifecycle hook failed — ${reportMsg}` };
-		if (/configerror|unknown provider|invalid provider|agentfs binary not found/i.test(reportMsg))
+		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested/i.test(reportMsg))
 			return { code: "config_error", text: reportMsg };
 		return { code: "unknown", text: reportMsg };
 	}
