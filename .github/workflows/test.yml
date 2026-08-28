@@ -35,7 +35,9 @@ jobs:
         run: npm test
 
   agentfs:
-    runs-on: ubuntu-latest
+    # AgentFS 0.6.4 needs unprivileged mount namespaces, which Ubuntu 24.04
+    # blocks through its default AppArmor policy.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
 
