@@ -311,8 +311,11 @@ export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
  * when both file writes and mutating shell commands are disabled. Anything
  * else is treated as write-capable.
  */
-export function isMutatingCwdAgent(agent: SwivalAgentConfig): boolean {
-	const args = buildSwivalArgs(agent, "", undefined);
+export function isMutatingCwdAgent(
+	agent: SwivalAgentConfig,
+	overrides: SwivalOverrides = {},
+): boolean {
+	const args = buildSwivalArgs(agent, "", undefined, overrides);
 	if (isAgentFsRequested(args) && hasCliFlag(args, "--no-sandbox-auto-session")) return false;
 
 	const files = lastCliOptionValue(args, "--files");
@@ -333,8 +336,12 @@ export function resolveDispatchCwd(
 }
 
 /** Resolve Swival's effective base directory relative to its process cwd. */
-export function resolveAgentBaseDir(agent: SwivalAgentConfig, runCwd: string): string {
-	const args = buildSwivalArgs(agent, "", runCwd);
+export function resolveAgentBaseDir(
+	agent: SwivalAgentConfig,
+	runCwd: string,
+	overrides: SwivalOverrides = {},
+): string {
+	const args = buildSwivalArgs(agent, "", runCwd, overrides);
 	const configured = lastCliOptionValue(args, "--base-dir") ?? runCwd;
 	return path.resolve(runCwd, configured);
 }
@@ -358,6 +365,13 @@ export function unknownAgentMessage(agentName: string, agents: SwivalAgentConfig
 	return `Unknown swival agent: "${agentName}". Available: ${available}`;
 }
 
+class SwivalArgumentError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SwivalArgumentError";
+	}
+}
+
 /**
  * Validate that an agent declaring `requiresReviewer: true` actually has a
  * reviewer attached for this call. Returns an error string when the gate
@@ -377,7 +391,8 @@ export function checkRequiresReviewer(
 	try {
 		args = buildSwivalArgs(agent, "", undefined, overrides);
 	} catch (err) {
-		return err instanceof Error ? err.message : String(err);
+		if (err instanceof SwivalArgumentError) return err.message;
+		throw err;
 	}
 	const reviewer = lastCliOptionValue(args, "--reviewer");
 	if (hasCliFlag(args, "--self-review") || reviewer?.trim()) return undefined;
@@ -422,7 +437,9 @@ export function buildSwivalArgs(
 	overrides: SwivalOverrides = {},
 ): string[] {
 	if (agent.extraArgs?.includes("--")) {
-		throw new Error(`Agent "${agent.name}" extraArgs must not include the option terminator "--".`);
+		throw new SwivalArgumentError(
+			`Agent "${agent.name}" extraArgs must not include the option terminator "--".`,
+		);
 	}
 	const args: string[] = [];
 
@@ -529,9 +546,23 @@ export function buildSwivalArgs(
 	}
 
 	if (hasCliFlag(args, "--self-review") && lastCliOptionValue(args, "--reviewer")?.trim()) {
-		throw new Error("--self-review and --reviewer are mutually exclusive.");
+		throw new SwivalArgumentError("--self-review and --reviewer are mutually exclusive.");
 	}
 	return args;
+}
+
+function getSwivalArgumentError(
+	agent: SwivalAgentConfig,
+	cwd: string | undefined,
+	overrides: SwivalOverrides,
+): string | undefined {
+	try {
+		buildSwivalArgs(agent, "", cwd, overrides);
+		return undefined;
+	} catch (err) {
+		if (err instanceof SwivalArgumentError) return err.message;
+		throw err;
+	}
 }
 
 // --------------------------------------------------------------- types --
@@ -1489,6 +1520,9 @@ export async function runSingleSwivalAsync(
 	if (reviewerError) {
 		throw new Error(reviewerError);
 	}
+	const runCwd = cwd ?? defaultCwd;
+	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
+	if (argumentError) throw new SwivalArgumentError(argumentError);
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
@@ -1499,7 +1533,6 @@ export async function runSingleSwivalAsync(
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
-	const runCwd = cwd ?? defaultCwd;
 
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
@@ -1648,12 +1681,26 @@ async function runSingleSwival(
 			reason: { code: "config_error", text: reviewerError },
 		};
 	}
+	const runCwd = cwd ?? defaultCwd;
+	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
+	if (argumentError) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [argumentError],
+			durationMs: 0,
+			errorMessage: argumentError,
+			reason: { code: "config_error", text: argumentError },
+		};
+	}
 
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
 	const traceDir = path.join(tmpDir, "trace");
 	await fs.promises.mkdir(traceDir, { recursive: true });
-	const runCwd = cwd ?? defaultCwd;
 
 	const current: SwivalResult = {
 		agent: agent.name,
@@ -2644,9 +2691,19 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					const t = params.tasks[i];
 					const agent = agents.find((a) => a.name === t.agent);
 					if (!agent) continue; // unknown-agent diagnostics happen per-task in runSingleSwival
-					if (!isMutatingCwdAgent(agent)) continue;
+					const perTaskOverrides: SwivalOverrides =
+						t.seed !== undefined ? { ...overrides, seed: t.seed } : overrides;
 					const runCwd = resolveDispatchCwd(t.cwd, params.cwd, ctx.cwd);
-					const resolvedBaseDir = resolveAgentBaseDir(agent, runCwd);
+					const argumentError = getSwivalArgumentError(agent, runCwd, perTaskOverrides);
+					if (argumentError) {
+						return {
+							content: [{ type: "text", text: argumentError }],
+							details: makeDetails("parallel")([]),
+							isError: true,
+						};
+					}
+					if (!isMutatingCwdAgent(agent, perTaskOverrides)) continue;
+					const resolvedBaseDir = resolveAgentBaseDir(agent, runCwd, perTaskOverrides);
 					const existing = cwdGroups.get(resolvedBaseDir) ?? [];
 					existing.push(i);
 					cwdGroups.set(resolvedBaseDir, existing);
