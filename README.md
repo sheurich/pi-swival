@@ -7,7 +7,7 @@ A Pi package that integrates [Swival](https://github.com/Swival/swival) — a co
 The package bundles:
 
 - `swival-subagent` extension — dispatches tasks to a swival subprocess with reviewer loops, sandboxes, and structured reporting. Mirrors the shape of pi's example subagent extension but swaps the spawn target to swival.
-- `swival` skill — drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and proxy setup.
+- `swival` skill — drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and native provider setup.
 - `auditing-with-swival` skill — a three-stage recon → per-bucket → consolidate pipeline for security audits over codebases too large for one worker.
 - `swival-audit` prompt template — slash-command-style invocation that walks an interactive operator through the audit pipeline.
 - Seven swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
@@ -43,7 +43,7 @@ uv tool install swival
 # or: pipx install swival
 ```
 
-See `skills/swival/references/setup.md` for the full setup walkthrough including the optional litellm proxy for Vertex AI and Bedrock cross-region inference.
+Swival routes models through `~/.config/swival/config.toml`. Its `bedrock` and `vertexai` providers reach AWS and Google Cloud natively, with no extra process to run. See `skills/swival/references/setup.md` for the full setup walkthrough.
 
 ## What's bundled
 
@@ -104,7 +104,7 @@ pi-swival/
 │   └── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
 ├── agents/                     # seven bundled swival agents (auto-discovered)
 ├── skills/
-│   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md, scripts/swival-proxy
+│   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md
 │   └── auditing-with-swival/   # SKILL.md, references/{recon-contract,audit-prompt-template,consolidation-contract}.md
 ├── prompts/
 │   └── swival-audit.md         # slash-command-style audit walkthrough
@@ -113,7 +113,7 @@ pi-swival/
 
 ## Running the tests
 
-The vitest harness covers the pure functions in `extensions/index.ts` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, and bundled-agent integrity. The harness never spawns an actual `swival` process; everything under test is pure.
+The vitest harness covers the pure functions in `extensions/index.ts` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, and bundled-agent integrity — plus the skill documentation invariants in `tests/skillDocs.test.ts`. The harness never spawns an actual `swival` process; everything under test is pure.
 
 ```bash
 cd tests

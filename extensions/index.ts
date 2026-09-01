@@ -862,7 +862,7 @@ async function readReport(reportPath: string): Promise<ReportSummary | undefined
  * Patterns we recognise today:
  *   - AWS SSO session expired / credentials missing
  *   - HTTP 401 / 403 from the LLM provider
- *   - DNS / connection refused to the LLM endpoint (e.g. proxy down)
+ *   - DNS / connection refused to the LLM endpoint (for example, a local server is down)
  *   - Rate limit (429)
  *   - ConfigError (unknown provider / missing model / bad API key)
  *   - ContextOverflowError (context window exceeded; 1.0.14 recovers when
@@ -917,7 +917,7 @@ export function classifyFailure(
 	if (/429 too many requests|rate limit|ratelimit/i.test(tail))
 		return { code: "rate_limited", text: "Rate limited by the LLM provider (429). Retry after backoff." };
 	if (/econnrefused|connection refused/i.test(tail))
-		return { code: "connection_refused", text: "Connection refused — is the LLM proxy / MLX server running?" };
+		return { code: "connection_refused", text: "Connection refused — is the local model server running?" };
 	if (/enotfound|name or service not known|dns/i.test(L) && /proxy|api|model/.test(L))
 		return { code: "connection_refused", text: "DNS lookup failed for the LLM endpoint." };
 	if (/context window exceeded|contextoverflowerror/i.test(tail))
