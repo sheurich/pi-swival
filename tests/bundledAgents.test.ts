@@ -25,6 +25,6 @@ function frontmatter(content: string): string {
 
 describe("bundled swival agents", () => {
 	it.each(bundledAgentFiles())("%s inherits model routing from swival config", (fileName) => {
-		expect(frontmatter(readAgent(fileName))).not.toMatch(/^model:/m);
+		expect(frontmatter(readAgent(fileName))).not.toMatch(/^(model|provider|baseUrl):/m);
 	});
 });

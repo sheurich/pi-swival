@@ -126,10 +126,10 @@ describe("classifyFailure", () => {
 		expect(res?.text).toMatch(/401/);
 	});
 
-	it("recognises ECONNREFUSED (proxy down)", () => {
+	it("recognises ECONNREFUSED (local model server down)", () => {
 		const res = classifyFailure(["ConnectError: connect ECONNREFUSED 127.0.0.1:4000"]);
 		expect(res?.code).toBe("connection_refused");
-		expect(res?.text).toMatch(/Connection refused/i);
+		expect(res?.text).toBe("Connection refused — is the local model server running?");
 	});
 
 	it("recognises rate limits (429)", () => {

@@ -22,10 +22,7 @@ pi --version
 swival --version
 ```
 
-You also need an LLM provider configured for swival. If you already use
-swival from the terminal, the existing config works. Otherwise see
-`skills/swival/references/setup.md` for the full setup including the
-optional litellm proxy.
+You also need an LLM provider configured for swival. If you already use swival from the terminal, the existing config works. Otherwise, see `skills/swival/references/setup.md` for native and local provider setup.
 
 ## Install the package
 

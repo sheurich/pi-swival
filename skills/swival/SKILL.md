@@ -11,7 +11,7 @@ description: >-
 
 # Swival
 
-Tracked against Swival 1.0.18.
+Tracked against Swival 1.0.40.
 
 Swival is a coding agent with a built-in reviewer loop, layered
 sandboxing (builtin + AgentFS), format-preserving secret
@@ -20,12 +20,9 @@ Access it from Pi via the `swival-subagent` tool.
 
 ## Delegation via swival-subagent
 
-The `swival-subagent` tool dispatches tasks to swival with
-streaming, structured results, and error classification. Bundled
-agents ship with the package and work immediately. Override or
-extend them by placing `.md` files in
-`~/.pi/agent/swival-agents/` (user) or `.pi/swival-agents/`
-(project). Discovery priority: project > user > bundled.
+The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user) or `.pi/swival-agents/` (project). Discovery priority: project > user > bundled.
+
+Bundled definitions live at `../../agents/<name>.md` relative to this skill, so the path holds wherever Pi installed the package. Read that file to see an agent's real frontmatter.
 
 ### Agent selection
 
@@ -35,6 +32,11 @@ extend them by placing `.md` files in
 | `test-runner` | Task has a runnable test command as acceptance criterion (pass `reviewerOverride`) |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying |
 | `swival` | Simple delegation, no review needed (also the default when agent is omitted) |
+| `audit-worker` | Read-only security or domain audit bucket; task must start with `/audit` (Stage 2 of the audit pipeline) |
+| `security-recon` | Survey a repository and emit `recon.json` bucket specs (Stage 1) |
+| `security-consolidator` | Merge per-bucket audit reports into one findings document (Stage 3) |
+
+The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc.
 
 ### Dispatch examples
 
@@ -154,6 +156,7 @@ sandbox: agentfs                  # builtin | agentfs
 files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
+noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS runs
 
 # Nested-invocation hygiene (defaults: all true)
 noInstructions: true
@@ -163,6 +166,7 @@ noMcp: true
 noA2a: true
 noHistory: true
 noContinue: true
+noSubagents: true
 
 # Extra directories
 addDir: ["/path1"]                # read+write access
@@ -179,11 +183,7 @@ extraArgs: ["--max-context-tokens", "128000"]
 System prompt body here (optional).
 ```
 
-Do not specify `model`, `provider`, or `baseUrl` in agent
-definitions. Model routing belongs in `~/.config/swival/config.toml`
-(managed per environment alongside the rest of your shell config).
-Use `profileOverride` at
-dispatch time when a specific profile is needed.
+Do not specify `model`, `provider`, or `baseUrl` in agent definitions. Model routing belongs in `~/.config/swival/config.toml`. Use `profileOverride` at dispatch time when a specific profile is needed.
 
 ### Agent configs do not inherit
 
@@ -209,9 +209,12 @@ agent intended. The trap to watch for:
   flags but as `false` for everything else — do not rely on this
   asymmetry, restate the flags you want.
 
-When overriding a bundled agent name from the user or project scope,
-diff your frontmatter against the bundled file and ensure every
-semantically-load-bearing flag is preserved.
+When overriding a bundled agent name from the user or project scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
+
+```bash
+# run from this skill's directory
+diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
+```
 
 ## Capabilities Reference
 
@@ -282,20 +285,22 @@ Named profiles:
 
 ```toml
 [profiles.budget]
-provider = "generic"
-model = "claude-haiku-4-5"
-base_url = "http://127.0.0.1:4000"
+provider = "bedrock"
+model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+reasoning_effort = "low"
 
-[profiles.local]
-provider = "lmstudio"
-model = "qwen3-30b"
+[profiles.vertex-research]
+provider = "vertexai"
+model = "gemini-3.7-flash"
+project = "my-gcp-project"
+location = "global"
 ```
 
 Switch at dispatch: `profileOverride: "budget"`.
 
-Native providers (no proxy needed): `lmstudio`, `llamacpp`,
-`huggingface`, `openrouter`, `google` (Gemini API), `chatgpt`,
-`bedrock`, `generic` (any OpenAI-compatible endpoint).
+Native providers, no proxy needed: `lmstudio`, `llamacpp`, `huggingface`, `openrouter`, `google` (Gemini API), `vertexai` (alias for `geap`), `chatgpt`, `bedrock`, and `generic` (any OpenAI-compatible endpoint, such as a local server).
+
+Configuration constraints: `bedrock` and `vertexai` both reject `api_key`, and a global `api_key` still applies when a profile selects them, so do not set one globally on a work-cloud host. For `bedrock`, `base_url` means the region; leave it unset to take the region from `~/.aws/config`, since a global value leaks into `vertexai` profiles, which take `project` and `location` instead. The Vertex project key is `project`, not `gcp_project`.
 
 ## Interactive REPL
 
@@ -328,11 +333,9 @@ work from Pi, use `swival-subagent` instead.
 | File | Purpose |
 |------|----------|
 | `~/.config/swival/config.toml` | Global config |
-| `~/.config/litellm/config.yaml` | Proxy model routing |
 | `swival.toml` (project root) | Project-level overrides |
 
-Generate config: `swival --init-config`.
-Proxy manager: `swival-proxy start|stop|status|restart`.
+Generate config: `swival --init-config`. Project config merges over global rather than replacing it, so a project file cannot unset a global `api_key`.
 
 ## Troubleshooting
 
@@ -344,7 +347,8 @@ Proxy manager: `swival-proxy start|stop|status|restart`.
 | `LifecycleError` | Hook failed under `--lifecycle-fail-closed` | Inspect hook; drop fail-closed |
 
 Infrastructure failures: expired AWS SSO, 401/403/429,
-`ECONNREFUSED` (proxy down), `E2BIG` (giant system prompt).
+`ECONNREFUSED` (local model server down), `E2BIG` (giant system
+prompt).
 
 ## Prerequisites
 
@@ -352,11 +356,6 @@ Infrastructure failures: expired AWS SSO, 401/403/429,
 command -v swival >/dev/null 2>&1 || { echo "swival not found"; exit 1; }
 ```
 
-If routing through litellm (Vertex / cross-region Bedrock):
-
-```bash
-command -v swival-proxy >/dev/null 2>&1 || { echo "proxy not found"; exit 1; }
-swival-proxy status || swival-proxy start
-```
+Bedrock and Vertex are reached natively, so there is nothing to start. Bedrock needs a live AWS session; Vertex needs application default credentials. Bundled agents run with `--no-lifecycle`, so refresh credentials before dispatching.
 
 See [setup.md](./references/setup.md) for installation.

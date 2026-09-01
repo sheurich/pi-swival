@@ -131,11 +131,11 @@ swival-subagent with
   ]
 ```
 
-The `audit-worker` agent is the existing read-only auditor (see `~/.pi/agent/swival-agents/audit-worker.md`). The leading `/audit` is required by that agent.
+The `audit-worker` agent is the bundled read-only auditor, at `../../agents/audit-worker.md` relative to this skill. The leading `/audit` is required by that agent.
 
 Set `concurrency` based on token budget and rate limits. Defaults: 3 for `frontier` profile, 4 for lighter.
 
-AgentFS parallel-dispatch warning: `audit-worker` runs under `sandbox: agentfs`, and AgentFS keeps its overlay state in a per-session SQLite database. When several invocations share a session id they fight over the same lock and most workers die before they can read anything. The bundled `audit-worker.md` ships with `noSandboxAutoSession: true` so each parallel invocation gets its own overlay; if you fork the agent into your own scope, keep that flag or every fan-out larger than one will fail. The same rule applies to any other `sandbox: agentfs` agent you fan out in parallel against a shared cwd. The dispatcher will refuse parallel dispatches of write-capable agents against a shared cwd unless one of these escapes is in effect (serial dispatch, per-task cwd, or `noSandboxAutoSession: true`).
+AgentFS parallel-dispatch warning: `audit-worker` runs under `sandbox: agentfs`, whose overlay state lives in a per-session SQLite database, so invocations sharing a session id fight over one lock and most workers die before reading anything. The bundled `audit-worker.md` sets `noSandboxAutoSession: true` to give each parallel invocation its own overlay; keep that flag if you fork the agent. The same rule applies to any `sandbox: agentfs` agent you fan out against a shared cwd — the dispatcher refuses parallel dispatch of write-capable agents there unless one escape is in effect: serial dispatch, per-task `cwd`, or `noSandboxAutoSession: true`.
 
 Output contract per report: see `references/audit-prompt-template.md` § "Required finding format".
 
