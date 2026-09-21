@@ -14,7 +14,7 @@ function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfi
 }
 
 describe("buildSwivalArgs", () => {
-	it("always disables lifecycle / MCP / A2A / history / continue / memory by default", () => {
+	it("always disables lifecycle / MCP / A2A / history / continue / memory / subagents by default", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
 		expect(args).toContain("--no-lifecycle");
 		expect(args).toContain("--no-mcp");
@@ -22,6 +22,16 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("--no-history");
 		expect(args).toContain("--no-continue");
 		expect(args).toContain("--no-memory");
+		expect(args).toContain("--no-subagents");
+	});
+
+	it("respects explicit noSubagents=false for user agents", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ noSubagents: false }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).not.toContain("--no-subagents");
 	});
 
 	it("respects explicit noLifecycle=false / noMcp=false / noA2a=false", () => {
@@ -360,5 +370,46 @@ describe("buildSwivalArgs", () => {
 			{ model: undefined } satisfies SwivalOverrides,
 		);
 		expect(args).toContain("from-fm");
+	});
+
+	it("emits --instructions-full when agent sets instructionsFull: true", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ instructionsFull: true }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--instructions-full");
+		expect(args).not.toContain("--no-instructions");
+	});
+
+	it("allows dispatch override to enable instructionsFull over agent noInstructions", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ noInstructions: true }),
+			"/tmp/r.json",
+			"/cwd",
+			{ instructionsFull: true },
+		);
+		expect(args).toContain("--instructions-full");
+		expect(args).not.toContain("--no-instructions");
+	});
+
+	it("throws if agent frontmatter sets both instructionsFull and noInstructions", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ instructionsFull: true, noInstructions: true }),
+				"/tmp/r.json",
+				"/cwd",
+			),
+		).toThrow(/cannot specify both instructionsFull and noInstructions/);
+	});
+
+	it("preserves safe default when bundled agent sets noInstructions", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ noInstructions: true }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--no-instructions");
+		expect(args).not.toContain("--instructions-full");
 	});
 });

@@ -13,7 +13,7 @@ const AUDIT_SKILL_DIR = join(SKILLS_DIR, "auditing-with-swival");
 const AUDIT_SKILL = join(AUDIT_SKILL_DIR, "SKILL.md");
 const AGENTS_DIR = join(PACKAGE_ROOT, "agents");
 
-const SWIVAL_VERSION = "1.0.40";
+const SWIVAL_VERSION = "1.0.44";
 
 function read(file: string): string {
 	return readFileSync(file, "utf8");
@@ -113,6 +113,10 @@ describe("setup.md documents native provider routing", () => {
 		const blocks = tomlBlocks(setup()).filter((b) => b.includes('provider = "generic"'));
 		expect(blocks.length, "local OpenAI-compatible servers still use generic").toBeGreaterThan(0);
 	});
+
+	it("documents uv tool upgrade swival", () => {
+		expect(setup()).toContain("uv tool upgrade swival");
+	});
 });
 
 describe("swival SKILL.md preserves package mechanics", () => {
@@ -132,6 +136,9 @@ describe("swival SKILL.md preserves package mechanics", () => {
 		["noSandboxAutoSession", /noSandboxAutoSession/],
 		["no-inheritance rule", /do not inherit/i],
 		["nested-invocation hygiene", /nested-invocation hygiene/i],
+		["instructionsFullOverride", /instructionsFullOverride/],
+		["reasoningEffortOverride", /reasoningEffortOverride/],
+		["enforced no-subagents", /--no-subagents/],
 	])("documents %s", (_label, pattern) => {
 		expect(skill()).toMatch(pattern);
 	});

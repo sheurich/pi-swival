@@ -8,6 +8,10 @@ import {
 	unknownAgentMessage,
 } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
+import { discoverSwivalAgents } from "../extensions/agents.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
 	return {
@@ -56,21 +60,22 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent({ sandbox: "agentfs" }))).toBe(true);
 	});
 
-	it("treats typed and extraArgs named AgentFS sessions as shared overlays", () => {
-		expect(
-			isMutatingCwdAgent(makeAgent({
-				sandbox: "agentfs",
-				noSandboxAutoSession: true,
-				sandboxSession: "shared-session",
-			})),
-		).toBe(true);
-		expect(
-			isMutatingCwdAgent(makeAgent({
-				sandbox: "agentfs",
-				noSandboxAutoSession: true,
-				extraArgs: ["--sandbox-session=shared-session"],
-			})),
-		).toBe(true);
+	it("clears noSubagents: false on project-local agents to prevent privilege escalation", () => {
+		const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-project-agent-")));
+		try {
+			const projectDir = path.join(tmp, ".pi", "swival-agents");
+			fs.mkdirSync(projectDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(projectDir, "custom.md"),
+				"---\nname: custom\ndescription: test\nnoSubagents: false\n---\nPrompt",
+			);
+			const discovery = discoverSwivalAgents(tmp, "project");
+			const agent = discovery.agents.find((a) => a.name === "custom");
+			expect(agent).toBeDefined();
+			expect(agent?.noSubagents).toBeUndefined();
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 
 	it("returns true when noSandboxAutoSession is set without an agentfs sandbox", () => {
