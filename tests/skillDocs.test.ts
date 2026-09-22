@@ -185,8 +185,18 @@ describe("swival-worker-briefs points at the bundled self-review-worker", () => 
 	});
 
 	it("requires distinct cwd for parallel dispatch", () => {
-		expect(skill()).toContain('cwd: ".worktrees/worker-a"');
-		expect(skill()).toContain('cwd: ".worktrees/worker-b"');
+		const matches = [...skill().matchAll(/cwd:\s*"([^"]+)"/g)].map((m) => m[1]);
+		expect(new Set(matches).size).toBeGreaterThanOrEqual(2);
+	});
+});
+
+describe("every packaged skill appears in README.md", () => {
+	it("lists all skill directories in README.md", () => {
+		const readme = read(join(PACKAGE_ROOT, "README.md"));
+		const skillNames = readdirSync(SKILLS_DIR).filter((d) => statSync(join(SKILLS_DIR, d)).isDirectory());
+		for (const name of skillNames) {
+			expect(readme).toContain(`\`${name}\``);
+		}
 	});
 });
 

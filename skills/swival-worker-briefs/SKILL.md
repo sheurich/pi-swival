@@ -14,6 +14,8 @@ Use this skill when drafting the `task` value for a `swival-subagent` dispatch t
 
 Do not use `self-review-worker` for pure review tasks. For PR reviews or change assessment without edits, use reviewer agents or review skills.
 
+The agent defaults to `maxReviewRounds: 5` and runs with `--no-instructions` and `--no-memory`. Pass `instructionsFullOverride: true` if the worker requires repository instructions.
+
 ## Brief structure
 
 Every task brief should include five elements:
@@ -22,7 +24,7 @@ Every task brief should include five elements:
 2. Scope: files, directories, or artifacts the worker may change.
 3. Constraints: repo instructions, style rules, compatibility limits, and things not to change.
 4. Validation: commands to run and expected outputs before declaring completion.
-5. Done condition: specific observable states that count as accepted.
+5. Done when: specific observable states that count as accepted.
 
 Prefer specific instructions over broad quality requests. For example, `Fix parser error handling and run pytest tests/parser` is better than `improve parser quality`.
 
@@ -46,7 +48,7 @@ Scope:
 - Change only <paths>.
 - Do not change <paths or behavior>.
 
-Implementation notes:
+Constraints:
 - <specific constraints or design choices>
 
 Validation:
@@ -65,24 +67,39 @@ Final answer must include changed files, commands run, validation output, and re
 Single implementation task:
 
 ```text
-swival-subagent with agent: "self-review-worker", task: "Goal: Add input validation to cmd/serve.go. Scope: change only cmd/serve.go and its tests. Validation: run go test ./cmd/... . Done when invalid input returns an error and tests pass. Final answer must include changed files, commands run, validation output, and residual risks."
+swival-subagent with agent: "self-review-worker", task: [
+  "Goal: Add input validation to cmd/serve.go.",
+  "Scope: change only cmd/serve.go and its tests.",
+  "Constraints: preserve existing error types and CLI flags.",
+  "Validation: run `go test ./cmd/...`.",
+  "Done when: invalid input returns an error and tests pass.",
+  "Final answer must include changed files, commands run, validation output, and residual risks."
+].join("\n")
 ```
 
 Parallel tasks on isolated worktrees:
 
-Parallel write-capable tasks must run with distinct `cwd` paths to avoid file conflicts:
+Parallel write-capable tasks must run with distinct `cwd` paths that already exist. Create each worktree before dispatching (`git worktree add -b worker-a .worktrees/worker-a HEAD`). See the `swival` skill for merge and cleanup procedures.
 
 ```text
 swival-subagent with tasks: [
-  { agent: "self-review-worker", task: "Goal: Refactor auth parsing. Scope: auth/*.go. Validation: go test ./auth/...", cwd: ".worktrees/worker-a" },
-  { agent: "self-review-worker", task: "Goal: Add parser error tests. Scope: parser tests. Validation: go test ./parser/...", cwd: ".worktrees/worker-b" }
+  {
+    agent: "self-review-worker",
+    cwd: ".worktrees/worker-a",
+    task: "Goal: Refactor auth parsing. Scope: auth/*.go. Constraints: keep public API. Validation: run `go test ./auth/...`. Done when: tests pass. Final answer must include changed files, commands run, and validation output."
+  },
+  {
+    agent: "self-review-worker",
+    cwd: ".worktrees/worker-b",
+    task: "Goal: Add parser error tests. Scope: parser tests. Constraints: no production edits. Validation: run `go test ./parser/...`. Done when: tests pass. Final answer must include changed files, commands run, and validation output."
+  }
 ]
 ```
 
 ## Common failures
 
 - Requesting review-only output from `self-review-worker`. Use a reviewer agent instead.
-- Omitting validation commands. The self-review loop needs explicit commands to verify work.
+- Omitting validation commands. Without commands, the self-review loop only evaluates output text and cannot confirm runtime behavior.
 - Writing vague scope descriptions like `clean this up`. Specify exact files and target behaviors.
-- Running parallel mutating tasks on the same `cwd`. Supply distinct worktree paths via `cwd`.
+- Running parallel mutating tasks on the same `cwd`. Pre-create and supply distinct worktree paths via `cwd`.
 - Treating `--self-review` as a human review replacement. You still own final acceptance.

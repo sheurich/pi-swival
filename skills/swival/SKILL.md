@@ -36,7 +36,7 @@ Bundled definitions live at `../../agents/<name>.md` relative to this skill, so 
 | `security-recon` | Survey a repository and emit `recon.json` bucket specs (Stage 1) |
 | `security-consolidator` | Merge per-bucket audit reports into one findings document (Stage 3) |
 
-The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc.
+The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc. Use the `swival-worker-briefs` skill to write structured task briefs for `self-review-worker`.
 
 ### Dispatch examples
 

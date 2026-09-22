@@ -9,6 +9,7 @@ The package bundles:
 - `swival-subagent` extension — dispatches tasks to a swival subprocess with reviewer loops, sandboxes, and structured reporting. Mirrors the shape of pi's example subagent extension but swaps the spawn target to swival.
 - `swival` skill — drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and native provider setup.
 - `auditing-with-swival` skill — a three-stage recon → per-bucket → consolidate pipeline for security audits over codebases too large for one worker.
+- `swival-worker-briefs` skill — task brief structure and evidence standards for `self-review-worker` dispatches.
 - `swival-audit` prompt template — slash-command-style invocation that walks an interactive operator through the audit pipeline.
 - Seven swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
 
@@ -70,7 +71,7 @@ See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for
 |-------|-----|
 | `swival` | Drive swival from any Pi agent — dispatch examples, agent authoring, capabilities reference, troubleshooting. |
 | `auditing-with-swival` | Run a reproducible multi-bucket security audit over a codebase. Three stages with structured output contracts. |
-| `swival-worker-briefs` | Draft precise, verifiable task briefs for self-review-worker delegations. |
+| `swival-worker-briefs` | Draft precise, verifiable task briefs for `self-review-worker` delegations. |
 
 ### Prompts
 
