@@ -1895,9 +1895,6 @@ export async function runSingleSwivalAsync(
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
-	const taskFile = path.join(artifactDir, "task.txt");
-	await fs.promises.writeFile(taskFile, task, "utf-8");
-
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
@@ -1905,6 +1902,8 @@ export async function runSingleSwivalAsync(
 	if (isReexec) {
 		args.push("--", task);
 	} else {
+		const taskFile = path.join(artifactDir, "task.txt");
+		await fs.promises.writeFile(taskFile, task, { encoding: "utf-8", mode: 0o600 });
 		args.push("--");
 	}
 
@@ -2151,10 +2150,9 @@ async function runSingleSwival(
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
 	// flag (argv injection).
-	// Swival's AgentFS and nono sandboxes re-exec from sys.argv and read stdin
-	// to EOF before re-exec, so re-exec sandboxes require the task on argv.
-	// For unsandboxed and builtin runs, the task is piped over stdin to protect
-	// it from process-table snooping (ps aux) and eliminate ARG_MAX limits.
+	// Only runs that explicitly set `sandbox: builtin` pipe the task over standard
+	// input; every other run, including sandbox-less ones, passes it on argv
+	// because ambient configuration may enable a re-executing sandbox.
 	const isReexec = isReexecSandboxRequested(args);
 	if (isReexec) {
 		args.push("--", task);

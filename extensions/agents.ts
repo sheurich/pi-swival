@@ -263,6 +263,8 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			agentConfig.commandMiddleware = undefined;
 			agentConfig.nonoProfile = undefined;
 			agentConfig.skillsDir = undefined;
+			agentConfig.network = undefined;
+			agentConfig.nonoAllowDomain = undefined;
 			// Force sandbox for project agents that don't specify a safe sandbox
 			if (!agentConfig.sandbox || agentConfig.sandbox === "builtin") {
 				agentConfig.sandbox = "agentfs";

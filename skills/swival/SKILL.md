@@ -271,7 +271,7 @@ AgentFS overlay does not merge back automatically. Inspect with
 
 ### Task prompt delivery
 
-For unsandboxed and `builtin` runs, tasks are piped directly over standard input rather than passed on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations. Because AgentFS and nono sandboxes re-execute from `sys.argv`, re-executing sandbox runs pass the task on the command line.
+Only runs that explicitly set `sandbox: builtin` pipe the task over standard input rather than passing it on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations. Every other run, including sandbox-less ones, passes the task on the command line because ambient configuration (`~/.config/swival/config.toml` or `swival.toml`) may enable a re-executing sandbox (AgentFS or nono).
 
 ### Secret encryption
 
