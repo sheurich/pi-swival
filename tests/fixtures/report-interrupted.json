@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "result": {
+    "outcome": "interrupted",
+    "exit_code": 130,
+    "answer": null
+  },
+  "stats": {
+    "turns": 1,
+    "tool_calls_total": 1
+  }
+}

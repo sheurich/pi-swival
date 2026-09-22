@@ -11,7 +11,7 @@ description: >-
 
 # Swival
 
-Tracked against Swival 1.0.40.
+Tracked against Swival 1.0.44.
 
 Swival is a coding agent with a built-in reviewer loop, layered
 sandboxing (builtin + AgentFS), format-preserving secret
@@ -131,8 +131,11 @@ definition:
 | `topPOverride` | Nucleus sampling |
 | `seedOverride` | Deterministic seed |
 | `reasoningEffortOverride` | Reasoning effort level |
+| `instructionsFullOverride` | Opt in to full instructions without truncation |
 | `cacheOverride` | Enable LLM response caching |
 | `cacheDirOverride` | Cache directory |
+
+Swival's `/reasoning` command is REPL-only. Use `reasoningEffortOverride` (or the agent frontmatter `reasoningEffort`) as the Pi equivalent.
 
 ## Authoring Agent Definitions
 
@@ -160,6 +163,7 @@ noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS 
 
 # Nested-invocation hygiene (defaults: all true)
 noInstructions: true
+# instructionsFull: true         # mutually exclusive with noInstructions — remove that line if enabled
 noMemory: true
 noLifecycle: true
 noMcp: true
@@ -203,11 +207,10 @@ agent intended. The trap to watch for:
   test script.
 - The nested-invocation hygiene flags (`noLifecycle`, `noMcp`,
   `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`)
-  default to `true` only for *bundled* agents whose frontmatter
-  declares them. The schema default for an unspecified flag is
-  `undefined`, which `buildSwivalArgs` treats as `true` for hygiene
-  flags but as `false` for everything else — do not rely on this
-  asymmetry, restate the flags you want.
+  default to `true` for every agent unless the frontmatter sets them to
+  `false`. The dispatcher enforces `--no-subagents` by default to
+  prevent unbounded subagent recursion; project-local agents cannot
+  disable it. Do not rely on schema defaults, restate the flags you want.
 
 When overriding a bundled agent name from the user or project scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
 
@@ -217,6 +220,15 @@ diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
 ```
 
 ## Capabilities Reference
+
+### Upstream Swival 1.0.44 behaviors
+
+Upstream Swival 1.0.44 provides several behaviors that require no package changes:
+
+- Image-rejection retries and generic-provider session headers operate transparently.
+- Streamed A2A response limits and endpoint-scoped model corrections apply automatically.
+- `swival --init-config` preserves existing configuration values.
+- Audit workflows (`/audit`) defend against hostile Git config and handle unusual tracked filenames (including newlines and unreadable files).
 
 ### Reviewer loop
 
@@ -355,6 +367,21 @@ prompt).
 ```bash
 command -v swival >/dev/null 2>&1 || { echo "swival not found"; exit 1; }
 ```
+
+Upgrade Swival to the latest release:
+
+```bash
+uv tool upgrade swival
+# or: pipx upgrade swival
+```
+
+### Version preflight
+
+Before spawning, the extension runs a fast, non-blocking version preflight:
+
+- Recommended: Swival 1.0.44 or later. Earlier 1.x releases produce an advisory upgrade notice.
+- Minimum compatible: Swival 1.0.0 (requires report schema v1). Earlier releases (< 1.0.0) are refused before spawning.
+- Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 
 Bedrock and Vertex are reached natively, so there is nothing to start. Bedrock needs a live AWS session; Vertex needs application default credentials. Bundled agents run with `--no-lifecycle`, so refresh credentials before dispatching.
 

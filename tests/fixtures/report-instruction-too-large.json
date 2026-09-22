@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "result": {
+    "outcome": "error",
+    "exit_code": 1,
+    "error_message": "The instruction files are too large for this setup.\nShorten the listed files, choose a model with more room, or restart with:\n  --no-instructions     Skip project and personal instruction files.\n  --instructions-full   Load all instructions; this may crowd out work or fail.\n\nFiles:\n  /path/to/AGENTS.md"
+  },
+  "stats": {
+    "turns": 0,
+    "tool_calls_total": 0
+  }
+}

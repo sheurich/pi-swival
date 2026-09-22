@@ -12,7 +12,7 @@ fi
 
 # 1. Install vitest locally.
 if [[ ! -d node_modules/vitest ]]; then
-	npm install --silent --ignore-scripts
+	npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps
 fi
 
 # 2. Find the Pi install so we can symlink the peer packages the extension
@@ -42,23 +42,47 @@ fi
 mkdir -p node_modules/@earendil-works
 
 # Determine the scope prefix used by this install (@earendil-works or @mariozechner).
+PI_SCOPE=""
+PI_MODULES_DIR=""
 if [[ -d "${PI_PKG}/node_modules/@earendil-works/pi-ai" ]]; then
 	PI_SCOPE="@earendil-works"
+	PI_MODULES_DIR="${PI_PKG}/node_modules"
 elif [[ -d "${PI_PKG}/node_modules/@mariozechner/pi-ai" ]]; then
 	PI_SCOPE="@mariozechner"
+	PI_MODULES_DIR="${PI_PKG}/node_modules"
+elif [[ -n "$npm_global_root" && -d "${npm_global_root}/@earendil-works/pi-ai" ]]; then
+	PI_SCOPE="@earendil-works"
+	PI_MODULES_DIR="${npm_global_root}"
+elif [[ -n "$npm_global_root" && -d "${npm_global_root}/@mariozechner/pi-ai" ]]; then
+	PI_SCOPE="@mariozechner"
+	PI_MODULES_DIR="${npm_global_root}"
+elif [[ -d "$(dirname "$PI_PKG")/pi-ai" ]]; then
+	PI_SCOPE="@earendil-works"
+	PI_MODULES_DIR="$(dirname "$PI_PKG")"
 else
-	echo "error: cannot find pi-ai under ${PI_PKG}/node_modules/" >&2
+	echo "error: cannot find pi-ai under ${PI_PKG}/node_modules/ or ${npm_global_root}" >&2
 	exit 1
 fi
 
 # The extension imports from @earendil-works/* — symlink to whatever scope
 # the Pi install uses internally.
 for pkg in pi-ai pi-agent-core; do
-	ln -sfn "${PI_PKG}/node_modules/${PI_SCOPE}/${pkg}" "node_modules/@earendil-works/${pkg}"
+	target=""
+	if [[ -d "${PI_MODULES_DIR}/${PI_SCOPE}/${pkg}" ]]; then
+		target="${PI_MODULES_DIR}/${PI_SCOPE}/${pkg}"
+	elif [[ -d "${PI_PKG}/node_modules/${PI_SCOPE}/${pkg}" ]]; then
+		target="${PI_PKG}/node_modules/${PI_SCOPE}/${pkg}"
+	fi
+	if [[ -n "$target" ]]; then
+		ln -sfn "$target" "node_modules/@earendil-works/${pkg}"
+	fi
 done
 
 # pi-tui may live under pi-coding-agent or as a sibling top-level package.
 PI_TUI="${PI_PKG}/node_modules/${PI_SCOPE}/pi-tui"
+if [[ ! -d "$PI_TUI" ]]; then
+	PI_TUI="${PI_MODULES_DIR}/${PI_SCOPE}/pi-tui"
+fi
 if [[ ! -d "$PI_TUI" ]]; then
 	# Try sibling install (e.g. /opt/homebrew/lib/node_modules/@earendil-works/pi-tui)
 	PI_TUI="$(dirname "$PI_PKG")/pi-tui"
@@ -70,6 +94,17 @@ else
 fi
 
 ln -sfn "$PI_PKG" node_modules/@earendil-works/pi-coding-agent
-ln -sfn "${PI_PKG}/node_modules/typebox" node_modules/typebox
+
+TYPEBOX_TARGET=""
+if [[ -d "${PI_PKG}/node_modules/typebox" ]]; then
+	TYPEBOX_TARGET="${PI_PKG}/node_modules/typebox"
+elif [[ -n "$npm_global_root" && -d "${npm_global_root}/typebox" ]]; then
+	TYPEBOX_TARGET="${npm_global_root}/typebox"
+elif [[ -d "$(dirname "$PI_PKG")/../typebox" ]]; then
+	TYPEBOX_TARGET="$(dirname "$PI_PKG")/../typebox"
+fi
+if [[ -n "$TYPEBOX_TARGET" ]]; then
+	ln -sfn "$TYPEBOX_TARGET" node_modules/typebox
+fi
 
 echo "swival-subagent tests ready. Run: npx vitest run"

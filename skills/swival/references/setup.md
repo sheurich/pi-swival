@@ -2,7 +2,7 @@
 
 Install Swival, point it at a provider, and verify connectivity.
 
-Tracked against Swival 1.0.40.
+Tracked against Swival 1.0.44.
 
 Bedrock and Vertex are reached through Swival's native `bedrock` and `vertexai` providers. No proxy process or second routing configuration is required.
 
@@ -24,9 +24,18 @@ uv tool install swival
 # or: pipx install swival
 ```
 
+## Upgrade Swival
+
+Update Swival to receive upstream security and reliability fixes:
+
+```bash
+uv tool upgrade swival
+# or: pipx upgrade swival
+```
+
 ## Configure
 
-On first run in an interactive terminal with no existing config, Swival offers an onboarding flow that writes `~/.config/swival/config.toml`. Run `swival --init-config` to generate a template non-interactively; add `--project` with `--base-dir <dir>` to write `swival.toml` under a project root instead.
+On first run in an interactive terminal with no existing config, Swival offers an onboarding flow that writes `~/.config/swival/config.toml`. Run `swival --init-config` to generate a template non-interactively; this preserves existing configuration without overwriting keys. Add `--project` with `--base-dir <dir>` to write `swival.toml` under a project root instead.
 
 Project config merges over global rather than replacing it, so a project file cannot unset a global key.
 

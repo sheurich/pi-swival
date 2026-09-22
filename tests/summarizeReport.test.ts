@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { classifyFailure, isRunFailure, summarizeReport } from "../extensions/index.js";
+import { classifyFailure, isRunFailure, renderStatus, summarizeReport, terminalFailureReason } from "../extensions/index.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const loadFixture = (name: string): Record<string, unknown> =>
@@ -91,6 +91,21 @@ describe("summarizeReport", () => {
 		expect(s.toolCallsByName).not.toHaveProperty("bad_string");
 		expect(s.toolCallsByName).not.toHaveProperty("bad_number");
 		expect(s.toolCallsByName).not.toHaveProperty("bad_array");
+	});
+
+	it("maps instruction-file-too-large error report", () => {
+		const raw = loadFixture("report-instruction-too-large.json");
+		const s = summarizeReport(raw);
+		expect(s.outcome).toBe("error");
+		expect(s.accepted).toBe(false);
+		expect(s.errorMessage).toContain("instruction files are too large");
+	});
+
+	it("maps interrupted lifecycle report", () => {
+		const raw = loadFixture("report-interrupted.json");
+		const s = summarizeReport(raw);
+		expect(s.outcome).toBe("interrupted");
+		expect(s.accepted).toBe(false);
 	});
 
 	it("keeps a raw pointer for debugging", () => {
@@ -213,6 +228,68 @@ describe("classifyFailure", () => {
 		expect(res?.text).toMatch(/context window exceeded/i);
 	});
 
+	it("classifies instruction-file-too-large from report", () => {
+		const raw = loadFixture("report-instruction-too-large.json");
+		const s = summarizeReport(raw);
+		const res = classifyFailure([], s);
+		expect(res?.code).toBe("config_error");
+		expect(res?.text).toMatch(/instruction files are too large/i);
+	});
+
+	it("classifies instruction-file-too-large from multi-line stderr fallback to first headline", () => {
+		const res = classifyFailure([
+			"The instruction files are too large for this setup.",
+			"Shorten the listed files, or restart with:",
+			"  --no-instructions     Skip project and personal instruction files.",
+			"  --instructions-full   Load all instructions; this may crowd out work or fail.",
+			"",
+			"Files:",
+			"  /path/to/AGENTS.md",
+		]);
+		expect(res?.code).toBe("config_error");
+		expect(res?.text).toBe("The instruction files are too large for this setup.");
+	});
+
+	it("classifies unreadable instruction error from report and stderr", () => {
+		const fromReport = classifyFailure([], {
+			outcome: "error",
+			errorMessage: "Some instruction files could not be read.",
+		} as ReturnType<typeof summarizeReport>);
+		expect(fromReport?.code).toBe("config_error");
+		expect(fromReport?.text).toMatch(/could not be read/i);
+
+		const fromStderr = classifyFailure(["Some instruction files could not be read."]);
+		expect(fromStderr?.code).toBe("config_error");
+		expect(fromStderr?.text).toMatch(/could not be read/i);
+	});
+
+	it("classifies interrupted outcome from report", () => {
+		const raw = loadFixture("report-interrupted.json");
+		const s = summarizeReport(raw);
+		const res = classifyFailure([], s);
+		expect(res?.code).toBe("non_zero_exit");
+		expect(res?.text).toMatch(/interrupted/i);
+	});
+
+	it("classifies interrupted from stderr fallback", () => {
+		const res = classifyFailure(["KeyboardInterrupt", "fmt.warning: interrupted."]);
+		expect(res?.code).toBe("non_zero_exit");
+		expect(res?.text).toMatch(/interrupted/i);
+	});
+
+	it("does not treat estimated-tokenizer or unreadable-instruction warnings as standalone failures", () => {
+		expect(
+			classifyFailure([
+				"  ⚠ Warning: tokenizer data is unavailable, so context sizes are byte estimates; preventive compaction and output clamping are off for this session",
+			]),
+		).toBeUndefined();
+		expect(
+			classifyFailure([
+				"  ⚠ Warning: instruction file not loaded — /path/to/extra/AGENTS.md: Permission denied",
+			]),
+		).toBeUndefined();
+	});
+
 	it("falls back to stderr patterns for ToolsNotSupportedError", () => {
 		const res = classifyFailure([
 			"Error: ToolsNotSupportedError: model does not support chat completions with tools",
@@ -240,9 +317,46 @@ describe("isRunFailure", () => {
 		expect(isRunFailure({ exitCode: 0, report: { outcome: "success" } })).toBe(false);
 	});
 
+	it("treats outcome=interrupted as failure", () => {
+		expect(isRunFailure({ exitCode: 0, report: { outcome: "interrupted" } })).toBe(true);
+		expect(isRunFailure({ exitCode: 130, report: { outcome: "interrupted" } })).toBe(true);
+	});
+
 	it("fails closed for exit=0 with a missing or unknown report", () => {
 		expect(isRunFailure({ exitCode: 0 })).toBe(true);
 		expect(isRunFailure({ exitCode: 0, report: {} })).toBe(true);
 		expect(isRunFailure({ exitCode: 0, report: { outcome: "unknown" } })).toBe(true);
+	});
+});
+
+describe("terminalFailureReason and renderStatus", () => {
+	it("maps exit status 130 directly to non_zero_exit reason", () => {
+		const res = terminalFailureReason(130, undefined, ["process killed"]);
+		expect(res?.code).toBe("non_zero_exit");
+		expect(res?.text).toMatch(/interrupted/i);
+	});
+
+	it("maps outcome=interrupted to non_zero_exit via terminalFailureReason", () => {
+		const raw = loadFixture("report-interrupted.json");
+		const s = summarizeReport(raw);
+		const res = terminalFailureReason(130, s, []);
+		expect(res?.code).toBe("non_zero_exit");
+		expect(res?.text).toMatch(/interrupted/i);
+	});
+
+	it("renderStatus returns failed for outcome=interrupted", () => {
+		const raw = loadFixture("report-interrupted.json");
+		const s = summarizeReport(raw);
+		const status = renderStatus({
+			agent: "test",
+			agentSource: "bundled",
+			task: "task",
+			exitCode: 130,
+			finalOutput: "",
+			stderrTail: [],
+			durationMs: 100,
+			report: s,
+		});
+		expect(status).toBe("failed");
 	});
 });

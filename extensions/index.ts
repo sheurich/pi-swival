@@ -436,6 +436,7 @@ export interface SwivalOverrides {
 	traceDir?: string;
 	verify?: string;
 	encryptSecrets?: boolean;
+	instructionsFull?: boolean;
 	timeoutMs?: number;
 }
 
@@ -533,7 +534,17 @@ export function buildSwivalArgs(
 	if (agent.noReadGuard) args.push("--no-read-guard");
 
 	// Prompt / memory (noMemory is handled above in nested-invocation hygiene)
-	if (agent.noInstructions) args.push("--no-instructions");
+	if (agent.instructionsFull && agent.noInstructions && overrides.instructionsFull === undefined) {
+		throw new SwivalArgumentError(
+			`Agent "${agent.name}" cannot specify both instructionsFull and noInstructions.`,
+		);
+	}
+	const instructionsFull = overrides.instructionsFull ?? agent.instructionsFull ?? false;
+	if (instructionsFull) {
+		args.push("--instructions-full");
+	} else if (agent.noInstructions) {
+		args.push("--no-instructions");
+	}
 	if (agent.noSkills) args.push("--no-skills");
 
 	// Escape hatch. Extension-owned protocol options follow this block so
@@ -610,7 +621,7 @@ interface ReportSummary {
 	// review was disabled and swival returned a terminal answer). "failed"
 	// is a reviewer rejection. "error" is an internal AgentError (see
 	// errorMessage for the specific cause).
-	outcome?: "success" | "failed" | "error" | "unknown";
+	outcome?: "success" | "failed" | "error" | "interrupted" | "unknown";
 	accepted?: boolean;
 	// From result.error_message — populated when swival raised an AgentError
 	// subclass (ConfigError, ContextOverflowError, ToolsNotSupportedError,
@@ -726,6 +737,8 @@ export interface SwivalResult {
 	// Undefined means swival's built-in default (100) was used. Surfaced
 	// in the header as "N/M turns" when a non-default limit was configured.
 	effectiveMaxTurns?: number;
+	// Advisory message when installed Swival is outdated (< 1.0.44).
+	versionAdvisory?: string;
 	// Set when the caller asked for per-task file output in parallel mode.
 	// `outputPath` is the absolute path we wrote finalOutput to; `outputMode`
 	// mirrors the TaskItem setting so consumers can decide whether to inline
@@ -764,6 +777,7 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	if (outcomeVal === "success") outcome = "success";
 	else if (outcomeVal === "failed") outcome = "failed";
 	else if (outcomeVal === "error") outcome = "error";
+	else if (outcomeVal === "interrupted") outcome = "interrupted";
 
 	// Last reviewer feedback: the most recent timeline entry of type "review".
 	// We include its feedback even on accepted runs (for visibility), but
@@ -783,7 +797,12 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	return {
 		reviewRounds: toNum(stats.review_rounds),
 		outcome,
-		accepted: outcome === "success" ? true : outcome === "failed" || outcome === "error" ? false : undefined,
+		accepted:
+			outcome === "success"
+				? true
+				: outcome === "failed" || outcome === "error" || outcome === "interrupted"
+					? false
+					: undefined,
 		errorMessage: toStr(result.error_message),
 		turns: toNum(stats.turns),
 		toolCallsTotal: toNum(stats.tool_calls_total),
@@ -886,6 +905,13 @@ export function classifyFailure(
 		};
 	}
 
+	if (report?.outcome === "interrupted") {
+		return {
+			code: "non_zero_exit",
+			text: "Swival execution was interrupted (SIGINT / exit 130).",
+		};
+	}
+
 	// Prefer the authoritative error_message from the report when swival
 	// finalized one (outcome="error" implies an AgentError subclass was raised).
 	// We normalise the most common subclasses into a short headline but fall
@@ -894,6 +920,10 @@ export function classifyFailure(
 	if (reportMsg) {
 		if (/context window exceeded|contextoverflow/i.test(reportMsg))
 			return { code: "context_overflow", text: `Context window exceeded — ${reportMsg}` };
+		if (/instruction.*(?:too large|fit this setup|read limit)|instructionloaderror/i.test(reportMsg))
+			return { code: "config_error", text: reportMsg };
+		if (/some instruction files could not be read|unreadable instruction/i.test(reportMsg))
+			return { code: "config_error", text: reportMsg };
 		if (/does not support (?:chat completions with tools|function calling)|toolsnotsupported/i.test(reportMsg))
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
@@ -906,6 +936,8 @@ export function classifyFailure(
 	const tail = stderrLines.slice(-50).join("\n");
 	const L = tail.toLowerCase();
 
+	if (/interrupted\.|keyboardinterrupt/i.test(tail))
+		return { code: "non_zero_exit", text: "Swival execution was interrupted (SIGINT / exit 130)." };
 	if (/token has expired|sso session|sso.*expired|expired token/i.test(tail))
 		return { code: "provider_auth", text: "AWS SSO session expired — run `aws sso login` and retry." };
 	if (/unable to locate credentials|no credentials|credentialretrieval|expiredtoken/i.test(tail))
@@ -925,6 +957,22 @@ export function classifyFailure(
 			code: "context_overflow",
 			text: "Context window exceeded (swival could not recover after truncation retries).",
 		};
+	if (/the instruction files are too large|instruction.*(?:too large|fit this setup|read limit)|instructionloaderror/i.test(tail)) {
+		const lines = tail.split("\n").filter((l) => l.trim());
+		const text = lines.find((l) => /too large|fit this setup|read limit|instructionloaderror/i.test(l))
+			?? lines.find((l) => /instruction/i.test(l))
+			?? "Instruction files too large for setup.";
+		return { code: "config_error", text };
+	}
+	if (/some instruction files could not be read/i.test(tail)) {
+		const lines = tail.split("\n").filter((l) => l.trim());
+		const text = lines.find((l) => /could not be read/i.test(l))
+			?? lines.find((l) => /instruction/i.test(l))
+			?? "Some instruction files could not be read.";
+		return { code: "config_error", text };
+	}
+	if (/^\s*(?:fmt\.warning:\s*)?interrupted\.$|keyboardinterrupt/im.test(tail))
+		return { code: "non_zero_exit", text: "Swival execution was interrupted (SIGINT / exit 130)." };
 	if (/toolsnotsupportederror|does not support function calling|does not support chat completions with tools/i.test(tail))
 		return { code: "config_error", text: "Model does not support function calling." };
 	if (/lifecycleerror|lifecycle.*hook failed/i.test(tail))
@@ -975,6 +1023,12 @@ export function terminalFailureReason(
 ): FailureReason | undefined {
 	if (!isRunFailure({ exitCode, report })) return undefined;
 	if (existingReason) return existingReason;
+	if (exitCode === 130) {
+		return {
+			code: "non_zero_exit",
+			text: "Swival execution was interrupted (exit 130).",
+		};
+	}
 	const classified = classifyFailure(stderrLines, report);
 	if (classified) return classified;
 	if (!report || report.outcome === "unknown") {
@@ -1070,6 +1124,159 @@ export async function terminateProcessGroup(
 			}
 		}, graceMs);
 		signal("SIGTERM");
+	});
+}
+
+// ---------------------------------------------------- version preflight --
+
+export interface SwivalVersionCheck {
+	installedVersion?: string;
+	recommendedVersion: string;
+	minCompatibleVersion: string;
+	isOutdated: boolean;
+	isIncompatible: boolean;
+	advisoryMessage?: string;
+	errorMessage?: string;
+}
+
+export const RECOMMENDED_SWIVAL_VERSION = "1.0.44";
+export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.0";
+
+export function parseSemver(v: string): [number, number, number] | null {
+	const match = v.match(/\bv?(\d+)\.(\d+)\.(\d+)\b/);
+	if (!match) return null;
+	return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+export function compareSemver(a: string, b: string): number {
+	const pa = parseSemver(a);
+	const pb = parseSemver(b);
+	if (!pa || !pb) return 0;
+	if (pa[0] !== pb[0]) return pa[0] - pb[0];
+	if (pa[1] !== pb[1]) return pa[1] - pb[1];
+	return pa[2] - pb[2];
+}
+
+export function evaluateSwivalVersion(installedVersion: string | undefined): SwivalVersionCheck {
+	if (!installedVersion) {
+		return {
+			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+			isOutdated: false,
+			isIncompatible: false,
+		};
+	}
+	const isTooOld = compareSemver(installedVersion, MIN_COMPATIBLE_SWIVAL_VERSION) < 0;
+	const isBehindRecommended = compareSemver(installedVersion, RECOMMENDED_SWIVAL_VERSION) < 0;
+
+	if (isTooOld) {
+		return {
+			installedVersion,
+			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+			isOutdated: true,
+			isIncompatible: true,
+			errorMessage: `Installed Swival version ${installedVersion} is incompatible with report schema v1 (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
+		};
+	}
+
+	if (isBehindRecommended) {
+		return {
+			installedVersion,
+			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+			isOutdated: true,
+			isIncompatible: false,
+			advisoryMessage: `Swival ${installedVersion} is installed. Swival ${RECOMMENDED_SWIVAL_VERSION} is recommended for latest security and reliability fixes. Upgrade with: uv tool upgrade swival`,
+		};
+	}
+
+	return {
+		installedVersion,
+		recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+		minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+		isOutdated: false,
+		isIncompatible: false,
+	};
+}
+
+let cachedVersionCheck: { check: SwivalVersionCheck; timestamp: number } | null = null;
+let inFlightVersionCheck: Promise<SwivalVersionCheck> | null = null;
+const VERSION_CACHE_TTL_MS = 60_000;
+
+export function resetSwivalVersionCache(): void {
+	cachedVersionCheck = null;
+	inFlightVersionCheck = null;
+}
+
+export async function preflightSwivalVersion(
+	execVersion: () => Promise<string | undefined> = defaultGetSwivalVersion,
+): Promise<SwivalVersionCheck> {
+	const now = Date.now();
+	if (cachedVersionCheck && now - cachedVersionCheck.timestamp < VERSION_CACHE_TTL_MS) {
+		return cachedVersionCheck.check;
+	}
+	if (inFlightVersionCheck) {
+		return inFlightVersionCheck;
+	}
+	inFlightVersionCheck = (async () => {
+		try {
+			const raw = await execVersion();
+			const check = evaluateSwivalVersion(raw);
+			cachedVersionCheck = { check, timestamp: Date.now() };
+			return check;
+		} catch {
+			return evaluateSwivalVersion(undefined);
+		} finally {
+			inFlightVersionCheck = null;
+		}
+	})();
+	return inFlightVersionCheck;
+}
+
+async function defaultGetSwivalVersion(): Promise<string | undefined> {
+	return new Promise<string | undefined>((resolve) => {
+		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const finish = (val: string | undefined) => {
+			if (settled) return;
+			settled = true;
+			if (killTimer) clearTimeout(killTimer);
+			resolve(val);
+		};
+		let cp: ChildProcess | undefined;
+		killTimer = setTimeout(() => {
+			try { cp?.kill("SIGKILL"); } catch { /* ignore */ }
+			finish(undefined);
+		}, 5000);
+		killTimer.unref?.();
+
+		try {
+			cp = spawn("swival", ["--version"], {
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			cp.unref?.();
+			let stdout = "";
+			let stderr = "";
+			const MAX_PROBE_BYTES = 16 * 1024;
+			cp.stdout?.on("data", (d: Buffer) => {
+				if (stdout.length < MAX_PROBE_BYTES) stdout += d.toString("utf-8");
+			});
+			cp.stderr?.on("data", (d: Buffer) => {
+				if (stderr.length < MAX_PROBE_BYTES) stderr += d.toString("utf-8");
+			});
+			cp.on("error", () => finish(undefined));
+			cp.on("close", (code) => {
+				if (code === 0) {
+					const out = stdout.trim() || stderr.trim();
+					finish(out || undefined);
+				} else {
+					finish(undefined);
+				}
+			});
+		} catch {
+			finish(undefined);
+		}
 	});
 }
 
@@ -1559,6 +1766,11 @@ export async function runSingleSwivalAsync(
 	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
 	if (argumentError) throw new SwivalArgumentError(argumentError);
 
+	const versionCheck = await preflightSwivalVersion();
+	if (versionCheck.isIncompatible) {
+		throw new SwivalArgumentError(versionCheck.errorMessage!);
+	}
+
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
 	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
@@ -1805,6 +2017,15 @@ async function runSingleSwival(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir: overrides.traceDir ?? traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
+
+	const versionCheck = await preflightSwivalVersion();
+	if (versionCheck.isIncompatible) {
+		throw new SwivalArgumentError(versionCheck.errorMessage!);
+	}
+	if (versionCheck.advisoryMessage) {
+		current.versionAdvisory = versionCheck.advisoryMessage;
+	}
+
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
 	// flag (argv injection). We always emit the separator; swival tolerates
@@ -2108,6 +2329,12 @@ const SwivalParams = Type.Object({
 	reasoningEffortOverride: Type.Optional(
 		Type.String({ description: "Override --reasoning-effort for this call." }),
 	),
+	instructionsFullOverride: Type.Optional(
+		Type.Boolean({
+			description:
+				"Opt in to loading complete AGENTS.md/CLAUDE.md instruction files without truncation. When true, passes --instructions-full and suppresses --no-instructions.",
+		}),
+	),
 	cacheOverride: Type.Optional(Type.Boolean({ description: "Override --cache for this call." })),
 	cacheDirOverride: Type.Optional(Type.String({ description: "Override --cache-dir for this call." })),
 	verifyOverride: Type.Optional(
@@ -2179,6 +2406,7 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		topP: g<number>("topPOverride"),
 		seed: g<number>("seedOverride"),
 		reasoningEffort: g<string>("reasoningEffortOverride"),
+		instructionsFull: g<boolean>("instructionsFullOverride") ?? g<boolean>("instructionsFull"),
 		cache: g<boolean>("cacheOverride"),
 		cacheDir: g<string>("cacheDirOverride"),
 		verify: g<string>("verifyOverride"),
@@ -2206,6 +2434,7 @@ export function renderStatus(r: SwivalResult): RunStatus {
 	if (r.exitCode !== 0) return "failed";
 	if (r.report?.outcome === "error") return "error";
 	if (r.report?.outcome === "failed") return "rejected";
+	if (r.report?.outcome === "interrupted") return "failed";
 	if (r.report?.outcome === "success") {
 		const rounds = r.report.reviewRounds ?? 0;
 		return rounds > 0 ? "accepted" : "completed";
@@ -2618,6 +2847,15 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				}
 			}
 
+			const versionCheck = await preflightSwivalVersion();
+			if (versionCheck.isIncompatible) {
+				return {
+					content: [{ type: "text", text: versionCheck.errorMessage! }],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
+
 			if (params.chain && params.chain.length > 0) {
 				if (params.chain.length > MAX_PARALLEL_TASKS) {
 					return {
@@ -3001,6 +3239,9 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 				if (r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
+				}
+				if (r.versionAdvisory) {
+					container.addChild(new Text(theme.fg("warning", `⚠ ${r.versionAdvisory}`), 0, 0));
 				}
 				// Per-tool-call progress from trace tailing. Always show a recent
 				// slice while the run is in flight so Pi's UI has something live.

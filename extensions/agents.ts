@@ -63,6 +63,7 @@ export interface SwivalAgentConfig {
 	yolo?: boolean;
 
 	// Prompt / memory
+	instructionsFull?: boolean;
 	noInstructions?: boolean;
 	noMemory?: boolean;
 	noSkills?: boolean;
@@ -207,6 +208,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			noReadGuard: asBool(fm.noReadGuard),
 			yolo: asBool(fm.yolo),
 
+			instructionsFull: asBool(fm.instructionsFull),
 			noInstructions: asBool(fm.noInstructions),
 			noMemory: asBool(fm.noMemory),
 			noSkills: asBool(fm.noSkills),
@@ -233,6 +235,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			agentConfig.extraArgs = undefined;
 			agentConfig.reviewer = undefined;
 			agentConfig.verify = undefined;
+			agentConfig.noSubagents = undefined;
 			// Force sandbox for project agents that don't specify one
 			if (!agentConfig.sandbox) agentConfig.sandbox = "agentfs";
 		}
