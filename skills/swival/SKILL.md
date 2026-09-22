@@ -14,7 +14,7 @@ description: >-
 Tracked against Swival 1.0.44.
 
 Swival is a coding agent with a built-in reviewer loop, layered
-sandboxing (builtin + AgentFS), format-preserving secret
+sandboxing (builtin + AgentFS + nono), format-preserving secret
 encryption, outbound request filtering, and A2A orchestration.
 Access it from Pi via the `swival-subagent` tool.
 
@@ -134,6 +134,7 @@ definition:
 | `instructionsFullOverride` | Opt in to full instructions without truncation |
 | `networkOverride` | Network policy (`full`, `provider-only`, `none`) |
 | `nonoRollbackOverride` | Enable nono atomic rollback snapshots |
+| `nonoBlockNetOverride` | Block all outbound network under nono sandbox |
 | `commandMiddlewareOverride` | Command run before each tool command |
 | `maxOutputKbOverride` | Size cap in KB for tool output |
 | `maxOutputLinesOverride` | Line cap for file reads |
@@ -163,7 +164,7 @@ maxReviewRounds: 5                # round budget
 requiresReviewer: true            # dispatcher refuses to spawn without a reviewer
 
 # Sandbox / commands
-sandbox: agentfs                  # builtin | agentfs
+sandbox: agentfs                  # builtin | agentfs | nono
 files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
@@ -270,7 +271,7 @@ AgentFS overlay does not merge back automatically. Inspect with
 
 ### Task prompt delivery
 
-Tasks are piped directly to Swival over standard input rather than passed on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations.
+For unsandboxed and `builtin` runs, tasks are piped directly over standard input rather than passed on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations. Because AgentFS and nono sandboxes re-execute from `sys.argv`, re-executing sandbox runs pass the task on the command line.
 
 ### Secret encryption
 

@@ -482,17 +482,32 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("--no-subagents");
 	});
 
-	it("detects re-exec sandboxes (agentfs and nono) via isReexecSandboxRequested", () => {
+	it("conservatively treats unknown or re-exec sandboxes as requiring argv task delivery", () => {
 		const agentFsArgs = buildSwivalArgs(makeAgent({ sandbox: "agentfs" }), "/tmp/r.json", "/cwd");
 		expect(isReexecSandboxRequested(agentFsArgs)).toBe(true);
 
 		const nonoArgs = buildSwivalArgs(makeAgent({ sandbox: "nono" }), "/tmp/r.json", "/cwd");
 		expect(isReexecSandboxRequested(nonoArgs)).toBe(true);
 
+		// Omitted sandbox is conservatively treated as potential re-exec because ambient
+		// config (config.toml / swival.toml) may set sandbox = "agentfs"
+		const defaultArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(defaultArgs)).toBe(true);
+
+		// Only explicitly configured builtin sandbox is known not to re-exec
 		const builtinArgs = buildSwivalArgs(makeAgent({ sandbox: "builtin" }), "/tmp/r.json", "/cwd");
 		expect(isReexecSandboxRequested(builtinArgs)).toBe(false);
+	});
 
-		const defaultArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
-		expect(isReexecSandboxRequested(defaultArgs)).toBe(false);
+	it("truncates non-integer maxOutputKb and maxOutputLines", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 50.7, maxOutputLines: 2000.9 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("50");
+		expect(args).not.toContain("50.7");
+		expect(args).toContain("2000");
+		expect(args).not.toContain("2000.9");
 	});
 });

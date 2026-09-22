@@ -287,10 +287,18 @@ export function isAgentFsRequested(args: readonly string[]): boolean {
 	return lastCliOptionValue(args, "--sandbox") === "agentfs";
 }
 
-/** Derive whether a sandbox requiring process re-exec (AgentFS or nono) is requested. */
+/**
+ * Derive whether a sandbox requiring process re-exec (AgentFS or nono) may be
+ * triggered. Swival merges ambient configuration (~/.config/swival/config.toml
+ * and <base-dir>/swival.toml) into args.sandbox when --sandbox is omitted on
+ * the command line. Because Swival drains stdin before re-exec, any run that
+ * re-execs requires the task on argv so it survives process image replacement.
+ * We therefore conservatively assume re-exec unless the CLI explicitly set
+ * --sandbox builtin.
+ */
 export function isReexecSandboxRequested(args: readonly string[]): boolean {
 	const mode = lastCliOptionValue(args, "--sandbox");
-	return mode === "agentfs" || mode === "nono";
+	return mode !== "builtin";
 }
 
 /**
@@ -567,11 +575,11 @@ export function buildSwivalArgs(
 	// Output budgeting
 	const maxOutputKb = overrides.maxOutputKb ?? agent.maxOutputKb;
 	if (typeof maxOutputKb === "number" && Number.isFinite(maxOutputKb) && maxOutputKb > 0) {
-		args.push("--max-output-kb", String(maxOutputKb));
+		args.push("--max-output-kb", String(Math.trunc(maxOutputKb)));
 	}
 	const maxOutputLines = overrides.maxOutputLines ?? agent.maxOutputLines;
 	if (typeof maxOutputLines === "number" && Number.isFinite(maxOutputLines) && maxOutputLines > 0) {
-		args.push("--max-output-lines", String(maxOutputLines));
+		args.push("--max-output-lines", String(Math.trunc(maxOutputLines)));
 	}
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);
@@ -2476,10 +2484,10 @@ const SwivalParams = Type.Object({
 		Type.String({ description: "Command run before each tool command (JSON on stdin -> allow/deny/rewrite)." }),
 	),
 	maxOutputKbOverride: Type.Optional(
-		Type.Number({ description: "Size cap in KB for tool output sent to the model (default 50)." }),
+		Type.Integer({ minimum: 1, description: "Size cap in KB for tool output sent to the model (default 50)." }),
 	),
 	maxOutputLinesOverride: Type.Optional(
-		Type.Number({ description: "Default number of lines returned by file reads (default 2000)." }),
+		Type.Integer({ minimum: 1, description: "Default number of lines returned by file reads (default 2000)." }),
 	),
 	skillsDirOverride: Type.Optional(
 		Type.Array(Type.String(), { description: "Additional directories to scan for Swival skills." }),
