@@ -70,6 +70,7 @@ See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for
 |-------|-----|
 | `swival` | Drive swival from any Pi agent — dispatch examples, agent authoring, capabilities reference, troubleshooting. |
 | `auditing-with-swival` | Run a reproducible multi-bucket security audit over a codebase. Three stages with structured output contracts. |
+| `swival-worker-briefs` | Draft precise, verifiable task briefs for self-review-worker delegations. |
 
 ### Prompts
 
@@ -108,7 +109,8 @@ pi-swival/
 ├── agents/                     # seven bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md
-│   └── auditing-with-swival/   # SKILL.md, references/{recon-contract,audit-prompt-template,consolidation-contract}.md
+│   ├── auditing-with-swival/   # SKILL.md, references/{recon-contract,audit-prompt-template,consolidation-contract}.md
+│   └── swival-worker-briefs/   # SKILL.md
 ├── prompts/
 │   └── swival-audit.md         # slash-command-style audit walkthrough
 └── tests/                  # vitest harness for pure functions in extensions/

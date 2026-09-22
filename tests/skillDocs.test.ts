@@ -11,6 +11,8 @@ const SWIVAL_SKILL = join(SWIVAL_SKILL_DIR, "SKILL.md");
 const SETUP_DOC = join(SWIVAL_SKILL_DIR, "references", "setup.md");
 const AUDIT_SKILL_DIR = join(SKILLS_DIR, "auditing-with-swival");
 const AUDIT_SKILL = join(AUDIT_SKILL_DIR, "SKILL.md");
+const BRIEFS_SKILL_DIR = join(SKILLS_DIR, "swival-worker-briefs");
+const BRIEFS_SKILL = join(BRIEFS_SKILL_DIR, "SKILL.md");
 const AGENTS_DIR = join(PACKAGE_ROOT, "agents");
 
 const SWIVAL_VERSION = "1.0.44";
@@ -175,10 +177,24 @@ describe("auditing-with-swival points at the bundled audit-worker", () => {
 	});
 });
 
+describe("swival-worker-briefs points at the bundled self-review-worker", () => {
+	const skill = () => read(BRIEFS_SKILL);
+
+	it("uses the bundled relative source path", () => {
+		expect(skill()).toContain("../../agents/self-review-worker.md");
+	});
+
+	it("requires distinct cwd for parallel dispatch", () => {
+		expect(skill()).toContain('cwd: ".worktrees/worker-a"');
+		expect(skill()).toContain('cwd: ".worktrees/worker-b"');
+	});
+});
+
 describe("documented bundled agent paths resolve on disk", () => {
 	it.each([
 		["skills/swival/SKILL.md", SWIVAL_SKILL, SWIVAL_SKILL_DIR],
 		["skills/auditing-with-swival/SKILL.md", AUDIT_SKILL, AUDIT_SKILL_DIR],
+		["skills/swival-worker-briefs/SKILL.md", BRIEFS_SKILL, BRIEFS_SKILL_DIR],
 	])("%s", (_label, file, skillDir) => {
 		const refs = [...read(file).matchAll(/\.\.\/\.\.\/agents\/([a-z0-9-]+)\.md/g)].map((m) => m[1]);
 		for (const name of refs) {
