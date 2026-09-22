@@ -412,4 +412,73 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("--no-instructions");
 		expect(args).not.toContain("--instructions-full");
 	});
+
+	it("passes nono sandbox and network isolation options", () => {
+		const args = buildSwivalArgs(
+			makeAgent({
+				sandbox: "nono",
+				nonoProfile: "strict",
+				nonoRollback: true,
+				nonoBlockNet: true,
+				nonoAllowDomain: ["api.example.com", "auth.example.com"],
+				network: "provider-only",
+			}),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--sandbox");
+		expect(args).toContain("nono");
+		expect(args).toContain("--nono-profile");
+		expect(args).toContain("strict");
+		expect(args).toContain("--nono-rollback");
+		expect(args).toContain("--nono-block-net");
+		expect(args).toContain("--nono-allow-domain");
+		expect(args).toContain("api.example.com");
+		expect(args).toContain("--network");
+		expect(args).toContain("provider-only");
+	});
+
+	it("passes command middleware", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ commandMiddleware: "rtk proxy" }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--command-middleware");
+		expect(args).toContain("rtk proxy");
+	});
+
+	it("passes maxOutputKb and maxOutputLines", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 100, maxOutputLines: 5000 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--max-output-kb");
+		expect(args).toContain("100");
+		expect(args).toContain("--max-output-lines");
+		expect(args).toContain("5000");
+	});
+
+	it("passes skillsDir and ambient skill sharing", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ skillsDir: ["/extra/skills"] }),
+			"/tmp/r.json",
+			"/cwd",
+			{ shareSkills: true },
+		);
+		expect(args).toContain("--skills-dir");
+		expect(args).toContain("/extra/skills");
+	});
+
+	it("allows explicit subagents opt-in to emit --subagents and omit --no-subagents", () => {
+		const args = buildSwivalArgs(
+			makeAgent(),
+			"/tmp/r.json",
+			"/cwd",
+			{ subagents: true },
+		);
+		expect(args).toContain("--subagents");
+		expect(args).not.toContain("--no-subagents");
+	});
 });

@@ -49,12 +49,18 @@ export interface SwivalAgentConfig {
 	requiresReviewer?: boolean;
 
 	// Filesystem / commands
-	sandbox?: "builtin" | "agentfs";
+	sandbox?: "builtin" | "agentfs" | "nono";
 	sandboxSession?: string;
 	sandboxStrictRead?: boolean;
 	noSandboxAutoSession?: boolean;
+	nonoProfile?: string;
+	nonoRollback?: boolean;
+	nonoBlockNet?: boolean;
+	nonoAllowDomain?: string[];
+	network?: "full" | "provider-only" | "none";
 	files?: "none" | "some" | "all";
 	commands?: string;
+	commandMiddleware?: string;
 	baseDir?: string;
 	addDir?: string[];
 	addDirRo?: string[];
@@ -67,6 +73,11 @@ export interface SwivalAgentConfig {
 	noInstructions?: boolean;
 	noMemory?: boolean;
 	noSkills?: boolean;
+	skillsDir?: string[];
+
+	// Output budgeting
+	maxOutputKb?: number;
+	maxOutputLines?: number;
 
 	// Caching
 	cache?: boolean;
@@ -83,6 +94,7 @@ export interface SwivalAgentConfig {
 	noHistory?: boolean;
 	noContinue?: boolean;
 	noSubagents?: boolean;
+	subagents?: boolean;
 
 	// Output control
 	quiet?: boolean;
@@ -195,12 +207,18 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			maxReviewRounds: asNumber(fm.maxReviewRounds),
 			requiresReviewer: asBool(fm.requiresReviewer),
 
-			sandbox: asEnum(fm.sandbox, ["builtin", "agentfs"] as const),
+			sandbox: asEnum(fm.sandbox, ["builtin", "agentfs", "nono"] as const),
 			sandboxSession: typeof fm.sandboxSession === "string" ? fm.sandboxSession : undefined,
 			sandboxStrictRead: asBool(fm.sandboxStrictRead),
 			noSandboxAutoSession: asBool(fm.noSandboxAutoSession),
+			nonoProfile: typeof fm.nonoProfile === "string" ? fm.nonoProfile : undefined,
+			nonoRollback: asBool(fm.nonoRollback),
+			nonoBlockNet: asBool(fm.nonoBlockNet),
+			nonoAllowDomain: asStringArray(fm.nonoAllowDomain),
+			network: asEnum(fm.network, ["full", "provider-only", "none"] as const),
 			files: asEnum(fm.files, ["none", "some", "all"] as const),
 			commands: typeof fm.commands === "string" ? fm.commands : undefined,
+			commandMiddleware: typeof fm.commandMiddleware === "string" ? fm.commandMiddleware : undefined,
 			baseDir: typeof fm.baseDir === "string" ? fm.baseDir : undefined,
 			addDir: asStringArray(fm.addDir),
 			addDirRo: asStringArray(fm.addDirRo),
@@ -212,6 +230,10 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			noInstructions: asBool(fm.noInstructions),
 			noMemory: asBool(fm.noMemory),
 			noSkills: asBool(fm.noSkills),
+			skillsDir: asStringArray(fm.skillsDir),
+
+			maxOutputKb: asNumber(fm.maxOutputKb),
+			maxOutputLines: asNumber(fm.maxOutputLines),
 
 			noLifecycle: asBool(fm.noLifecycle),
 			noMcp: asBool(fm.noMcp),
@@ -219,6 +241,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			noHistory: asBool(fm.noHistory),
 			noContinue: asBool(fm.noContinue),
 			noSubagents: asBool(fm.noSubagents),
+			subagents: asBool(fm.subagents),
 
 			quiet: asBool(fm.quiet),
 			extraArgs: asStringArray(fm.extraArgs),
@@ -236,8 +259,14 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			agentConfig.reviewer = undefined;
 			agentConfig.verify = undefined;
 			agentConfig.noSubagents = undefined;
-			// Force sandbox for project agents that don't specify one
-			if (!agentConfig.sandbox) agentConfig.sandbox = "agentfs";
+			agentConfig.subagents = undefined;
+			agentConfig.commandMiddleware = undefined;
+			agentConfig.nonoProfile = undefined;
+			agentConfig.skillsDir = undefined;
+			// Force sandbox for project agents that don't specify a safe sandbox
+			if (!agentConfig.sandbox || agentConfig.sandbox === "builtin") {
+				agentConfig.sandbox = "agentfs";
+			}
 		}
 		agents.push(agentConfig);
 	}

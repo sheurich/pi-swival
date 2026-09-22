@@ -32,8 +32,18 @@ function finish(exitCode, spawnError) {
 	process.exitCode = exitCode ?? 127;
 }
 
+const taskFile = path.join(artifactDir, "task.txt");
+let stdinFd = "ignore";
+if (fs.existsSync(taskFile)) {
+	try {
+		stdinFd = fs.openSync(taskFile, "r");
+	} catch {
+		stdinFd = "ignore";
+	}
+}
+
 const child = spawn("swival", swivalArgs, {
-	stdio: "inherit",
+	stdio: [stdinFd, "inherit", "inherit"],
 });
 
 child.once("error", (error) => {

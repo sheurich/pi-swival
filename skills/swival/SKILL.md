@@ -132,6 +132,14 @@ definition:
 | `seedOverride` | Deterministic seed |
 | `reasoningEffortOverride` | Reasoning effort level |
 | `instructionsFullOverride` | Opt in to full instructions without truncation |
+| `networkOverride` | Network policy (`full`, `provider-only`, `none`) |
+| `nonoRollbackOverride` | Enable nono atomic rollback snapshots |
+| `commandMiddlewareOverride` | Command run before each tool command |
+| `maxOutputKbOverride` | Size cap in KB for tool output |
+| `maxOutputLinesOverride` | Line cap for file reads |
+| `skillsDirOverride` | Additional directories to scan for skills |
+| `shareSkills` | Share ambient Pi skills with Swival |
+| `subagentsOverride` | Allow Swival to spawn native subagents |
 | `cacheOverride` | Enable LLM response caching |
 | `cacheDirOverride` | Cache directory |
 
@@ -251,6 +259,7 @@ Self-review and `--reviewer` are mutually exclusive.
 | `files: all` | Unrestricted |
 | `files: none` | Only `.swival/` accessible |
 | `sandbox: agentfs` | OS-enforced overlay; writes hit SQLite, not real FS |
+| `sandbox: nono` | OS-enforced Landlock (Linux) / Seatbelt (macOS) with rollback and network blocking |
 
 The read-before-write guard prevents overwriting unread files.
 Disable with `noReadGuard: true` for agents that create files
@@ -258,6 +267,10 @@ from scratch.
 
 AgentFS overlay does not merge back automatically. Inspect with
 `agentfs diff <session-id>` and apply manually.
+
+### Task prompt delivery
+
+Tasks are piped directly to Swival over standard input rather than passed on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations.
 
 ### Secret encryption
 

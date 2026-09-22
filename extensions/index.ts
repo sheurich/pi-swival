@@ -437,6 +437,15 @@ export interface SwivalOverrides {
 	verify?: string;
 	encryptSecrets?: boolean;
 	instructionsFull?: boolean;
+	network?: "full" | "provider-only" | "none";
+	nonoRollback?: boolean;
+	nonoBlockNet?: boolean;
+	commandMiddleware?: string;
+	maxOutputKb?: number;
+	maxOutputLines?: number;
+	skillsDir?: string[];
+	shareSkills?: boolean;
+	subagents?: boolean;
 	timeoutMs?: number;
 }
 
@@ -455,15 +464,22 @@ export function buildSwivalArgs(
 
 	// Nested-invocation hygiene: default to disabling lifecycle / MCP / A2A /
 	// history / continue / memory / subagents unless the agent explicitly opts
-	// in (field=false). --no-subagents prevents a nested swival from spawning
-	// its own sub-subagents (unbounded recursion risk).
+	// in (field=false).
 	if (agent.noLifecycle !== false) args.push("--no-lifecycle");
 	if (agent.noMcp !== false) args.push("--no-mcp");
 	if (agent.noA2a !== false) args.push("--no-a2a");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
 	if (agent.noMemory !== false) args.push("--no-memory");
-	if (agent.noSubagents !== false) args.push("--no-subagents");
+
+	// Native subagents opt-in: default to --no-subagents to prevent unmonitored
+	// recursion inside Pi, but allow explicit subagents=true opt-in.
+	const allowSubagents = overrides.subagents ?? agent.subagents ?? false;
+	if (allowSubagents) {
+		args.push("--subagents");
+	} else if (agent.noSubagents !== false) {
+		args.push("--no-subagents");
+	}
 
 	// Provider / model (overrides outrank frontmatter)
 	const provider = overrides.provider ?? agent.provider;
@@ -525,6 +541,32 @@ export function buildSwivalArgs(
 	if (agent.sandboxSession) args.push("--sandbox-session", agent.sandboxSession);
 	if (agent.sandboxStrictRead) args.push("--sandbox-strict-read");
 	if (agent.noSandboxAutoSession) args.push("--no-sandbox-auto-session");
+
+	// nono sandbox controls (only meaningful with --sandbox nono)
+	if (agent.nonoProfile) args.push("--nono-profile", agent.nonoProfile);
+	const nonoRollback = overrides.nonoRollback ?? agent.nonoRollback;
+	if (nonoRollback) args.push("--nono-rollback");
+	const nonoBlockNet = overrides.nonoBlockNet ?? agent.nonoBlockNet;
+	if (nonoBlockNet) args.push("--nono-block-net");
+	for (const domain of agent.nonoAllowDomain ?? []) args.push("--nono-allow-domain", domain);
+
+	// Network policy
+	const network = overrides.network ?? agent.network;
+	if (network) args.push("--network", network);
+
+	// Command middleware
+	const commandMiddleware = overrides.commandMiddleware ?? agent.commandMiddleware;
+	if (commandMiddleware) args.push("--command-middleware", commandMiddleware);
+
+	// Output budgeting
+	const maxOutputKb = overrides.maxOutputKb ?? agent.maxOutputKb;
+	if (typeof maxOutputKb === "number" && Number.isFinite(maxOutputKb) && maxOutputKb > 0) {
+		args.push("--max-output-kb", String(maxOutputKb));
+	}
+	const maxOutputLines = overrides.maxOutputLines ?? agent.maxOutputLines;
+	if (typeof maxOutputLines === "number" && Number.isFinite(maxOutputLines) && maxOutputLines > 0) {
+		args.push("--max-output-lines", String(maxOutputLines));
+	}
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);
 	for (const d of agent.addDir ?? []) args.push("--add-dir", d);
@@ -545,7 +587,16 @@ export function buildSwivalArgs(
 	} else if (agent.noInstructions) {
 		args.push("--no-instructions");
 	}
-	if (agent.noSkills) args.push("--no-skills");
+	if (agent.noSkills) {
+		args.push("--no-skills");
+	} else {
+		const skillsDirs = overrides.skillsDir ?? agent.skillsDir ?? [];
+		for (const dir of skillsDirs) args.push("--skills-dir", dir);
+		if (overrides.shareSkills) {
+			const ambientSkills = path.join(os.homedir(), ".agents", "skills");
+			if (fs.existsSync(ambientSkills)) args.push("--skills-dir", ambientSkills);
+		}
+	}
 
 	// Escape hatch. Extension-owned protocol options follow this block so
 	// extraArgs cannot redirect reports or traces away from the paths we read.
@@ -656,7 +707,22 @@ interface ReportSummary {
 		mode?: string;
 		agentfsVersion?: string;
 		diffHint?: string;
+		nonoVersion?: string;
+		nonoProfile?: string;
+		nonoRollback?: boolean;
 	};
+	network?: string;
+	promptCache?: {
+		cachedTokens?: number;
+		cacheWriteTokens?: number;
+	};
+	security?: {
+		commandPolicyBlocks?: number;
+		commandPolicyApprovals?: number;
+		untrustedInputs?: number;
+	};
+	stormedCalls?: number;
+	truncationRepairs?: number;
 	raw?: Record<string, unknown>;
 }
 
@@ -794,6 +860,25 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		}
 	}
 
+	const promptCacheRaw = stats.prompt_cache as Record<string, unknown> | undefined;
+	const promptCache =
+		promptCacheRaw && typeof promptCacheRaw === "object"
+			? {
+					cachedTokens: toNum(promptCacheRaw.cached_tokens),
+					cacheWriteTokens: toNum(promptCacheRaw.cache_write_tokens),
+				}
+			: undefined;
+
+	const securityRaw = stats.security as Record<string, unknown> | undefined;
+	const security =
+		securityRaw && typeof securityRaw === "object"
+			? {
+					commandPolicyBlocks: toNum(securityRaw.command_policy_blocks),
+					commandPolicyApprovals: toNum(securityRaw.command_policy_approvals),
+					untrustedInputs: toNum(securityRaw.untrusted_inputs),
+				}
+			: undefined;
+
 	return {
 		reviewRounds: toNum(stats.review_rounds),
 		outcome,
@@ -815,7 +900,12 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		answer: toStr(result.answer),
 		model: toStr(raw.model),
 		provider: toStr(raw.provider),
+		network: toStr(raw.network),
 		sandbox: summarizeSandbox(raw.sandbox),
+		promptCache,
+		security,
+		stormedCalls: toNum(stats.stormed_calls),
+		truncationRepairs: toNum(stats.truncation_repairs),
 		raw,
 	};
 }
@@ -826,8 +916,19 @@ function summarizeSandbox(raw: unknown): ReportSummary["sandbox"] {
 	const mode = toStr(s.mode);
 	const agentfsVersion = toStr(s.agentfs_version);
 	const diffHint = toStr(s.diff_hint);
-	if (mode === undefined && agentfsVersion === undefined && diffHint === undefined) return undefined;
-	return { mode, agentfsVersion, diffHint };
+	const nonoVersion = toStr(s.nono_version);
+	const nonoProfile = toStr(s.nono_profile);
+	const nonoRollback = typeof s.rollback === "boolean" ? s.rollback : undefined;
+	if (
+		mode === undefined &&
+		agentfsVersion === undefined &&
+		diffHint === undefined &&
+		nonoVersion === undefined &&
+		nonoProfile === undefined &&
+		nonoRollback === undefined
+	)
+		return undefined;
+	return { mode, agentfsVersion, diffHint, nonoVersion, nonoProfile, nonoRollback };
 }
 
 function validateToolCallsByName(
@@ -1780,11 +1881,13 @@ export async function runSingleSwivalAsync(
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
+	const taskFile = path.join(artifactDir, "task.txt");
+	await fs.promises.writeFile(taskFile, task, "utf-8");
 
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
-	args.push("--", task);
+	args.push("--");
 
 	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
 	// opening stderrFd throws, close stdoutFd before propagating. Both are
@@ -2028,17 +2131,18 @@ async function runSingleSwival(
 
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
-	// flag (argv injection). We always emit the separator; swival tolerates
-	// an unused trailing `--`.
-	args.push("--", task);
+	// flag (argv injection). The prompt is piped over stdin to protect it from
+	// process-table snooping (ps aux) and eliminate ARG_MAX limits.
+	args.push("--");
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn("swival", args, {
 				cwd: runCwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 			});
+			proc.stdin?.end(task, "utf-8");
 
 			const stdoutDecoder = new TextDecoder("utf-8");
 			const stderrDecoder = new TextDecoder("utf-8");
@@ -2335,6 +2439,35 @@ const SwivalParams = Type.Object({
 				"Opt in to loading complete AGENTS.md/CLAUDE.md instruction files without truncation. When true, passes --instructions-full and suppresses --no-instructions.",
 		}),
 	),
+	networkOverride: Type.Optional(
+		StringEnum(["full", "provider-only", "none"] as const, {
+			description: "Override network policy: full, provider-only, or none.",
+		}),
+	),
+	nonoRollbackOverride: Type.Optional(
+		Type.Boolean({ description: "Override nono rollback snapshots." }),
+	),
+	nonoBlockNetOverride: Type.Optional(
+		Type.Boolean({ description: "Block all outbound network in nono sandbox." }),
+	),
+	commandMiddlewareOverride: Type.Optional(
+		Type.String({ description: "Command run before each tool command (JSON on stdin -> allow/deny/rewrite)." }),
+	),
+	maxOutputKbOverride: Type.Optional(
+		Type.Number({ description: "Size cap in KB for tool output sent to the model (default 50)." }),
+	),
+	maxOutputLinesOverride: Type.Optional(
+		Type.Number({ description: "Default number of lines returned by file reads (default 2000)." }),
+	),
+	skillsDirOverride: Type.Optional(
+		Type.Array(Type.String(), { description: "Additional directories to scan for Swival skills." }),
+	),
+	shareSkills: Type.Optional(
+		Type.Boolean({ description: "Share ambient Pi skills directories with child Swival processes." }),
+	),
+	subagentsOverride: Type.Optional(
+		Type.Boolean({ description: "Explicitly allow Swival to spawn native subagents (spawn_subagent/check_subagents)." }),
+	),
 	cacheOverride: Type.Optional(Type.Boolean({ description: "Override --cache for this call." })),
 	cacheDirOverride: Type.Optional(Type.String({ description: "Override --cache-dir for this call." })),
 	verifyOverride: Type.Optional(
@@ -2407,6 +2540,15 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		seed: g<number>("seedOverride"),
 		reasoningEffort: g<string>("reasoningEffortOverride"),
 		instructionsFull: g<boolean>("instructionsFullOverride") ?? g<boolean>("instructionsFull"),
+		network: g<"full" | "provider-only" | "none">("networkOverride"),
+		nonoRollback: g<boolean>("nonoRollbackOverride"),
+		nonoBlockNet: g<boolean>("nonoBlockNetOverride"),
+		commandMiddleware: g<string>("commandMiddlewareOverride"),
+		maxOutputKb: g<number>("maxOutputKbOverride"),
+		maxOutputLines: g<number>("maxOutputLinesOverride"),
+		skillsDir: g<string[]>("skillsDirOverride"),
+		shareSkills: g<boolean>("shareSkills"),
+		subagents: g<boolean>("subagentsOverride"),
 		cache: g<boolean>("cacheOverride"),
 		cacheDir: g<string>("cacheDirOverride"),
 		verify: g<string>("verifyOverride"),
@@ -2477,6 +2619,10 @@ function buildHeaderMeta(r: SwivalResult): string {
 	const toolCalls = r.report?.toolCallsTotal;
 	if (typeof toolCalls === "number" && toolCalls > 0) {
 		parts.push(`${toolCalls} tool call${toolCalls === 1 ? "" : "s"}`);
+	}
+	const cachedTokens = r.report?.promptCache?.cachedTokens;
+	if (typeof cachedTokens === "number" && cachedTokens > 0) {
+		parts.push(`${(cachedTokens / 1000).toFixed(1)}k cached`);
 	}
 	if (r.durationMs) parts.push(formatDuration(r.durationMs));
 	parts.push(renderOutcome(r));
@@ -3242,6 +3388,16 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				}
 				if (r.versionAdvisory) {
 					container.addChild(new Text(theme.fg("warning", `⚠ ${r.versionAdvisory}`), 0, 0));
+				}
+				if (r.report?.security?.commandPolicyBlocks) {
+					container.addChild(
+						new Text(theme.fg("warning", `⚠ ${r.report.security.commandPolicyBlocks} command(s) blocked by security policy`), 0, 0),
+					);
+				}
+				if (r.report?.stormedCalls) {
+					container.addChild(
+						new Text(theme.fg("warning", `⚠ ${r.report.stormedCalls} repeat call(s) suppressed by storm breaker`), 0, 0),
+					);
 				}
 				// Per-tool-call progress from trace tailing. Always show a recent
 				// slice while the run is in flight so Pi's UI has something live.
