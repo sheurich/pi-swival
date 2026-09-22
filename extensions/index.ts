@@ -1100,7 +1100,7 @@ export function classifyFailure(
 	if (/e2big|argument list too long|exec.*failed/i.test(tail))
 		return {
 			code: "config_error",
-			text: "System prompt too large (ARG_MAX). Trim the agent body or move content into skills.",
+			text: "Arguments too large (ARG_MAX): trim the task prompt or agent body, or set `sandbox: builtin` to pipe the task over stdin.",
 		};
 	return undefined;
 }
@@ -1607,7 +1607,7 @@ export async function persistArtifacts(
 
 	let captured = false;
 	try {
-		await fs.promises.mkdir(destDir, { recursive: true });
+		await fs.promises.mkdir(destDir, { recursive: true, mode: 0o700 });
 	} catch {
 		return undefined;
 	}
@@ -1627,7 +1627,7 @@ export async function persistArtifacts(
 		const entries = await fs.promises.readdir(traceSrc);
 		if (entries.length > 0) {
 			const destTrace = path.join(destDir, "trace");
-			await fs.promises.mkdir(destTrace, { recursive: true });
+			await fs.promises.mkdir(destTrace, { recursive: true, mode: 0o700 });
 			for (const name of entries) {
 				try {
 					await fs.promises.copyFile(path.join(traceSrc, name), path.join(destTrace, name));
@@ -1890,7 +1890,7 @@ export async function runSingleSwivalAsync(
 	// millisecond collisions) and the directory format matches persistArtifacts.
 	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
 	const traceDir = path.join(artifactDir, "trace");
-	await fs.promises.mkdir(traceDir, { recursive: true });
+	await fs.promises.mkdir(traceDir, { recursive: true, mode: 0o700 });
 
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
@@ -2068,7 +2068,7 @@ async function runSingleSwival(
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
 	const traceDir = path.join(tmpDir, "trace");
-	await fs.promises.mkdir(traceDir, { recursive: true });
+	await fs.promises.mkdir(traceDir, { recursive: true, mode: 0o700 });
 
 	const current: SwivalResult = {
 		agent: agent.name,

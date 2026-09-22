@@ -263,7 +263,9 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			agentConfig.commandMiddleware = undefined;
 			agentConfig.nonoProfile = undefined;
 			agentConfig.skillsDir = undefined;
-			agentConfig.network = undefined;
+			// Clamp instead of strip: de-escalating network policy ("none"/"provider-only")
+			// is safe to keep; only "full" (or unset, which defaults to full) is escalation.
+			if (agentConfig.network === "full") agentConfig.network = undefined;
 			agentConfig.nonoAllowDomain = undefined;
 			// Force sandbox for project agents that don't specify a safe sandbox
 			if (!agentConfig.sandbox || agentConfig.sandbox === "builtin") {

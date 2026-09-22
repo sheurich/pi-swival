@@ -37,11 +37,11 @@ let stdinFd = "ignore";
 // Only pipe task.txt if the task was not already provided on argv
 const lastDashDash = swivalArgs.lastIndexOf("--");
 const hasArgvTask = lastDashDash !== -1 && lastDashDash < swivalArgs.length - 1;
-if (!hasArgvTask && fs.existsSync(taskFile)) {
+if (!hasArgvTask) {
 	try {
 		stdinFd = fs.openSync(taskFile, "r");
 	} catch {
-		stdinFd = "ignore";
+		/* no task file: stdin stays ignored */
 	}
 }
 

@@ -331,6 +331,12 @@ describe("classifyFailure", () => {
 		expect(res?.code).toBe("config_error");
 		expect(res?.text).toMatch(/function calling/i);
 	});
+
+	it("classifies E2BIG / argument list too long with escape hatch advice", () => {
+		const res = classifyFailure(["exec: argument list too long"]);
+		expect(res?.code).toBe("config_error");
+		expect(res?.text).toMatch(/sandbox: builtin/);
+	});
 });
 
 describe("isRunFailure", () => {

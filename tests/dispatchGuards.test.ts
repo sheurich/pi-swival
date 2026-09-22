@@ -281,4 +281,22 @@ describe("project agent sanitization", () => {
 			fs.rmSync(tmp, { recursive: true, force: true });
 		}
 	});
+
+	it("preserves de-escalating network: provider-only on project agents", () => {
+		const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-project-agent-network-")));
+		try {
+			const projectDir = path.join(tmp, ".pi", "swival-agents");
+			fs.mkdirSync(projectDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(projectDir, "restricted.md"),
+				["---", "name: restricted", "description: test", "network: provider-only", "---", "Prompt"].join("\n"),
+			);
+			const discovery = discoverSwivalAgents(tmp, "project");
+			const agent = discovery.agents.find((a) => a.name === "restricted");
+			expect(agent).toBeDefined();
+			expect(agent?.network).toBe("provider-only");
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
+	});
 });

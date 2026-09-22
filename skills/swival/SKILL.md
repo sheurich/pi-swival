@@ -169,6 +169,8 @@ files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
 noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS runs
+nonoRollback: true                # nono only: atomic rollback snapshots
+network: provider-only            # full | provider-only | none
 
 # Nested-invocation hygiene (defaults: all true)
 noInstructions: true
@@ -271,7 +273,7 @@ AgentFS overlay does not merge back automatically. Inspect with
 
 ### Task prompt delivery
 
-Only runs that explicitly set `sandbox: builtin` pipe the task over standard input rather than passing it on command-line arguments. This keeps task text out of operating-system process tables (`ps aux`) and avoids kernel `ARG_MAX` length limitations. Every other run, including sandbox-less ones, passes the task on the command line because ambient configuration (`~/.config/swival/config.toml` or `swival.toml`) may enable a re-executing sandbox (AgentFS or nono).
+Swival receives the task on the command line unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input instead (keeping it out of `ps aux` and clear of `ARG_MAX`). The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) may enable a re-executing sandbox (AgentFS or nono).
 
 ### Secret encryption
 
