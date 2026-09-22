@@ -287,6 +287,12 @@ export function isAgentFsRequested(args: readonly string[]): boolean {
 	return lastCliOptionValue(args, "--sandbox") === "agentfs";
 }
 
+/** Derive whether a sandbox requiring process re-exec (AgentFS or nono) is requested. */
+export function isReexecSandboxRequested(args: readonly string[]): boolean {
+	const mode = lastCliOptionValue(args, "--sandbox");
+	return mode === "agentfs" || mode === "nono";
+}
+
 /**
  * Enforce bootstrap evidence when consuming a completed async report. The
  * persisted value covers CLI intent; report.sandbox.mode also covers AgentFS
@@ -1887,7 +1893,12 @@ export async function runSingleSwivalAsync(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
-	args.push("--");
+	const isReexec = isReexecSandboxRequested(args);
+	if (isReexec) {
+		args.push("--", task);
+	} else {
+		args.push("--");
+	}
 
 	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
 	// opening stderrFd throws, close stdoutFd before propagating. Both are
@@ -2131,18 +2142,29 @@ async function runSingleSwival(
 
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
-	// flag (argv injection). The prompt is piped over stdin to protect it from
-	// process-table snooping (ps aux) and eliminate ARG_MAX limits.
-	args.push("--");
+	// flag (argv injection).
+	// Swival's AgentFS and nono sandboxes re-exec from sys.argv and read stdin
+	// to EOF before re-exec, so re-exec sandboxes require the task on argv.
+	// For unsandboxed and builtin runs, the task is piped over stdin to protect
+	// it from process-table snooping (ps aux) and eliminate ARG_MAX limits.
+	const isReexec = isReexecSandboxRequested(args);
+	if (isReexec) {
+		args.push("--", task);
+	} else {
+		args.push("--");
+	}
 
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn("swival", args, {
 				cwd: runCwd,
 				shell: false,
-				stdio: ["pipe", "pipe", "pipe"],
+				stdio: [isReexec ? "ignore" : "pipe", "pipe", "pipe"],
 			});
-			proc.stdin?.end(task, "utf-8");
+			if (!isReexec) {
+				proc.stdin?.on("error", () => { /* child exited before reading prompt */ });
+				proc.stdin?.end(task, "utf-8");
+			}
 
 			const stdoutDecoder = new TextDecoder("utf-8");
 			const stderrDecoder = new TextDecoder("utf-8");

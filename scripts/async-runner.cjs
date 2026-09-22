@@ -34,7 +34,9 @@ function finish(exitCode, spawnError) {
 
 const taskFile = path.join(artifactDir, "task.txt");
 let stdinFd = "ignore";
-if (fs.existsSync(taskFile)) {
+// Only pipe task.txt if the task was not already provided on argv
+const hasArgvTask = swivalArgs.includes("--") && swivalArgs.indexOf("--") < swivalArgs.length - 1;
+if (!hasArgvTask && fs.existsSync(taskFile)) {
 	try {
 		stdinFd = fs.openSync(taskFile, "r");
 	} catch {

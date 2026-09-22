@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -480,5 +480,19 @@ describe("buildSwivalArgs", () => {
 		);
 		expect(args).toContain("--subagents");
 		expect(args).not.toContain("--no-subagents");
+	});
+
+	it("detects re-exec sandboxes (agentfs and nono) via isReexecSandboxRequested", () => {
+		const agentFsArgs = buildSwivalArgs(makeAgent({ sandbox: "agentfs" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(agentFsArgs)).toBe(true);
+
+		const nonoArgs = buildSwivalArgs(makeAgent({ sandbox: "nono" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(nonoArgs)).toBe(true);
+
+		const builtinArgs = buildSwivalArgs(makeAgent({ sandbox: "builtin" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(builtinArgs)).toBe(false);
+
+		const defaultArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(defaultArgs)).toBe(false);
 	});
 });
