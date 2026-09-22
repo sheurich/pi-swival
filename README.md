@@ -58,8 +58,8 @@ Key features beyond pi's example subagent extension:
 - Network policy (`network: provider-only`, `network: none`).
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
-- Standard input task delivery (protects prompts from `ps aux` and bypasses `ARG_MAX` on builtin runs).
-- Operational telemetry (prompt cache token savings, security policy blocks, and storm suppressions).
+- Standard input task delivery (protects prompts from `ps aux` and bypasses `ARG_MAX` when `sandbox: builtin` is configured).
+- Operational telemetry (prompt cache token savings, security policy blocks, and storm breaker suppressions).
 - Async / background runs with cross-session `status` / `resume` / `interrupt`.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
@@ -155,7 +155,7 @@ Pi does not ship a subagent tool by default. The closest reference points are th
 
 | Feature                   | example `subagent`    | `swival-subagent`     |
 |---------------------------|-----------------------|-----------------------|
-| Live tool streaming       | yes (`--mode json`)   | yes (`--trace-dir` watcher) |
+| Live tool streaming       | yes (`--mode json`)   | yes (`--trace-dir` watcher, throttled) |
 | Reviewer loop             | no                    | yes                   |
 | Test-as-contract          | no                    | yes                   |
 | Sandboxing                | no                    | yes (AgentFS + nono)  |
@@ -170,8 +170,8 @@ Use the example subagent (or a third-party equivalent) when fine-grained tool-ca
 ## Known limitations
 
 - Per-tool-call streaming tails Swival's `--trace-dir` JSONL output and may lag on filesystems with weak `fs.watch` semantics.
-- Swival receives the task on command-line arguments unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input (keeping it out of `ps aux` and clear of `ARG_MAX`; unavailable to project-scope agents, which are upgraded to `agentfs`). The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) can enable a re-executing sandbox (AgentFS or nono).
-- The agent system prompt body is always passed as `--system-prompt` command-line arguments. Large bodies can hit platform `ARG_MAX` even under `sandbox: builtin`; split long guidance into a skills directory passed via `extraArgs` instead.
+- Swival receives the task on command-line arguments unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input (keeping it out of `ps aux` and clear of `ARG_MAX`). Project-scope agents cannot use standard input delivery because they are upgraded to `agentfs`. The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) can enable a re-executing sandbox (AgentFS or nono).
+- The agent system prompt body is always passed as `--system-prompt` command-line arguments. Large bodies can hit platform `ARG_MAX` even under `sandbox: builtin`; split long guidance into a skills directory passed via `skillsDir` (or `skillsDirOverride` at dispatch) instead.
 - Parallel tasks share the host working tree (no git worktree isolation). Tasks that mutate overlapping files must be dispatched serially or run with per-task `cwd` pointing at pre-created worktrees.
 - `async: true` is single-mode only. Parallel and chain modes always run synchronously.
 - Artifact directories under `~/.pi/agent/swival-artifacts/` are auto-pruned at 7 days. Back up reports you need longer.
