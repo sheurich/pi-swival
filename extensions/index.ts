@@ -487,11 +487,11 @@ export function buildSwivalArgs(
 	if (agent.noMemory !== false) args.push("--no-memory");
 
 	// Native subagents opt-in: default to --no-subagents to prevent unmonitored
-	// recursion inside Pi, but allow explicit subagents=true opt-in.
-	const allowSubagents = overrides.subagents ?? agent.subagents ?? false;
-	if (allowSubagents) {
+	// recursion inside Pi, but allow explicit subagents=true opt-in. An explicit
+	// false override outranks an agent's legacy noSubagents=false.
+	if (overrides.subagents === true || (overrides.subagents === undefined && agent.subagents === true)) {
 		args.push("--subagents");
-	} else if (agent.noSubagents !== false) {
+	} else if (overrides.subagents === false || agent.noSubagents !== false) {
 		args.push("--no-subagents");
 	}
 
@@ -575,11 +575,13 @@ export function buildSwivalArgs(
 	// Output budgeting
 	const maxOutputKb = overrides.maxOutputKb ?? agent.maxOutputKb;
 	if (typeof maxOutputKb === "number" && Number.isFinite(maxOutputKb) && maxOutputKb > 0) {
-		args.push("--max-output-kb", String(Math.trunc(maxOutputKb)));
+		const truncated = Math.trunc(maxOutputKb);
+		if (truncated >= 1) args.push("--max-output-kb", String(truncated));
 	}
 	const maxOutputLines = overrides.maxOutputLines ?? agent.maxOutputLines;
 	if (typeof maxOutputLines === "number" && Number.isFinite(maxOutputLines) && maxOutputLines > 0) {
-		args.push("--max-output-lines", String(Math.trunc(maxOutputLines)));
+		const truncated = Math.trunc(maxOutputLines);
+		if (truncated >= 1) args.push("--max-output-lines", String(truncated));
 	}
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);

@@ -499,7 +499,7 @@ describe("buildSwivalArgs", () => {
 		expect(isReexecSandboxRequested(builtinArgs)).toBe(false);
 	});
 
-	it("truncates non-integer maxOutputKb and maxOutputLines", () => {
+	it("truncates non-integer maxOutputKb and maxOutputLines and skips values below 1", () => {
 		const args = buildSwivalArgs(
 			makeAgent({ maxOutputKb: 50.7, maxOutputLines: 2000.9 }),
 			"/tmp/r.json",
@@ -509,5 +509,24 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("50.7");
 		expect(args).toContain("2000");
 		expect(args).not.toContain("2000.9");
+
+		const subOneArgs = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 0.5, maxOutputLines: 0.9 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(subOneArgs).not.toContain("--max-output-kb");
+		expect(subOneArgs).not.toContain("--max-output-lines");
+	});
+
+	it("honors false subagent override over agent noSubagents: false", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ noSubagents: false }),
+			"/tmp/r.json",
+			"/cwd",
+			{ subagents: false },
+		);
+		expect(args).toContain("--no-subagents");
+		expect(args).not.toContain("--subagents");
 	});
 });
