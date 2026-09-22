@@ -71,7 +71,7 @@ See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for
 |-------|-----|
 | `swival` | Drive swival from any Pi agent — dispatch examples, agent authoring, capabilities reference, troubleshooting. |
 | `auditing-with-swival` | Run a reproducible multi-bucket security audit over a codebase. Three stages with structured output contracts. |
-| `swival-worker-briefs` | Draft precise, verifiable task briefs for `self-review-worker` delegations. |
+| `swival-worker-briefs` | Draft precise, verifiable task briefs for `self-review-worker` dispatches. |
 
 ### Prompts
 
@@ -132,7 +132,7 @@ From the package root:
 ```bash
 npm test       # vitest only
 npm run smoke  # manifest + frontmatter + pi-load checks
-npm run ci     # smoke + vitest (mirrors CI)
+npm run ci     # smoke + agentfs canary + vitest
 ```
 
 The smoke test runs in under a second and validates: every path declared in `package.json#pi` resolves, every bundled agent has sane frontmatter, and `pi -e` loads the package without printing extension errors. It does not need an LLM provider — useful for clean CI runners.

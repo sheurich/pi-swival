@@ -1,8 +1,8 @@
 ---
 name: swival-worker-briefs
 description: >-
-  Write precise task briefs for Swival self-review worker dispatches. Use when
-  dispatching self-review-worker for implementation, file edits, generated
+  Write precise task briefs for `self-review-worker` dispatches. Use when
+  dispatching `self-review-worker` for implementation, file edits, generated
   artifacts, or other work that should pass through Swival's self-review loop.
 ---
 
@@ -18,7 +18,7 @@ The agent defaults to `maxReviewRounds: 5` and runs with `--no-instructions` and
 
 ## Brief structure
 
-Every task brief should include five elements:
+Every task brief should include five core elements plus an evidence requirement:
 
 1. Goal: one sentence defining the required result.
 2. Scope: files, directories, or artifacts the worker may change.
@@ -86,12 +86,26 @@ swival-subagent with tasks: [
   {
     agent: "self-review-worker",
     cwd: ".worktrees/worker-a",
-    task: "Goal: Refactor auth parsing. Scope: auth/*.go. Constraints: keep public API. Validation: run `go test ./auth/...`. Done when: tests pass. Final answer must include changed files, commands run, and validation output."
+    task: [
+      "Goal: Refactor auth parsing.",
+      "Scope: change only auth/*.go.",
+      "Constraints: keep public API.",
+      "Validation: run `go test ./auth/...`.",
+      "Done when: tests pass.",
+      "Final answer must include changed files, commands run, validation output, and residual risks."
+    ].join("\n")
   },
   {
     agent: "self-review-worker",
     cwd: ".worktrees/worker-b",
-    task: "Goal: Add parser error tests. Scope: parser tests. Constraints: no production edits. Validation: run `go test ./parser/...`. Done when: tests pass. Final answer must include changed files, commands run, and validation output."
+    task: [
+      "Goal: Add parser error tests.",
+      "Scope: change only parser tests.",
+      "Constraints: no production edits.",
+      "Validation: run `go test ./parser/...`.",
+      "Done when: tests pass.",
+      "Final answer must include changed files, commands run, validation output, and residual risks."
+    ].join("\n")
   }
 ]
 ```
