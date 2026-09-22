@@ -2,6 +2,7 @@
 name: sandboxed-explorer
 description: Runs swival inside an AgentFS overlay so writes hit a per-session SQLite-backed sandbox instead of real files. Use for tasks where you want to see what the agent would do without committing to the changes. Inspect the overlay afterward with `agentfs diff <session-id>`.
 sandbox: agentfs
+noSandboxAutoSession: true
 selfReview: true
 files: some
 commands: all
