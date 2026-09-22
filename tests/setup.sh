@@ -12,7 +12,7 @@ fi
 
 # 1. Install vitest locally.
 if [[ ! -d node_modules/vitest ]]; then
-	npm install --silent --ignore-scripts
+	npm install --ignore-scripts --no-audit --no-fund
 fi
 
 # 2. Find the Pi install so we can symlink the peer packages the extension
@@ -33,6 +33,8 @@ for candidate in \
 		break
 	fi
 done
+
+echo "setup.sh: npm_global_root='${npm_global_root}', PI_PKG='${PI_PKG}'"
 
 if [[ -z "$PI_PKG" ]]; then
 	echo "error: could not locate pi-coding-agent (@earendil-works or @mariozechner); install Pi first." >&2
