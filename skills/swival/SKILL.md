@@ -100,11 +100,12 @@ swival-subagent with tasks: [
 
 Fresh worktrees track committed files only. Untracked dependencies (`node_modules`, `.venv`, `.env`) must be installed or linked before running builds or tests. Worktrees isolate concurrent writes against race conditions, but share `.git` configuration and hooks with the host repository.
 
-After tasks finish, merge branches and clean up worktrees:
+After tasks finish, commit any uncommitted changes in each worktree, merge the branches, and remove the worktrees:
 
 ```bash
-git worktree remove --force .worktrees/worker-a && git branch -D worker-a
-git worktree remove --force .worktrees/worker-b && git branch -D worker-b
+git -C .worktrees/worker-a commit -am "Implement API"
+git merge worker-a
+git worktree remove .worktrees/worker-a && git branch -d worker-a
 ```
 
 Chain (each step gets prior step's output as `{previous}`):
