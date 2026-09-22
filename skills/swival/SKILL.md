@@ -14,7 +14,7 @@ description: >-
 Tracked against Swival 1.0.44.
 
 Swival is a coding agent with a built-in reviewer loop, layered
-sandboxing (builtin + AgentFS), format-preserving secret
+sandboxing (builtin + AgentFS + nono), format-preserving secret
 encryption, outbound request filtering, and A2A orchestration.
 Access it from Pi via the `swival-subagent` tool.
 
@@ -132,6 +132,15 @@ definition:
 | `seedOverride` | Deterministic seed |
 | `reasoningEffortOverride` | Reasoning effort level |
 | `instructionsFullOverride` | Opt in to full instructions without truncation |
+| `networkOverride` | Network policy (`full`, `provider-only`, `none`) |
+| `nonoRollbackOverride` | Enable nono atomic rollback snapshots |
+| `nonoBlockNetOverride` | Block all outbound network under nono sandbox |
+| `commandMiddlewareOverride` | Command run before each tool command |
+| `maxOutputKbOverride` | Size cap in KB for tool output |
+| `maxOutputLinesOverride` | Line cap for file reads |
+| `skillsDirOverride` | Additional directories to scan for skills |
+| `shareSkills` | Share ambient Pi skills with Swival |
+| `subagentsOverride` | Allow Swival to spawn native subagents |
 | `cacheOverride` | Enable LLM response caching |
 | `cacheDirOverride` | Cache directory |
 
@@ -155,11 +164,13 @@ maxReviewRounds: 5                # round budget
 requiresReviewer: true            # dispatcher refuses to spawn without a reviewer
 
 # Sandbox / commands
-sandbox: agentfs                  # builtin | agentfs
+sandbox: agentfs                  # builtin | agentfs | nono
 files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
 noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS runs
+nonoRollback: true                # nono only: atomic rollback snapshots
+network: provider-only            # full | provider-only | none
 
 # Nested-invocation hygiene (defaults: all true)
 noInstructions: true
@@ -251,6 +262,7 @@ Self-review and `--reviewer` are mutually exclusive.
 | `files: all` | Unrestricted |
 | `files: none` | Only `.swival/` accessible |
 | `sandbox: agentfs` | OS-enforced overlay; writes hit SQLite, not real FS |
+| `sandbox: nono` | OS-enforced Landlock (Linux) / Seatbelt (macOS) with rollback and network blocking |
 
 The read-before-write guard prevents overwriting unread files.
 Disable with `noReadGuard: true` for agents that create files
@@ -258,6 +270,10 @@ from scratch.
 
 AgentFS overlay does not merge back automatically. Inspect with
 `agentfs diff <session-id>` and apply manually.
+
+### Task prompt delivery
+
+Swival receives the task on the command line unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input instead (keeping it out of `ps aux` and clear of `ARG_MAX`). The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) may enable a re-executing sandbox (AgentFS or nono).
 
 ### Secret encryption
 

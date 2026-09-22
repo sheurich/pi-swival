@@ -32,8 +32,21 @@ function finish(exitCode, spawnError) {
 	process.exitCode = exitCode ?? 127;
 }
 
+const taskFile = path.join(artifactDir, "task.txt");
+let stdinFd = "ignore";
+// Only pipe task.txt if the task was not already provided on argv
+const lastDashDash = swivalArgs.lastIndexOf("--");
+const hasArgvTask = lastDashDash !== -1 && lastDashDash < swivalArgs.length - 1;
+if (!hasArgvTask) {
+	try {
+		stdinFd = fs.openSync(taskFile, "r");
+	} catch {
+		/* no task file: stdin stays ignored */
+	}
+}
+
 const child = spawn("swival", swivalArgs, {
-	stdio: "inherit",
+	stdio: [stdinFd, "inherit", "inherit"],
 });
 
 child.once("error", (error) => {

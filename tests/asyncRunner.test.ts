@@ -140,4 +140,28 @@ describe("durable async runner", () => {
 			exitCode: null,
 		});
 	});
+
+	it("pipes task.txt over stdin when task is omitted from argv", () => {
+		const root = makeTmp("pi-swival-async-stdin-");
+		const bin = path.join(root, "bin");
+		const artifacts = path.join(root, "artifacts");
+		fs.mkdirSync(bin);
+		fs.mkdirSync(artifacts);
+		fs.writeFileSync(path.join(artifacts, "task.txt"), "hello from stdin task");
+		const receivedFile = path.join(artifacts, "received.txt");
+		const fakeSwival = path.join(bin, "swival");
+		fs.writeFileSync(
+			fakeSwival,
+			`#!/bin/sh\ncat > "${receivedFile}"\nexit 0\n`,
+			{ mode: 0o755 },
+		);
+
+		const result = spawnSync(process.execPath, [runner, artifacts, "--no-color", "--"], {
+			env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` },
+			encoding: "utf-8",
+		});
+
+		expect(result.status).toBe(0);
+		expect(fs.readFileSync(receivedFile, "utf-8")).toBe("hello from stdin task");
+	});
 });

@@ -57,6 +57,40 @@ describe("summarizeReport", () => {
 		expect(s.toolCallsTotal).toBe(5);
 	});
 
+	it("extracts prompt_cache, security stats, nono sandbox, and network mode", () => {
+		const s = summarizeReport({
+			network: "provider-only",
+			sandbox: {
+				mode: "nono",
+				nono_version: "0.4.1",
+				nono_profile: "strict",
+				rollback: true,
+			},
+			result: { outcome: "success", exit_code: 0 },
+			stats: {
+				prompt_cache: {
+					cached_tokens: 12500,
+					cache_write_tokens: 3000,
+				},
+				security: {
+					command_policy_blocks: 2,
+					command_policy_approvals: 5,
+					untrusted_inputs: 1,
+				},
+				stormed_calls: 3,
+				truncation_repairs: 1,
+			},
+		});
+		expect(s.network).toBe("provider-only");
+		expect(s.sandbox?.mode).toBe("nono");
+		expect(s.sandbox?.nonoVersion).toBe("0.4.1");
+		expect(s.sandbox?.nonoRollback).toBe(true);
+		expect(s.promptCache?.cachedTokens).toBe(12500);
+		expect(s.security?.commandPolicyBlocks).toBe(2);
+		expect(s.stormedCalls).toBe(3);
+		expect(s.truncationRepairs).toBe(1);
+	});
+
 	it("tolerates a completely empty report object", () => {
 		const s = summarizeReport({});
 		expect(s.outcome).toBe("unknown");
@@ -296,6 +330,12 @@ describe("classifyFailure", () => {
 		]);
 		expect(res?.code).toBe("config_error");
 		expect(res?.text).toMatch(/function calling/i);
+	});
+
+	it("classifies E2BIG / argument list too long with escape hatch advice", () => {
+		const res = classifyFailure(["exec: argument list too long"]);
+		expect(res?.code).toBe("config_error");
+		expect(res?.text).toMatch(/sandbox: builtin/);
 	});
 });
 

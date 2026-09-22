@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -411,5 +411,122 @@ describe("buildSwivalArgs", () => {
 		);
 		expect(args).toContain("--no-instructions");
 		expect(args).not.toContain("--instructions-full");
+	});
+
+	it("passes nono sandbox and network isolation options", () => {
+		const args = buildSwivalArgs(
+			makeAgent({
+				sandbox: "nono",
+				nonoProfile: "strict",
+				nonoRollback: true,
+				nonoBlockNet: true,
+				nonoAllowDomain: ["api.example.com", "auth.example.com"],
+				network: "provider-only",
+			}),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--sandbox");
+		expect(args).toContain("nono");
+		expect(args).toContain("--nono-profile");
+		expect(args).toContain("strict");
+		expect(args).toContain("--nono-rollback");
+		expect(args).toContain("--nono-block-net");
+		expect(args).toContain("--nono-allow-domain");
+		expect(args).toContain("api.example.com");
+		expect(args).toContain("--network");
+		expect(args).toContain("provider-only");
+	});
+
+	it("passes command middleware", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ commandMiddleware: "rtk proxy" }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--command-middleware");
+		expect(args).toContain("rtk proxy");
+	});
+
+	it("passes maxOutputKb and maxOutputLines", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 100, maxOutputLines: 5000 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--max-output-kb");
+		expect(args).toContain("100");
+		expect(args).toContain("--max-output-lines");
+		expect(args).toContain("5000");
+	});
+
+	it("passes skillsDir and ambient skill sharing", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ skillsDir: ["/extra/skills"] }),
+			"/tmp/r.json",
+			"/cwd",
+			{ shareSkills: true },
+		);
+		expect(args).toContain("--skills-dir");
+		expect(args).toContain("/extra/skills");
+	});
+
+	it("allows explicit subagents opt-in to emit --subagents and omit --no-subagents", () => {
+		const args = buildSwivalArgs(
+			makeAgent(),
+			"/tmp/r.json",
+			"/cwd",
+			{ subagents: true },
+		);
+		expect(args).toContain("--subagents");
+		expect(args).not.toContain("--no-subagents");
+	});
+
+	it("conservatively treats unknown or re-exec sandboxes as requiring argv task delivery", () => {
+		const agentFsArgs = buildSwivalArgs(makeAgent({ sandbox: "agentfs" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(agentFsArgs)).toBe(true);
+
+		const nonoArgs = buildSwivalArgs(makeAgent({ sandbox: "nono" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(nonoArgs)).toBe(true);
+
+		// Omitted sandbox is conservatively treated as potential re-exec because ambient
+		// config (config.toml / swival.toml) may set sandbox = "agentfs"
+		const defaultArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(defaultArgs)).toBe(true);
+
+		// Only explicitly configured builtin sandbox is known not to re-exec
+		const builtinArgs = buildSwivalArgs(makeAgent({ sandbox: "builtin" }), "/tmp/r.json", "/cwd");
+		expect(isReexecSandboxRequested(builtinArgs)).toBe(false);
+	});
+
+	it("truncates non-integer maxOutputKb and maxOutputLines and skips values below 1", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 50.7, maxOutputLines: 2000.9 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("50");
+		expect(args).not.toContain("50.7");
+		expect(args).toContain("2000");
+		expect(args).not.toContain("2000.9");
+
+		const subOneArgs = buildSwivalArgs(
+			makeAgent({ maxOutputKb: 0.5, maxOutputLines: 0.9 }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(subOneArgs).not.toContain("--max-output-kb");
+		expect(subOneArgs).not.toContain("--max-output-lines");
+	});
+
+	it("honors false subagent override over agent noSubagents: false", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ noSubagents: false }),
+			"/tmp/r.json",
+			"/cwd",
+			{ subagents: false },
+		);
+		expect(args).toContain("--no-subagents");
+		expect(args).not.toContain("--subagents");
 	});
 });
