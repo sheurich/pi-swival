@@ -60,22 +60,21 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent({ sandbox: "agentfs" }))).toBe(true);
 	});
 
-	it("clears noSubagents: false on project-local agents to prevent privilege escalation", () => {
-		const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-project-agent-")));
-		try {
-			const projectDir = path.join(tmp, ".pi", "swival-agents");
-			fs.mkdirSync(projectDir, { recursive: true });
-			fs.writeFileSync(
-				path.join(projectDir, "custom.md"),
-				"---\nname: custom\ndescription: test\nnoSubagents: false\n---\nPrompt",
-			);
-			const discovery = discoverSwivalAgents(tmp, "project");
-			const agent = discovery.agents.find((a) => a.name === "custom");
-			expect(agent).toBeDefined();
-			expect(agent?.noSubagents).toBeUndefined();
-		} finally {
-			fs.rmSync(tmp, { recursive: true, force: true });
-		}
+	it("treats typed and extraArgs named AgentFS sessions as shared overlays", () => {
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				sandbox: "agentfs",
+				noSandboxAutoSession: true,
+				sandboxSession: "shared-session",
+			})),
+		).toBe(true);
+		expect(
+			isMutatingCwdAgent(makeAgent({
+				sandbox: "agentfs",
+				noSandboxAutoSession: true,
+				extraArgs: ["--sandbox-session=shared-session"],
+			})),
+		).toBe(true);
 	});
 
 	it("returns true when noSandboxAutoSession is set without an agentfs sandbox", () => {
@@ -238,5 +237,25 @@ describe("unknownAgentMessage", () => {
 		expect(unknownAgentMessage("explorer", [])).toBe(
 			'Unknown swival agent: "explorer". Available: none',
 		);
+	});
+});
+
+describe("project agent sanitization", () => {
+	it("clears noSubagents: false on project-local agents to prevent privilege escalation", () => {
+		const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-project-agent-")));
+		try {
+			const projectDir = path.join(tmp, ".pi", "swival-agents");
+			fs.mkdirSync(projectDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(projectDir, "custom.md"),
+				"---\nname: custom\ndescription: test\nnoSubagents: false\n---\nPrompt",
+			);
+			const discovery = discoverSwivalAgents(tmp, "project");
+			const agent = discovery.agents.find((a) => a.name === "custom");
+			expect(agent).toBeDefined();
+			expect(agent?.noSubagents).toBeUndefined();
+		} finally {
+			fs.rmSync(tmp, { recursive: true, force: true });
+		}
 	});
 });

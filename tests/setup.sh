@@ -34,8 +34,6 @@ for candidate in \
 	fi
 done
 
-echo "setup.sh: npm_global_root='${npm_global_root}', PI_PKG='${PI_PKG}'"
-
 if [[ -z "$PI_PKG" ]]; then
 	echo "error: could not locate pi-coding-agent (@earendil-works or @mariozechner); install Pi first." >&2
 	exit 1

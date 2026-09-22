@@ -289,6 +289,14 @@ describe("classifyFailure", () => {
 			]),
 		).toBeUndefined();
 	});
+
+	it("falls back to stderr patterns for ToolsNotSupportedError", () => {
+		const res = classifyFailure([
+			"Error: ToolsNotSupportedError: model does not support chat completions with tools",
+		]);
+		expect(res?.code).toBe("config_error");
+		expect(res?.text).toMatch(/function calling/i);
+	});
 });
 
 describe("isRunFailure", () => {
@@ -312,6 +320,12 @@ describe("isRunFailure", () => {
 	it("treats outcome=interrupted as failure", () => {
 		expect(isRunFailure({ exitCode: 0, report: { outcome: "interrupted" } })).toBe(true);
 		expect(isRunFailure({ exitCode: 130, report: { outcome: "interrupted" } })).toBe(true);
+	});
+
+	it("fails closed for exit=0 with a missing or unknown report", () => {
+		expect(isRunFailure({ exitCode: 0 })).toBe(true);
+		expect(isRunFailure({ exitCode: 0, report: {} })).toBe(true);
+		expect(isRunFailure({ exitCode: 0, report: { outcome: "unknown" } })).toBe(true);
 	});
 });
 

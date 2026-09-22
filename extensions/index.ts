@@ -737,6 +737,8 @@ export interface SwivalResult {
 	// Undefined means swival's built-in default (100) was used. Surfaced
 	// in the header as "N/M turns" when a non-default limit was configured.
 	effectiveMaxTurns?: number;
+	// Advisory message when installed Swival is outdated (< 1.0.44).
+	versionAdvisory?: string;
 	// Set when the caller asked for per-task file output in parallel mode.
 	// `outputPath` is the absolute path we wrote finalOutput to; `outputMode`
 	// mirrors the TaskItem setting so consumers can decide whether to inline
@@ -955,16 +957,22 @@ export function classifyFailure(
 			code: "context_overflow",
 			text: "Context window exceeded (swival could not recover after truncation retries).",
 		};
-	if (/the instruction files are too large|instruction.*(?:too large|fit this setup|read limit)|instructionloaderror/i.test(tail))
-		return {
-			code: "config_error",
-			text: tail.split("\n").filter((l) => l.trim()).find((l) => /instruction/i.test(l)) ?? "Instruction files too large for setup.",
-		};
-	if (/some instruction files could not be read/i.test(tail))
-		return {
-			code: "config_error",
-			text: tail.split("\n").filter((l) => l.trim()).find((l) => /instruction/i.test(l)) ?? "Some instruction files could not be read.",
-		};
+	if (/the instruction files are too large|instruction.*(?:too large|fit this setup|read limit)|instructionloaderror/i.test(tail)) {
+		const lines = tail.split("\n").filter((l) => l.trim());
+		const text = lines.find((l) => /too large|fit this setup|read limit|instructionloaderror/i.test(l))
+			?? lines.find((l) => /instruction/i.test(l))
+			?? "Instruction files too large for setup.";
+		return { code: "config_error", text };
+	}
+	if (/some instruction files could not be read/i.test(tail)) {
+		const lines = tail.split("\n").filter((l) => l.trim());
+		const text = lines.find((l) => /could not be read/i.test(l))
+			?? lines.find((l) => /instruction/i.test(l))
+			?? "Some instruction files could not be read.";
+		return { code: "config_error", text };
+	}
+	if (/^\s*(?:fmt\.warning:\s*)?interrupted\.$|keyboardinterrupt/im.test(tail))
+		return { code: "non_zero_exit", text: "Swival execution was interrupted (SIGINT / exit 130)." };
 	if (/toolsnotsupportederror|does not support function calling|does not support chat completions with tools/i.test(tail))
 		return { code: "config_error", text: "Model does not support function calling." };
 	if (/lifecycleerror|lifecycle.*hook failed/i.test(tail))
@@ -1193,10 +1201,12 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 }
 
 let cachedVersionCheck: { check: SwivalVersionCheck; timestamp: number } | null = null;
+let inFlightVersionCheck: Promise<SwivalVersionCheck> | null = null;
 const VERSION_CACHE_TTL_MS = 60_000;
 
 export function resetSwivalVersionCache(): void {
 	cachedVersionCheck = null;
+	inFlightVersionCheck = null;
 }
 
 export async function preflightSwivalVersion(
@@ -1206,38 +1216,66 @@ export async function preflightSwivalVersion(
 	if (cachedVersionCheck && now - cachedVersionCheck.timestamp < VERSION_CACHE_TTL_MS) {
 		return cachedVersionCheck.check;
 	}
-	try {
-		const raw = await execVersion();
-		const check = evaluateSwivalVersion(raw);
-		cachedVersionCheck = { check, timestamp: now };
-		return check;
-	} catch {
-		return evaluateSwivalVersion(undefined);
+	if (inFlightVersionCheck) {
+		return inFlightVersionCheck;
 	}
+	inFlightVersionCheck = (async () => {
+		try {
+			const raw = await execVersion();
+			const check = evaluateSwivalVersion(raw);
+			cachedVersionCheck = { check, timestamp: Date.now() };
+			return check;
+		} catch {
+			return evaluateSwivalVersion(undefined);
+		} finally {
+			inFlightVersionCheck = null;
+		}
+	})();
+	return inFlightVersionCheck;
 }
 
 async function defaultGetSwivalVersion(): Promise<string | undefined> {
 	return new Promise<string | undefined>((resolve) => {
+		let settled = false;
+		let killTimer: NodeJS.Timeout | undefined;
+		const finish = (val: string | undefined) => {
+			if (settled) return;
+			settled = true;
+			if (killTimer) clearTimeout(killTimer);
+			resolve(val);
+		};
+		let cp: ChildProcess | undefined;
+		killTimer = setTimeout(() => {
+			try { cp?.kill("SIGKILL"); } catch { /* ignore */ }
+			finish(undefined);
+		}, 5000);
+		killTimer.unref?.();
+
 		try {
-			const cp = spawn("swival", ["--version"], {
+			cp = spawn("swival", ["--version"], {
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			cp.unref?.();
 			let stdout = "";
 			let stderr = "";
-			cp.stdout?.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
-			cp.stderr?.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
-			cp.on("error", () => resolve(undefined));
+			const MAX_PROBE_BYTES = 16 * 1024;
+			cp.stdout?.on("data", (d: Buffer) => {
+				if (stdout.length < MAX_PROBE_BYTES) stdout += d.toString("utf-8");
+			});
+			cp.stderr?.on("data", (d: Buffer) => {
+				if (stderr.length < MAX_PROBE_BYTES) stderr += d.toString("utf-8");
+			});
+			cp.on("error", () => finish(undefined));
 			cp.on("close", (code) => {
 				if (code === 0) {
 					const out = stdout.trim() || stderr.trim();
-					if (out) resolve(out);
-					else resolve(undefined);
+					finish(out || undefined);
 				} else {
-					resolve(undefined);
+					finish(undefined);
 				}
 			});
 		} catch {
-			resolve(undefined);
+			finish(undefined);
 		}
 	});
 }
@@ -1985,7 +2023,7 @@ async function runSingleSwival(
 		throw new SwivalArgumentError(versionCheck.errorMessage!);
 	}
 	if (versionCheck.advisoryMessage) {
-		stderrLines.push(versionCheck.advisoryMessage);
+		current.versionAdvisory = versionCheck.advisoryMessage;
 	}
 
 	// `--` separates options from positional arguments. Without it, a task
@@ -3201,6 +3239,9 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
 				if (r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
+				}
+				if (r.versionAdvisory) {
+					container.addChild(new Text(theme.fg("warning", `⚠ ${r.versionAdvisory}`), 0, 0));
 				}
 				// Per-tool-call progress from trace tailing. Always show a recent
 				// slice while the run is in flight so Pi's UI has something live.

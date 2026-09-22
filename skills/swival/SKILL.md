@@ -163,7 +163,7 @@ noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS 
 
 # Nested-invocation hygiene (defaults: all true)
 noInstructions: true
-# instructionsFull: true         # opt in to full AGENTS.md/CLAUDE.md loading
+# instructionsFull: true         # mutually exclusive with noInstructions — remove that line if enabled
 noMemory: true
 noLifecycle: true
 noMcp: true
@@ -374,6 +374,14 @@ Upgrade Swival to the latest release:
 uv tool upgrade swival
 # or: pipx upgrade swival
 ```
+
+### Version preflight
+
+Before spawning, the extension runs a fast, non-blocking version preflight:
+
+- Recommended: Swival 1.0.44 or later. Earlier 1.x releases produce an advisory upgrade notice.
+- Minimum compatible: Swival 1.0.0 (requires report schema v1). Earlier releases (< 1.0.0) are refused before spawning.
+- Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 
 Bedrock and Vertex are reached natively, so there is nothing to start. Bedrock needs a live AWS session; Vertex needs application default credentials. Bundled agents run with `--no-lifecycle`, so refresh credentials before dispatching.
 
