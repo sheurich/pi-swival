@@ -56,6 +56,14 @@ describe("isMutatingCwdAgent", () => {
 		).toBe(false);
 	});
 
+	it("exempts bundled sandboxed-explorer from isMutatingCwdAgent", () => {
+		const discovery = discoverSwivalAgents(process.cwd(), "user");
+		const explorer = discovery.agents.find((a) => a.name === "sandboxed-explorer");
+		expect(explorer).toBeDefined();
+		expect(explorer?.noSandboxAutoSession).toBe(true);
+		expect(isMutatingCwdAgent(explorer!)).toBe(false);
+	});
+
 	it("returns true when sandbox=agentfs WITHOUT noSandboxAutoSession (shared overlay)", () => {
 		expect(isMutatingCwdAgent(makeAgent({ sandbox: "agentfs" }))).toBe(true);
 	});

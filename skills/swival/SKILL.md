@@ -20,7 +20,7 @@ Access it from Pi via the `swival-subagent` tool.
 
 ## Delegation via swival-subagent
 
-The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user) or `.pi/swival-agents/` (project). Discovery priority: project > user > bundled.
+The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with `confirmProjectAgents: false` or the `PI_SWIVAL_TRUST_PROJECT_AGENTS` environment variable.
 
 Bundled definitions live at `../../agents/<name>.md` relative to this skill, so the path holds wherever Pi installed the package. Read that file to see an agent's real frontmatter.
 
@@ -69,13 +69,43 @@ swival-subagent with agent: "sandboxed-explorer",
   task: "Refactor the database layer"
 ```
 
-Parallel:
+Parallel task isolation:
+
+Parallel tasks run across separate processes but share the host filesystem. The `tasks` array supports up to 8 tasks and defaults to a concurrency of 4. The dispatcher groups tasks by target directory and rejects write-capable tasks that target the same `cwd`.
+
+Zero-setup isolation with AgentFS (writes divert to virtual overlays):
 
 ```
 swival-subagent with tasks: [
-  { agent: "self-review-worker", task: "Refactor auth module" },
-  { agent: "self-review-worker", task: "Add error handling to parser" }
+  { agent: "sandboxed-explorer", task: "Refactor parser logic" },
+  { agent: "sandboxed-explorer", task: "Refactor tokenizer logic" }
 ]
+```
+
+AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on the agent definition. Both `sandboxed-explorer` and `audit-worker` enable this setting.
+
+Git worktree isolation for real filesystem mutations:
+
+```bash
+git worktree add -b worker-a .worktrees/worker-a HEAD
+git worktree add -b worker-b .worktrees/worker-b HEAD
+```
+
+```
+swival-subagent with tasks: [
+  { agent: "self-review-worker", task: "Implement API", cwd: ".worktrees/worker-a" },
+  { agent: "self-review-worker", task: "Implement UI", cwd: ".worktrees/worker-b" }
+]
+```
+
+Fresh worktrees track committed files only. Untracked dependencies (`node_modules`, `.venv`, `.env`) must be installed or linked before running builds or tests. Worktrees isolate concurrent writes against race conditions, but share `.git` configuration and hooks with the host repository.
+
+After tasks finish, commit any uncommitted changes in each worktree, merge the branches, and remove the worktrees:
+
+```bash
+git -C .worktrees/worker-a commit -am "Implement API"
+git merge worker-a
+git worktree remove .worktrees/worker-a && git branch -d worker-a
 ```
 
 Chain (each step gets prior step's output as `{previous}`):
@@ -209,21 +239,12 @@ When you fork a bundled agent into `~/.pi/agent/swival-agents/` or
 revert to the schema default, which is rarely what the bundled
 agent intended. The trap to watch for:
 
-- `noSandboxAutoSession: true` on `audit-worker` is what makes
-  parallel `/audit` fan-out work. Drop it in a fork and the next
-  parallel dispatch deadlocks on the AgentFS SQLite overlay.
-- `requiresReviewer: true` on `test-runner` is what makes the
-  test-as-contract gate enforceable. Drop it in a fork and the
-  agent will silently report "completed" without ever running the
-  test script.
-- The nested-invocation hygiene flags (`noLifecycle`, `noMcp`,
-  `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`)
-  default to `true` for every agent unless the frontmatter sets them to
-  `false`. The dispatcher enforces `--no-subagents` by default to
-  prevent unbounded subagent recursion; project-local agents cannot
-  disable it. Do not rely on schema defaults, restate the flags you want.
+- `noSandboxAutoSession: true` on `sandboxed-explorer` and `audit-worker` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
+- `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
+- The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
+- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips `yolo`, `extraArgs`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, `nonoAllowDomain`, `skillsDir`, `noSubagents`, and `subagents` from project-local agents. It also narrows `network` to `none` only and forces `sandbox: agentfs`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
 
-When overriding a bundled agent name from the user or project scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
+When overriding a bundled agent name from the user scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
 
 ```bash
 # run from this skill's directory
@@ -243,8 +264,7 @@ Upstream Swival 1.0.44 provides several behaviors that require no package change
 
 ### Reviewer loop
 
-The headline feature. Runs after each answer; retries until
-acceptance or budget exhaustion.
+Automated review loop that evaluates task output after each answer and retries until acceptance or budget exhaustion.
 
 - Self-review: same model, fresh context evaluates the output
 - Test-as-contract: external script gates completion (exit 0 =
@@ -254,26 +274,33 @@ acceptance or budget exhaustion.
 
 Self-review and `--reviewer` are mutually exclusive.
 
-### Filesystem sandbox
+### Filesystem sandbox and network isolation
 
-| Mode | Effect |
-|------|--------|
-| Default (`files: some`) | Reads/writes confined to base directory |
-| `files: all` | Unrestricted |
-| `files: none` | Only `.swival/` accessible |
-| `sandbox: agentfs` | OS-enforced overlay; writes hit SQLite, not real FS |
-| `sandbox: nono` | OS-enforced Landlock (Linux) / Seatbelt (macOS) with rollback and network blocking |
+Swival supports three sandbox backends:
 
-The read-before-write guard prevents overwriting unread files.
-Disable with `noReadGuard: true` for agents that create files
-from scratch.
+| Mode | Backend | Capabilities |
+|------|---------|--------------|
+| `builtin` | Application path checks | Fast. Enables standard input prompt delivery. |
+| `agentfs` | Virtual SQLite overlay | Safe exploratory writes. Inspect with `agentfs diff <session-id>`. |
+| `nono` | OS kernel (Landlock/Seatbelt) | Kernel isolation. Enables rollback snapshots and network blocking. |
 
-AgentFS overlay does not merge back automatically. Inspect with
-`agentfs diff <session-id>` and apply manually.
+The read-before-write guard prevents overwriting unread files. Disable with `noReadGuard: true` for agents that create files from scratch.
+
+AgentFS overlays do not merge back automatically. Inspect with `agentfs diff <session-id>` and apply manually. See [references/agentfs.md](./references/agentfs.md) for session lookup, database locations (`~/.agentfs/run/<id>/delta.db`), and extraction procedures.
+
+Configure network egress policies with `network` in agent frontmatter or `networkOverride` at dispatch:
+
+| Policy | Behavior |
+|--------|----------|
+| `full` | Unrestricted network egress (default). |
+| `provider-only` | Blocks child commands and Python scripts from the network while preserving provider API access. |
+| `none` | Complete air-gap isolation. Blocks all outbound traffic. Requires an offline provider. |
+
+Enable atomic filesystem snapshots with `nonoRollback: true` or `nonoRollbackOverride: true`. If a run fails or encounters errors, Swival reverts filesystem changes automatically.
 
 ### Task prompt delivery
 
-Swival receives the task on the command line unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input instead (keeping it out of `ps aux` and clear of `ARG_MAX`). The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) may enable a re-executing sandbox (AgentFS or nono).
+Swival receives the task on standard input when the agent explicitly sets `sandbox: builtin`. Standard input delivery keeps sensitive prompt text out of `ps aux` and clears operating system `ARG_MAX` limits. Only the task text moves to standard input; system prompts, review prompts, and flags remain on argv. Setting `yolo: true` suppresses `sandbox` emission, so yolo runs pass the task on argv. Re-executing sandboxes (`agentfs`, `nono`) and default runs pass the task on argv (`-- <task>`) so the prompt survives `execve`. Project-scope agents in `.pi/swival-agents/` upgrade to `agentfs` automatically and cannot use standard input delivery.
 
 ### Secret encryption
 
@@ -303,6 +330,61 @@ Non-zero exit or `{"allow": false}` blocks the request.
 
 Shell wrappers (`bash -c`, pipes, redirects) are blocked in any
 mode other than `all`.
+
+### Command governance
+
+Inspect, rewrite, or block shell commands before execution using `commandMiddleware` in frontmatter or `commandMiddlewareOverride` at dispatch.
+
+Swival sends command descriptors via standard input to the middleware executable:
+
+```json
+{"command": "rm -rf build", "mode": "run_shell_command"}
+```
+
+The executable responds on standard output with one of three JSON payloads:
+
+```json
+{"action": "allow"}
+{"action": "allow", "command": "rm -rf build/temp"}
+{"action": "deny", "reason": "Destructive command blocked by policy"}
+```
+
+Security boundary: `pi-swival` strips `commandMiddleware` from project-local agents in `.pi/swival-agents/`. This protects the host from malicious scripts in untrusted repositories. Inject middleware through user-scoped agents or dispatch overrides.
+
+### Context budgeting
+
+Prevent large tool outputs from exhausting context windows using output caps:
+
+- `maxOutputKb` / `maxOutputKbOverride`: Caps tool output size in kilobytes for file reads, directory scans, grep searches, and web fetches (default: 50 KB).
+- `maxOutputLines` / `maxOutputLinesOverride`: Default line cap for file reads (default: 2000 lines).
+
+The dispatcher truncates float inputs in agent frontmatter to positive integers (`Math.trunc`).
+
+Recommended presets:
+- Small or budget models (`haiku`, `flash-lite`): `maxOutputKbOverride: 20`, `maxOutputLinesOverride: 250`.
+- Deep investigations on frontier models: `maxOutputKbOverride: 100`.
+
+### Telemetry and diagnostics
+
+Swival records execution and security metrics in `report.json`. The `swival-subagent` tool surfaces these values in result headers and `ReportSummary`:
+
+- `promptCache.cachedTokens`: Tokens read from provider cache (`prompt_cache.cached_tokens`). Explains why round 2+ of review loops runs faster and cheaper.
+- `promptCache.cacheWriteTokens`: Tokens written to provider cache on the initial turn (`prompt_cache.cache_write_tokens`).
+- `security.commandPolicyBlocks`: Number of commands blocked by middleware or sandbox rules (`security.command_policy_blocks`). Surfaces as a warning in tool results.
+- `stormedCalls`: Number of repeated tool calls suppressed by the Swival storm breaker (`stormed_calls`). Indicates model looping.
+- `truncationRepairs`: Number of truncated tool outputs or JSON structures recovered automatically (`truncation_repairs`).
+
+### Native subagents
+
+Swival includes native tools for running subagents (`spawn_subagent`, `check_subagents`).
+
+By default, `pi-swival` disables them (`--no-subagents`) to prevent unmonitored recursive execution. Enable them with `subagents: true` in agent frontmatter or `subagentsOverride: true` at dispatch:
+
+```
+swival-subagent with agent: "swival", subagentsOverride: true, task: "Survey repository modules in parallel"
+```
+
+Use native subagents when Swival must decompose a single prompt into independent child processes autonomously. Use `tasks: [...]` when you want Pi to coordinate separate tasks and collect independent artifacts.
 
 ## Model Selection
 
@@ -382,6 +464,7 @@ prompt).
 
 ```bash
 command -v swival >/dev/null 2>&1 || { echo "swival not found"; exit 1; }
+command -v agentfs >/dev/null 2>&1 || { echo "agentfs optional: required for sandbox: agentfs"; }
 ```
 
 Upgrade Swival to the latest release:

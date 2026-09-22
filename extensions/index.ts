@@ -2788,7 +2788,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			const discoveryCwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents = !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
+			const confirmProjectAgents =
+				params.confirmProjectAgents !== false && !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
 			const makeDetails =
