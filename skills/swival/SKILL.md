@@ -103,7 +103,7 @@ Fresh worktrees track committed files only. Untracked dependencies (`node_module
 After tasks finish, commit any uncommitted changes in each worktree, merge the branches, and remove the worktrees:
 
 ```bash
-git -C .worktrees/worker-a commit -am "Implement API"
+git -C .worktrees/worker-a add -A && git -C .worktrees/worker-a commit -m "Implement API"
 git merge worker-a
 git worktree remove .worktrees/worker-a && git branch -d worker-a
 ```
