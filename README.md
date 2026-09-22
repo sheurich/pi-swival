@@ -54,9 +54,12 @@ A Pi tool that dispatches single, parallel, or chained tasks to swival processes
 Key features beyond pi's example subagent extension:
 
 - Reviewer loop (`selfReview` or test-as-contract `reviewer`) that retries until the reviewer accepts.
-- AgentFS sandbox (`sandbox: agentfs`) that captures writes in a per-session SQLite overlay.
+- Kernel & overlay sandboxing (`sandbox: agentfs` SQLite overlay; `sandbox: nono` Landlock/Seatbelt isolation).
+- Fine-grained network policies (`--network provider-only`, `--network none`).
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
+- Standard input task delivery (protects prompts from `ps aux` and bypasses `ARG_MAX` on builtin runs).
+- Operational telemetry (prompt cache token savings, security policy blocks, and storm suppressions).
 - Async / background runs with cross-session `status` / `resume` / `interrupt`.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
@@ -88,7 +91,7 @@ Bundled in `agents/` for the `swival-subagent` tool:
 | `security-recon` | Survey a repository and emit `recon.json` (Stage 1 of the audit pipeline). |
 | `security-consolidator` | Merge per-bucket audit reports into one consolidated findings document (Stage 3). |
 
-The first four were extracted from the original `swival-subagent` Pi extension. The last three implement the audit pipeline documented in the `auditing-with-swival` skill.
+The first four agents handle general-purpose development tasks (unreviewed execution, self-reviewed edits, test-driven validation, and sandboxed exploration). The last three implement the multi-stage security audit pipeline documented in the `auditing-with-swival` skill.
 
 Audit agents include built-in self-review with JSON / structure contract enforcement, an AgentFS sandbox, and a read-only command allowlist.
 
@@ -152,10 +155,11 @@ Pi does not ship a subagent tool by default. The closest reference points are th
 
 | Feature                   | example `subagent`    | `swival-subagent`     |
 |---------------------------|-----------------------|-----------------------|
-| Per-tool-call streaming   | yes (`--mode json`)   | post-run trace replay |
+| Live tool streaming       | yes (`--mode json`)   | yes (`--trace-dir` watcher) |
 | Reviewer loop             | no                    | yes                   |
 | Test-as-contract          | no                    | yes                   |
-| AgentFS sandbox           | no                    | yes                   |
+| Sandboxing                | no                    | yes (AgentFS + nono)  |
+| Network isolation         | no                    | yes (provider-only, none) |
 | Secret encryption         | no                    | yes                   |
 | Parallel execution        | yes                   | yes                   |
 | Chain mode (`{previous}`) | yes                   | yes                   |
@@ -165,8 +169,8 @@ Use the example subagent (or a third-party equivalent) when fine-grained tool-ca
 
 ## Known limitations
 
-- Per-tool-call streaming comes from tailing swival's `--trace-dir` JSONL output and may lag on filesystems with weak `fs.watch` semantics.
-- The system prompt body is passed as `--system-prompt` argv. Hundreds-of-KB bodies can hit platform `ARG_MAX`; split long guidance into a skills directory passed via `extraArgs` instead.
+- Per-tool-call streaming tails Swival's `--trace-dir` JSONL output and may lag on filesystems with weak `fs.watch` semantics.
+- Re-executing sandboxes (`agentfs` and `nono`) pass the task prompt on command-line arguments to survive process image replacement. For massive prompts exceeding platform `ARG_MAX`, use `sandbox: builtin` which pipes prompts over standard input.
 - Parallel tasks share the host working tree (no git worktree isolation). Tasks that mutate overlapping files must be dispatched serially or run with per-task `cwd` pointing at pre-created worktrees.
 - `async: true` is single-mode only. Parallel and chain modes always run synchronously.
 - Artifact directories under `~/.pi/agent/swival-artifacts/` are auto-pruned at 7 days. Back up reports you need longer.
