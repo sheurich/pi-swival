@@ -81,6 +81,8 @@ export interface RunMeta {
 	/** Whether this run effectively requested AgentFS. Optional for artifacts
 	 *  written before AgentFS intent was persisted. */
 	agentFsRequested?: boolean;
+	/** Whether this run effectively requested Nono. */
+	nonoRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -181,7 +183,12 @@ async function writeRunOutput(
 		// content; never leave the output file group/world-readable regardless
 		// of the process umask.
 		await fs.promises.writeFile(resolved, body, { encoding: "utf-8", mode: 0o600 });
-		await fs.promises.chmod(resolved, 0o600);
+		try {
+			await fs.promises.chmod(resolved, 0o600);
+		} catch (chmodErr) {
+			await fs.promises.unlink(resolved).catch(() => {});
+			throw chmodErr;
+		}
 		r.outputPath = resolved;
 		// Default file-only when output is set; inline opts back in.
 		r.outputMode = outputMode ?? "file-only";
@@ -268,6 +275,60 @@ export function enforceAgentFsBootstrap(
 	};
 }
 
+/**
+ * Detect a Nono sandbox that was requested but never proven to have actually
+ * engaged. `sandbox.mode` in the report is written straight from argv
+ * (`report.py:349`), so it reads "nono" whether or not the sandbox actually
+ * executed — it is not evidence. `sandbox.nono_version` is set only when
+ * Nono sandbox isolation actually took effect.
+ *
+ * A run that requested "nono" and cannot show this evidence is a bootstrap
+ * failure: the caller believed execution was sandboxed when it may not have
+ * been. Returns undefined when nono was not requested or when evidence is present.
+ */
+export function nonoBootstrapFailure(
+	nonoRequested: boolean,
+	report: ReportSummary | undefined,
+): FailureReason | undefined {
+	if (!nonoRequested) return undefined;
+	if (!report) {
+		return {
+			code: "config_error",
+			text: "Nono sandbox was requested but no report was produced, so nono sandbox engagement cannot be confirmed.",
+		};
+	}
+	if (report.sandbox?.mode !== "nono") {
+		return {
+			code: "config_error",
+			text: `Nono sandbox was requested but report.sandbox.mode is "${report.sandbox?.mode ?? "missing"}", not "nono".`,
+		};
+	}
+	if (typeof report.sandbox.nonoVersion !== "string" || report.sandbox.nonoVersion === "") {
+		return {
+			code: "config_error",
+			text: 'Nono sandbox was requested and report.sandbox.mode says "nono", but sandbox.nono_version is absent, so nono sandbox engagement cannot be confirmed.',
+		};
+	}
+	return undefined;
+}
+
+export function enforceNonoBootstrap(
+	nonoRequested: boolean,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const failure = nonoBootstrapFailure(nonoRequested, report);
+	if (!failure) return { report };
+	return {
+		report: {
+			...(report ?? {}),
+			outcome: "error",
+			accepted: false,
+			errorMessage: failure.text,
+		},
+		reason: failure,
+	};
+}
+
 function lastCliOptionValue(args: readonly string[], option: string): string | undefined {
 	let value: string | undefined;
 	const equalsPrefix = `${option}=`;
@@ -303,6 +364,11 @@ export function isAgentFsRequested(args: readonly string[]): boolean {
 	return lastCliOptionValue(args, "--sandbox") === "agentfs";
 }
 
+/** Derive effective Nono intent from the arguments emitted to Swival. */
+export function isNonoRequested(args: readonly string[]): boolean {
+	return lastCliOptionValue(args, "--sandbox") === "nono";
+}
+
 /**
  * Derive whether a sandbox requiring process re-exec (AgentFS or nono) may be
  * triggered. Swival merges ambient configuration (~/.config/swival/config.toml
@@ -328,6 +394,14 @@ export function enforceCompletedAsyncAgentFs(
 ): { report: ReportSummary | undefined; reason?: FailureReason } {
 	const requested = meta.agentFsRequested === true || report?.sandbox?.mode === "agentfs";
 	return enforceAgentFsBootstrap(requested, report);
+}
+
+export function enforceCompletedAsyncNono(
+	meta: Pick<RunMeta, "nonoRequested">,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const requested = meta.nonoRequested === true || report?.sandbox?.mode === "nono";
+	return enforceNonoBootstrap(requested, report);
 }
 
 /**
@@ -500,8 +574,15 @@ export function buildSwivalArgs(
 	// in (field=false).
 	if (agent.noLifecycle !== false) args.push("--no-lifecycle");
 	if (agent.noMcp !== false) args.push("--no-mcp");
-	const a2aConfig = overrides.a2aConfig ?? agent.a2aConfig;
-	const allowA2a = a2aConfig !== undefined || agent.allowA2a === true;
+	const rawA2aConfig = overrides.a2aConfig ?? agent.a2aConfig;
+	if (rawA2aConfig !== undefined && rawA2aConfig.trim() === "") {
+		throw new SwivalArgumentError("A2A configuration path cannot be empty.");
+	}
+	if (agent.source === "project" && (rawA2aConfig !== undefined || agent.allowA2a === true)) {
+		throw new SwivalArgumentError(`Project-scope agent "${agent.name}" cannot enable A2A.`);
+	}
+	const a2aConfig = rawA2aConfig?.trim();
+	const allowA2a = Boolean(a2aConfig) || agent.allowA2a === true;
 	if (agent.noA2a !== false && !allowA2a) args.push("--no-a2a");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
@@ -597,9 +678,9 @@ export function buildSwivalArgs(
 	// agents, so it requires unrestricted network egress; reject the
 	// contradictory combination up front rather than letting swival's own
 	// argparse produce a less legible failure.
-	if (a2aConfig && network && network !== "full") {
+	if (allowA2a && network && network !== "full") {
 		throw new SwivalArgumentError(
-			`Agent "${agent.name}" sets a2aConfig but network is "${network}"; A2A requires --network full.`,
+			`Agent "${agent.name}" enables A2A but network is "${network}"; A2A requires --network full.`,
 		);
 	}
 	if (a2aConfig) {
@@ -737,7 +818,9 @@ interface ReportSummary {
 	errorMessage?: string;
 	// From stats.turns — number of agent-loop iterations actually executed.
 	turns?: number;
-	// Tool usage stats (no token/cost totals in the report schema).
+	// Tool usage stats and LLM cost. Cumulative estimated LLM cost is populated
+	// from stats.estimated_cost_usd / total_cost_usd / cost_usd when pricing
+	// metadata was available (Swival 1.0.40+).
 	toolCallsTotal?: number;
 	toolCallsByName?: Record<string, { succeeded?: number; failed?: number }>;
 	// Wall-clock breakdown for the session.
@@ -745,6 +828,7 @@ interface ReportSummary {
 	totalToolTimeS?: number;
 	llmCalls?: number;
 	compactions?: number;
+	estimatedCostUsd?: number;
 	// Last reviewer feedback (populated from timeline[] when a review rejected).
 	lastReviewFeedback?: string;
 	// Final answer, if result.answer is present in the report.
@@ -780,6 +864,14 @@ interface ReportSummary {
 	};
 	stormedCalls?: number;
 	truncationRepairs?: number;
+	// Context budgeting telemetry (Swival 1.0.45+).
+	exposure?: {
+		toolResults?: number;
+		toolSchemas?: number;
+		history?: number;
+		summaries?: number;
+		totalEstimatedInputTokens?: number;
+	};
 	// From settings.provider_timeout / settings.initial_tool_choice (swival
 	// 1.0.45+). Not currently emitted by swival's own report.settings, but
 	// parsed defensively in case a future release starts surfacing the
@@ -970,11 +1062,36 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		security,
 		stormedCalls: toNum(stats.stormed_calls),
 		truncationRepairs: toNum(stats.truncation_repairs),
+		exposure: summarizeExposure(raw.exposure ?? stats.exposure),
+		estimatedCostUsd:
+			toNum(stats.estimated_cost_usd) ??
+			toNum(stats.total_cost_usd) ??
+			toNum(stats.cost_usd),
 		providerTimeout: toNum(settings.provider_timeout),
 		initialToolChoice:
 			toStr(settings.initial_tool_choice) === "required" ? "required" : toStr(settings.initial_tool_choice) === "auto" ? "auto" : undefined,
 		raw,
 	};
+}
+
+function summarizeExposure(raw: unknown): ReportSummary["exposure"] {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const e = raw as Record<string, unknown>;
+	const toolResults = toNum(e.tool_results) ?? toNum(e.toolResults);
+	const toolSchemas = toNum(e.tool_schemas) ?? toNum(e.toolSchemas);
+	const history = toNum(e.history);
+	const summaries = toNum(e.summaries);
+	const totalEstimatedInputTokens = toNum(e.total_estimated_input_tokens) ?? toNum(e.total);
+	if (
+		toolResults === undefined &&
+		toolSchemas === undefined &&
+		history === undefined &&
+		summaries === undefined &&
+		totalEstimatedInputTokens === undefined
+	) {
+		return undefined;
+	}
+	return { toolResults, toolSchemas, history, summaries, totalEstimatedInputTokens };
 }
 
 function summarizeSandbox(raw: unknown): ReportSummary["sandbox"] {
@@ -1096,7 +1213,7 @@ export function classifyFailure(
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
 			return { code: "config_error", text: `Lifecycle hook failed — ${reportMsg}` };
-		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested/i.test(reportMsg))
+		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested|nono sandbox was requested/i.test(reportMsg))
 			return { code: "config_error", text: reportMsg };
 		return { code: "unknown", text: reportMsg };
 	}
@@ -1308,7 +1425,7 @@ export interface SwivalVersionCheck {
 }
 
 export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
-export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.0";
+export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.44";
 
 export function parseSemver(v: string): [number, number, number] | null {
 	const match = v.match(/\bv?(\d+)\.(\d+)\.(\d+)\b/);
@@ -1344,7 +1461,7 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
 			isOutdated: true,
 			isIncompatible: true,
-			errorMessage: `Installed Swival version ${installedVersion} is incompatible with report schema v1 (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
+			errorMessage: `Installed Swival version ${installedVersion} is incompatible (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
 		};
 	}
 
@@ -1782,7 +1899,8 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.runId !== "string" ||
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
-				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean")
+				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
+				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -1878,15 +1996,18 @@ interface CompletedAsyncInspection {
 async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
 	const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
 	const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
+	const nonoCheck = enforceCompletedAsyncNono(state.meta, bootstrapCheck.report);
+	const effectiveReport = nonoCheck.report;
+	const effectiveBootstrapReason = bootstrapCheck.reason ?? nonoCheck.reason;
 	const stderr = await fs.promises.readFile(state.meta.stderrFile, "utf-8").catch(() => "");
 	const stderrLines = stderr.split("\n").filter(Boolean);
 	const reason = terminalFailureReason(
 		state.exitCode ?? 1,
-		bootstrapCheck.report,
+		effectiveReport,
 		stderrLines,
-		bootstrapCheck.reason,
+		effectiveBootstrapReason,
 	);
-	return { report: bootstrapCheck.report, reason };
+	return { report: effectiveReport, reason };
 }
 
 function formatCompletedAsyncFailure(
@@ -1896,6 +2017,8 @@ function formatCompletedAsyncFailure(
 ): string {
 	const label = reason.text.startsWith("AgentFS sandbox was requested")
 		? "failed AgentFS bootstrap validation"
+		: reason.text.startsWith("Nono sandbox was requested")
+		? "failed Nono bootstrap validation"
 		: `failed (${reason.code})`;
 	return `Run ${runId} ${label}: ${reason.text}\nArtifact dir: ${state.meta.artifactDir}`;
 }
@@ -1951,6 +2074,7 @@ export async function runSingleSwivalAsync(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
+	const nonoRequested = isNonoRequested(args);
 	const isReexec = isReexecSandboxRequested(args);
 	if (isReexec) {
 		args.push("--", task);
@@ -1995,6 +2119,7 @@ export async function runSingleSwivalAsync(
 		stdoutFile,
 		stderrFile,
 		agentFsRequested,
+		nonoRequested,
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
@@ -2191,6 +2316,7 @@ async function runSingleSwival(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir: overrides.traceDir ?? traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
+	const nonoRequested = isNonoRequested(args);
 
 	const versionCheck = await preflightSwivalVersion();
 	if (versionCheck.isIncompatible) {
@@ -2325,11 +2451,16 @@ async function runSingleSwival(
 		current.report = await readReport(reportPath);
 
 		// Fail closed when emitted arguments or Swival configuration requested
-		// AgentFS but the report cannot prove the overlay re-exec happened.
+		// AgentFS or Nono but the report cannot prove sandbox engagement.
 		const sandboxRequested = agentFsRequested || current.report?.sandbox?.mode === "agentfs";
 		const bootstrapCheck = enforceAgentFsBootstrap(sandboxRequested, current.report);
 		current.report = bootstrapCheck.report;
 		if (bootstrapCheck.reason) current.reason = bootstrapCheck.reason;
+
+		const nonoReq = nonoRequested || current.report?.sandbox?.mode === "nono";
+		const nonoCheck = enforceNonoBootstrap(nonoReq, current.report);
+		current.report = nonoCheck.report;
+		if (nonoCheck.reason && !current.reason) current.reason = nonoCheck.reason;
 
 		// Prefer result.answer from the report JSON as the authoritative final
 		// output. Swival streams the answer to stdout too, but our 256 KB stdout
@@ -2462,9 +2593,6 @@ const SwivalParams = Type.Object({
 		}),
 	),
 	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the swival process (single mode)" })),
 
 	// Dispatch-time overrides (outrank agent frontmatter).
@@ -2817,6 +2945,7 @@ export function buildParallelSummary(
 
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
+	trustProjectAgents?: boolean;
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
@@ -2856,8 +2985,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			const discoveryCwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents =
-				params.confirmProjectAgents !== false && !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
+			const trustProjectAgents =
+				options.trustProjectAgents === true ||
+				Boolean(process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS);
+			const confirmProjectAgents = !trustProjectAgents;
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
 			const makeDetails =
@@ -3073,7 +3204,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					const names = projectRequested.map((a) => a.name).join(", ");
 					if (!ctx.hasUI) {
 						return {
-							content: [{ type: "text", text: `Refusing to run project-local swival agents (${names}) without UI confirmation. Pass confirmProjectAgents: false to opt out, or invoke from an interactive session.` }],
+							content: [{ type: "text", text: `Refusing to run project-local swival agents (${names}) without UI confirmation. Set PI_SWIVAL_TRUST_PROJECT_AGENTS=1 to opt out, or invoke from an interactive session.` }],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 							isError: true,
 						};
@@ -3118,7 +3249,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
 					// Per-step seed outranks the shared override so callers can
 					// seed each step independently for reproducibility.
 					const perStepOverrides: SwivalOverrides =

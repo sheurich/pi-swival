@@ -20,7 +20,7 @@ Access it from Pi via the `swival-subagent` tool.
 
 ## Delegation via swival-subagent
 
-The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with `confirmProjectAgents: false` or the `PI_SWIVAL_TRUST_PROJECT_AGENTS` environment variable.
+The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with the `PI_SWIVAL_TRUST_PROJECT_AGENTS` environment variable or extension options.
 
 Bundled definitions live at `../../agents/<name>.md` relative to this skill, so the path holds wherever Pi installed the package. Read that file to see an agent's real frontmatter.
 
@@ -262,18 +262,18 @@ diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
 
 Upstream Swival 1.0.45 provides several behaviors that require no package changes:
 
-- Image-rejection retries and generic-provider session headers operate transparently.
-- Streamed A2A response limits and endpoint-scoped model corrections apply automatically.
+- Image-rejection retries, generic session headers, and streamed A2A response limits apply automatically.
+- Large MCP tool catalogs load schemas on demand via `tool_search`; applies automatically to agents forked with `noMcp: false`.
+- Concurrent `edit_file` calls serialize per file within a session, preventing agents and subagents from overwriting edits.
 - `swival --init-config` preserves existing configuration values.
-- Audit workflows (`/audit`) defend against hostile Git config and handle unusual tracked filenames (including newlines and unreadable files).
+- Audit workflows (`/audit`) defend against hostile Git config and handle unusual tracked filenames.
 
 ### Reviewer loop
 
 Automated review loop that evaluates task output after each answer and retries until acceptance or budget exhaustion.
 
 - Self-review: same model, fresh context evaluates the output
-- Test-as-contract: external script gates completion (exit 0 =
-  accept, 1 = retry with stdout as feedback, 2 = reviewer error)
+- Test-as-contract: external script gates completion (exit 0 = accept, 1 = retry with stdout as feedback, 2 = reviewer error)
 - `--verify FILE`: feeds acceptance criteria to the reviewer
 - Default budget: 15 rounds (`maxReviewRounds` overrides)
 
@@ -377,17 +377,19 @@ Recommended presets:
 
 Swival records execution and security metrics in `report.json`. The `swival-subagent` tool surfaces these values in result headers and `ReportSummary`:
 
-- `promptCache.cachedTokens`: Tokens read from provider cache (`prompt_cache.cached_tokens`). Explains why round 2+ of review loops runs faster and cheaper.
+- `promptCache.cachedTokens`: Tokens read from provider cache (`prompt_cache.cached_tokens`).
 - `promptCache.cacheWriteTokens`: Tokens written to provider cache on the initial turn (`prompt_cache.cache_write_tokens`).
 - `security.commandPolicyBlocks`: Number of commands blocked by middleware or sandbox rules (`security.command_policy_blocks`). Surfaces as a warning in tool results.
 - `stormedCalls`: Number of repeated tool calls suppressed by the Swival storm breaker (`stormed_calls`). Indicates model looping.
 - `truncationRepairs`: Number of truncated tool outputs or JSON structures recovered automatically (`truncation_repairs`).
+- `estimatedCostUsd`: Estimated LLM cost in USD from `stats.estimated_cost_usd` when pricing metadata is available.
+- `exposure`: Context budgeting breakdown (`toolResults`, `toolSchemas`, `history`, `summaries`, `totalEstimatedInputTokens`).
 
 ### Native subagents
 
 Swival includes native tools for running subagents (`spawn_subagent`, `check_subagents`).
 
-By default, `pi-swival` disables them (`--no-subagents`) to prevent unmonitored recursive execution. Enable them with `subagents: true` in agent frontmatter or `subagentsOverride: true` at dispatch:
+By default, `pi-swival` disables them (`--no-subagents`) to prevent unmonitored recursive execution. Swival releases prior to 1.0.44 could auto-enable native subagents when context was large, ignoring `--no-subagents`; `pi-swival` enforces a 1.0.44 minimum compatible version to prevent this bypass. Swival 1.0.45 also serializes concurrent `edit_file` calls per file when subagents run. Enable native subagents with `subagents: true` in agent frontmatter or `subagentsOverride: true` at dispatch:
 
 ```
 swival-subagent with agent: "swival", subagentsOverride: true, task: "Survey repository modules in parallel"
@@ -488,7 +490,7 @@ uv tool upgrade swival
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
 - Recommended: Swival 1.0.45 or later. Earlier 1.x releases produce an advisory upgrade notice.
-- Minimum compatible: Swival 1.0.0 (requires report schema v1). Earlier releases (< 1.0.0) are refused before spawning.
+- Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 
 Bedrock and Vertex are reached natively, so there is nothing to start. Bedrock needs a live AWS session; Vertex needs application default credentials. Bundled agents run with `--no-lifecycle`, so refresh credentials before dispatching.

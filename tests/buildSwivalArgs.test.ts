@@ -591,6 +591,37 @@ describe("buildSwivalArgs", () => {
 		).toThrow(/A2A requires --network full/);
 	});
 
+	it("throws when allowA2a is set but network is not full", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ allowA2a: true, network: "none" }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A requires --network full/);
+	});
+
+	it("throws when a2aConfig is empty string", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ a2aConfig: "   " }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A configuration path cannot be empty/);
+	});
+
+	it("throws when project agent attempts to enable A2A via override", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ source: "project" }),
+				"/tmp/r.json",
+				"/repo",
+				{ a2aConfig: "/tmp/a2a.toml" },
+			),
+		).toThrow(/Project-scope agent "test-agent" cannot enable A2A/);
+	});
+
 	it("allows a2aConfig with network omitted (defaults to full)", () => {
 		const args = buildSwivalArgs(makeAgent({ a2aConfig: "a2a.toml" }), "/tmp/r.json", "/repo");
 		expect(args).not.toContain("--network");

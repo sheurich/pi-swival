@@ -30,7 +30,8 @@ describe("version preflight semantics", () => {
 
 	it("evaluates noisy CLI output correctly", () => {
 		expect(evaluateSwivalVersion("swival 0.9.0").isIncompatible).toBe(true);
-		expect(evaluateSwivalVersion("warn: check\nswival 1.0.40").isOutdated).toBe(true);
+		expect(evaluateSwivalVersion("warn: check\nswival 1.0.44").isOutdated).toBe(true);
+		expect(evaluateSwivalVersion("warn: check\nswival 1.0.44").isIncompatible).toBe(false);
 		expect(evaluateSwivalVersion("swival 1.0.45").isOutdated).toBe(false);
 	});
 
@@ -49,8 +50,8 @@ describe("version preflight semantics", () => {
 		expect(check.errorMessage).toBeUndefined();
 	});
 
-	it("treats version 1.0.40 as outdated but advisory (not incompatible)", () => {
-		const check = evaluateSwivalVersion("1.0.40");
+	it("treats version 1.0.44 as outdated but advisory (not incompatible)", () => {
+		const check = evaluateSwivalVersion("1.0.44");
 		expect(check.isOutdated).toBe(true);
 		expect(check.isIncompatible).toBe(false);
 		expect(check.advisoryMessage).toContain("uv tool upgrade swival");
@@ -58,8 +59,8 @@ describe("version preflight semantics", () => {
 		expect(check.errorMessage).toBeUndefined();
 	});
 
-	it("treats version below minCompatibleVersion (0.9.0) as incompatible", () => {
-		const check = evaluateSwivalVersion("0.9.0");
+	it("treats version below minCompatibleVersion (1.0.40) as incompatible", () => {
+		const check = evaluateSwivalVersion("1.0.40");
 		expect(check.isOutdated).toBe(true);
 		expect(check.isIncompatible).toBe(true);
 		expect(check.errorMessage).toContain(MIN_COMPATIBLE_SWIVAL_VERSION);

@@ -290,6 +290,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			agentConfig.provider = undefined;
 			agentConfig.model = undefined;
 			agentConfig.baseUrl = undefined;
+			agentConfig.profile = undefined;
 			// baseDir/addDir/addDirRo escape the repo-scoped working tree
 			// entirely (e.g. baseDir: "/", addDir: ["~/.ssh"]), regardless of
 			// the forced sandbox below.
