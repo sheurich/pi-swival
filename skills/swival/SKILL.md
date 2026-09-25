@@ -20,7 +20,7 @@ Access it from Pi via the `swival-subagent` tool.
 
 ## Delegation via swival-subagent
 
-The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with the `PI_SWIVAL_TRUST_PROJECT_AGENTS` environment variable or extension options.
+The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with `PI_SWIVAL_TRUST_PROJECT_AGENTS=1` (or `true`) or extension options.
 
 Bundled definitions live at `../../agents/<name>.md` relative to this skill, so the path holds wherever Pi installed the package. Read that file to see an agent's real frontmatter.
 
@@ -305,7 +305,7 @@ Enable atomic filesystem snapshots with `nonoRollback: true` or `nonoRollbackOve
 
 ### A2A (agent-to-agent)
 
-Swival can delegate work to a remote agent over the A2A protocol. Set `a2aConfig` in frontmatter or `a2aConfigOverride` at dispatch time. Point to a TOML file with `[a2a_servers.*]` tables that name reachable endpoints. Relative paths resolve against the task `cwd`. Setting `a2aConfig` or `allowA2a: true` suppresses `--no-a2a`. A2A requires unrestricted network access. The dispatcher rejects A2A when `network` is not `full`. The bundled `a2a-coordinator` agent configures `noA2a: false` and `network: full`. Its system prompt treats remote agent output as untrusted data. Project-scope agents cannot enable A2A. The extension strips `a2aConfig` and forces `noA2a: true`.
+Swival can delegate work to a remote agent over the A2A protocol. Set `a2aConfig` in frontmatter or `a2aConfigOverride` at dispatch time. Point to a TOML file with `[a2a_servers.*]` tables that name reachable endpoints. Relative paths resolve against the task `cwd`. Setting `a2aConfig`, `allowA2a: true`, or `noA2a: false` enables A2A and suppresses `--no-a2a`. A2A requires unrestricted network access; the dispatcher rejects A2A when `network` is set to any policy other than `full` (network defaults to full when omitted). The bundled `a2a-coordinator` agent configures `noA2a: false` and `network: full`. Its system prompt treats remote agent output as untrusted data. Project-scope agents cannot enable A2A. The extension strips `a2aConfig` and forces `noA2a: true`.
 
 ### Task prompt delivery
 
@@ -490,7 +490,7 @@ uv tool upgrade swival
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
 - Recommended: Swival 1.0.45 or later. Releases between 1.0.44 and 1.0.45 produce an advisory upgrade notice.
-- Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) are refused before spawning.
+- Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) or unverified versions are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 
 Bedrock and Vertex are reached natively, so there is nothing to start. Bedrock needs a live AWS session; Vertex needs application default credentials. Bundled agents run with `--no-lifecycle`, so refresh credentials before dispatching.

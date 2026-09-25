@@ -127,7 +127,24 @@ it("rolls back output file if chmod fails", async () => {
 		expect(fs.existsSync(outputPath)).toBe(false);
 		expect(result.details.results[0].outputPath).toBeUndefined();
 		expect(result.details.results[0].stderrTail.join("\n")).toMatch(/chmod/i);
+		// Verify no leftover .tmp-output-* file exists in workspace
+		const remainingFiles = fs.readdirSync(path.join(root, "workspace"));
+		expect(remainingFiles.filter((f) => f.startsWith(".tmp-output-"))).toHaveLength(0);
 	} finally {
 		chmodSpy.mockRestore();
+	}
+});
+
+it("allows writing to an absolute path under os.tmpdir() without macOS /var symlink false-positives", async () => {
+	const rawTmpDir = os.tmpdir(); // Not realpathSync'd, may start with /var on macOS
+	const targetFile = path.join(rawTmpDir, `pi-swival-test-abs-${Date.now()}.txt`);
+
+	try {
+		const result = await execute({ agent: "swival", task: "fixture", output: targetFile });
+		expect(result.isError).not.toBe(true);
+		expect(fs.existsSync(targetFile)).toBe(true);
+		expect(fs.readFileSync(targetFile, "utf8")).toBe("WRITE_OUTPUT_FIXTURE");
+	} finally {
+		if (fs.existsSync(targetFile)) fs.unlinkSync(targetFile);
 	}
 });

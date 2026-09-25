@@ -157,19 +157,31 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
-async function hasSymlinkInPath(targetPath: string, rootAnchor?: string): Promise<string | null> {
-	let current = path.resolve(targetPath);
-	const anchor = rootAnchor ? path.resolve(rootAnchor) : undefined;
-	while (current && current !== anchor) {
-		try {
-			const lst = await fs.promises.lstat(current);
-			if (lst.isSymbolicLink()) return current;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+async function hasSymlinkInPath(resolved: string, cwdAnchor: string, isRelative: boolean): Promise<string | null> {
+	// 1. Check if the target leaf itself is an existing symlink
+	try {
+		const lst = await fs.promises.lstat(resolved);
+		if (lst.isSymbolicLink()) return resolved;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+
+	// 2. For relative paths within cwdAnchor, verify no parent directory component
+	// under cwdAnchor is a symlink.
+	if (isRelative) {
+		const anchor = path.resolve(cwdAnchor);
+		let current = path.dirname(resolved);
+		while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
+			try {
+				const lst = await fs.promises.lstat(current);
+				if (lst.isSymbolicLink()) return current;
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+			}
+			const parent = path.dirname(current);
+			if (parent === current) break;
+			current = parent;
 		}
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
 	}
 	return null;
 }
@@ -180,37 +192,40 @@ async function writeRunOutput(
 	outputMode: "inline" | "file-only" | undefined,
 	cwdAnchor: string,
 ): Promise<void> {
-	const resolved = path.isAbsolute(outputPath) ? outputPath : path.resolve(cwdAnchor, outputPath);
+	const isRelative = !path.isAbsolute(outputPath);
+	const resolved = isRelative ? path.resolve(cwdAnchor, outputPath) : outputPath;
+	let tmpFile: string | undefined;
 	try {
 		// Refuse to write through an existing symlink (both the leaf file and
-		// any parent directory component). `outputPath` is model-controlled;
+		// any parent directory component within cwdAnchor). `outputPath` is model-controlled;
 		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
 		// or `linked.txt -> /etc/passwd`) so a caller-chosen relative path
 		// silently redirects writes to an attacker-chosen target.
-		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
+		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor, isRelative);
 		if (symlinkFound) {
 			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
 		}
 		const dir = path.dirname(resolved);
 		await fs.promises.mkdir(dir, { recursive: true });
-		// Double check after mkdir in case a parent directory was created or replaced
-		const postMkdirSymlink = await hasSymlinkInPath(dir, cwdAnchor);
+		// Double check directory component after mkdir
+		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor, isRelative);
 		if (postMkdirSymlink) {
 			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
 		}
 		const body = r.finalOutput ?? "";
 		// finalOutput may carry decrypted secrets or task-adjacent sensitive
-		// content; write to a temporary file with mode 0600, apply chmod, and
-		// atomically rename so the destination is never left world-readable or
-		// partially written on failure.
-		const tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600 });
+		// content; write to a temporary file opened with flag 'wx' and mode 0600,
+		// apply chmod, and atomically rename so the destination is never left
+		// world-readable or partially written on failure.
+		tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		try {
+			await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
 			await fs.promises.chmod(tmpFile, 0o600);
 			await fs.promises.rename(tmpFile, resolved);
-		} catch (writeErr) {
-			await fs.promises.unlink(tmpFile).catch(() => {});
-			throw writeErr;
+		} finally {
+			if (tmpFile) {
+				await fs.promises.unlink(tmpFile).catch(() => {});
+			}
 		}
 		r.outputPath = resolved;
 		// Default file-only when output is set; inline opts back in.
@@ -1470,8 +1485,9 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 		return {
 			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
 			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
-			isOutdated: false,
-			isIncompatible: false,
+			isOutdated: true,
+			isIncompatible: true,
+			errorMessage: `Could not determine installed Swival version (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Verify Swival is installed and runs with 'swival --version', or upgrade with: uv tool upgrade swival`,
 		};
 	}
 	const parsed = parseSemver(installedVersion);

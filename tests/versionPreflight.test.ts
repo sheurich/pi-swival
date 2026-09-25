@@ -67,10 +67,11 @@ describe("version preflight semantics", () => {
 		expect(check.errorMessage).toContain("uv tool upgrade swival");
 	});
 
-	it("handles missing/undefined version gracefully", () => {
+	it("treats missing/undefined version as incompatible", () => {
 		const check = evaluateSwivalVersion(undefined);
-		expect(check.isOutdated).toBe(false);
-		expect(check.isIncompatible).toBe(false);
+		expect(check.isOutdated).toBe(true);
+		expect(check.isIncompatible).toBe(true);
+		expect(check.errorMessage).toContain("Could not determine installed Swival version");
 	});
 
 	it("treats unparseable version string as incompatible", () => {
