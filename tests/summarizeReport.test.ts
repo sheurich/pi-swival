@@ -91,6 +91,21 @@ describe("summarizeReport", () => {
 		expect(s.truncationRepairs).toBe(1);
 	});
 
+	it("extracts providerTimeout and initialToolChoice from settings when present", () => {
+		const s = summarizeReport({
+			result: { outcome: "success", exit_code: 0 },
+			settings: { provider_timeout: 300, initial_tool_choice: "required" },
+		});
+		expect(s.providerTimeout).toBe(300);
+		expect(s.initialToolChoice).toBe("required");
+	});
+
+	it("tolerates a report with no settings object for providerTimeout/initialToolChoice", () => {
+		const s = summarizeReport({ result: { outcome: "success", exit_code: 0 } });
+		expect(s.providerTimeout).toBeUndefined();
+		expect(s.initialToolChoice).toBeUndefined();
+	});
+
 	it("tolerates a completely empty report object", () => {
 		const s = summarizeReport({});
 		expect(s.outcome).toBe("unknown");

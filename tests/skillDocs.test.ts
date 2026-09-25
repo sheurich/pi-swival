@@ -15,7 +15,7 @@ const BRIEFS_SKILL_DIR = join(SKILLS_DIR, "swival-worker-briefs");
 const BRIEFS_SKILL = join(BRIEFS_SKILL_DIR, "SKILL.md");
 const AGENTS_DIR = join(PACKAGE_ROOT, "agents");
 
-const SWIVAL_VERSION = "1.0.44";
+const SWIVAL_VERSION = "1.0.45";
 
 function read(file: string): string {
 	return readFileSync(file, "utf8");
@@ -152,8 +152,8 @@ describe("swival SKILL.md preserves package mechanics", () => {
 		}
 	});
 
-	it("covers all seven bundled agents", () => {
-		expect(bundledAgentNames()).toHaveLength(7);
+	it("covers all eight bundled agents", () => {
+		expect(bundledAgentNames()).toHaveLength(8);
 	});
 
 	it("stays under 500 lines", () => {

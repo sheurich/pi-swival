@@ -2,7 +2,7 @@
 
 Install Swival, point it at a provider, and verify connectivity.
 
-Tracked against Swival 1.0.44.
+Tracked against Swival 1.0.45.
 
 Bedrock and Vertex are reached through Swival's native `bedrock` and `vertexai` providers. No proxy process or second routing configuration is required.
 

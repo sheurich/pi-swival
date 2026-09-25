@@ -163,9 +163,25 @@ async function writeRunOutput(
 ): Promise<void> {
 	const resolved = path.isAbsolute(outputPath) ? outputPath : path.resolve(cwdAnchor, outputPath);
 	try {
+		// Refuse to write through an existing symlink. `outputPath` is model-
+		// controlled; a hostile repo can pre-plant a symlink (e.g. a tracked
+		// `linked.txt` pointing outside the repo) so a caller-chosen relative
+		// path silently redirects the write to an attacker-chosen target.
+		try {
+			const lst = await fs.promises.lstat(resolved);
+			if (lst.isSymbolicLink()) {
+				throw new Error(`refusing to write through existing symlink at ${resolved}`);
+			}
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
 		await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
 		const body = r.finalOutput ?? "";
-		await fs.promises.writeFile(resolved, body, "utf-8");
+		// finalOutput may carry decrypted secrets or task-adjacent sensitive
+		// content; never leave the output file group/world-readable regardless
+		// of the process umask.
+		await fs.promises.writeFile(resolved, body, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.chmod(resolved, 0o600);
 		r.outputPath = resolved;
 		// Default file-only when output is set; inline opts back in.
 		r.outputMode = outputMode ?? "file-only";
@@ -461,6 +477,9 @@ export interface SwivalOverrides {
 	shareSkills?: boolean;
 	subagents?: boolean;
 	timeoutMs?: number;
+	a2aConfig?: string;
+	providerTimeout?: number;
+	initialToolChoice?: "auto" | "required";
 }
 
 export function buildSwivalArgs(
@@ -481,7 +500,9 @@ export function buildSwivalArgs(
 	// in (field=false).
 	if (agent.noLifecycle !== false) args.push("--no-lifecycle");
 	if (agent.noMcp !== false) args.push("--no-mcp");
-	if (agent.noA2a !== false) args.push("--no-a2a");
+	const a2aConfig = overrides.a2aConfig ?? agent.a2aConfig;
+	const allowA2a = a2aConfig !== undefined || agent.allowA2a === true;
+	if (agent.noA2a !== false && !allowA2a) args.push("--no-a2a");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
 	if (agent.noMemory !== false) args.push("--no-memory");
@@ -518,6 +539,10 @@ export function buildSwivalArgs(
 	if (maxOutputTokens !== undefined) args.push("--max-output-tokens", String(maxOutputTokens));
 	const maxTurns = overrides.maxTurns ?? agent.maxTurns;
 	if (maxTurns !== undefined) args.push("--max-turns", String(maxTurns));
+	const providerTimeout = overrides.providerTimeout ?? agent.providerTimeout;
+	if (providerTimeout !== undefined) args.push("--provider-timeout", String(providerTimeout));
+	const initialToolChoice = overrides.initialToolChoice ?? agent.initialToolChoice;
+	if (initialToolChoice) args.push("--initial-tool-choice", initialToolChoice);
 
 	// Caching
 	const cache = overrides.cache ?? agent.cache;
@@ -567,6 +592,22 @@ export function buildSwivalArgs(
 	// Network policy
 	const network = overrides.network ?? agent.network;
 	if (network) args.push("--network", network);
+
+	// A2A (agent-to-agent) client configuration. A2A dials out to other
+	// agents, so it requires unrestricted network egress; reject the
+	// contradictory combination up front rather than letting swival's own
+	// argparse produce a less legible failure.
+	if (a2aConfig && network && network !== "full") {
+		throw new SwivalArgumentError(
+			`Agent "${agent.name}" sets a2aConfig but network is "${network}"; A2A requires --network full.`,
+		);
+	}
+	if (a2aConfig) {
+		const resolvedA2aConfig = path.isAbsolute(a2aConfig)
+			? a2aConfig
+			: path.resolve(cwd ?? process.cwd(), a2aConfig);
+		args.push("--a2a-config", resolvedA2aConfig);
+	}
 
 	// Command middleware
 	const commandMiddleware = overrides.commandMiddleware ?? agent.commandMiddleware;
@@ -739,6 +780,12 @@ interface ReportSummary {
 	};
 	stormedCalls?: number;
 	truncationRepairs?: number;
+	// From settings.provider_timeout / settings.initial_tool_choice (swival
+	// 1.0.45+). Not currently emitted by swival's own report.settings, but
+	// parsed defensively in case a future release starts surfacing the
+	// effective values there.
+	providerTimeout?: number;
+	initialToolChoice?: "auto" | "required";
 	raw?: Record<string, unknown>;
 }
 
@@ -819,7 +866,7 @@ export interface SwivalResult {
 	// Undefined means swival's built-in default (100) was used. Surfaced
 	// in the header as "N/M turns" when a non-default limit was configured.
 	effectiveMaxTurns?: number;
-	// Advisory message when installed Swival is outdated (< 1.0.44).
+	// Advisory message when installed Swival is outdated (< 1.0.45).
 	versionAdvisory?: string;
 	// Set when the caller asked for per-task file output in parallel mode.
 	// `outputPath` is the absolute path we wrote finalOutput to; `outputMode`
@@ -852,6 +899,7 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	// but use the documented keys as the authoritative source.
 	const stats = (raw.stats ?? {}) as Record<string, unknown>;
 	const result = (raw.result ?? {}) as Record<string, unknown>;
+	const settings = (raw.settings ?? {}) as Record<string, unknown>;
 	const timelineRaw = Array.isArray(raw.timeline) ? (raw.timeline as Array<Record<string, unknown>>) : [];
 
 	const outcomeVal = toStr(result.outcome);
@@ -922,6 +970,9 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		security,
 		stormedCalls: toNum(stats.stormed_calls),
 		truncationRepairs: toNum(stats.truncation_repairs),
+		providerTimeout: toNum(settings.provider_timeout),
+		initialToolChoice:
+			toStr(settings.initial_tool_choice) === "required" ? "required" : toStr(settings.initial_tool_choice) === "auto" ? "auto" : undefined,
 		raw,
 	};
 }
@@ -1256,7 +1307,7 @@ export interface SwivalVersionCheck {
 	errorMessage?: string;
 }
 
-export const RECOMMENDED_SWIVAL_VERSION = "1.0.44";
+export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
 export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.0";
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -2474,6 +2525,20 @@ const SwivalParams = Type.Object({
 			description: "Override network policy: full, provider-only, or none.",
 		}),
 	),
+	a2aConfigOverride: Type.Optional(
+		Type.String({
+			description:
+				"Path to an A2A TOML config file with [a2a_servers.*] tables for this call. Relative paths resolve against cwd. Suppresses --no-a2a and requires networkOverride/network=full (or omitted, which defaults to full).",
+		}),
+	),
+	providerTimeoutOverride: Type.Optional(
+		Type.Number({ description: "Override --provider-timeout (seconds) for this call. Swival's default is 900." }),
+	),
+	initialToolChoiceOverride: Type.Optional(
+		StringEnum(["auto", "required"] as const, {
+			description: "Override --initial-tool-choice for this call. Swival's default is auto.",
+		}),
+	),
 	nonoRollbackOverride: Type.Optional(
 		Type.Boolean({ description: "Override nono rollback snapshots." }),
 	),
@@ -2571,6 +2636,9 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		reasoningEffort: g<string>("reasoningEffortOverride"),
 		instructionsFull: g<boolean>("instructionsFullOverride") ?? g<boolean>("instructionsFull"),
 		network: g<"full" | "provider-only" | "none">("networkOverride"),
+		a2aConfig: g<string>("a2aConfigOverride"),
+		providerTimeout: g<number>("providerTimeoutOverride"),
+		initialToolChoice: g<"auto" | "required">("initialToolChoiceOverride"),
 		nonoRollback: g<boolean>("nonoRollbackOverride"),
 		nonoBlockNet: g<boolean>("nonoBlockNetOverride"),
 		commandMiddleware: g<string>("commandMiddlewareOverride"),

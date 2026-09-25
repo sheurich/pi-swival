@@ -103,7 +103,7 @@ const args = process.argv.slice(2);
 
 // Swival version check probe
 if (args.includes('--version')) {
-  console.log('1.0.44');
+  console.log('1.0.45');
   process.exit(0);
 }
 
@@ -212,7 +212,7 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 
 if (args.includes('--version')) {
-  console.log('1.0.44');
+  console.log('1.0.45');
   process.exit(0);
 }
 
@@ -267,7 +267,7 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 
 if (args.includes('--version')) {
-  console.log('1.0.44');
+  console.log('1.0.45');
   process.exit(0);
 }
 

@@ -31,7 +31,7 @@ describe("version preflight semantics", () => {
 	it("evaluates noisy CLI output correctly", () => {
 		expect(evaluateSwivalVersion("swival 0.9.0").isIncompatible).toBe(true);
 		expect(evaluateSwivalVersion("warn: check\nswival 1.0.40").isOutdated).toBe(true);
-		expect(evaluateSwivalVersion("swival 1.0.44").isOutdated).toBe(false);
+		expect(evaluateSwivalVersion("swival 1.0.45").isOutdated).toBe(false);
 	});
 
 	it("compares semver correctly", () => {
@@ -41,8 +41,8 @@ describe("version preflight semantics", () => {
 		expect(compareSemver("2.0.0", "1.99.99")).toBeGreaterThan(0);
 	});
 
-	it("treats version 1.0.44 as up to date", () => {
-		const check = evaluateSwivalVersion("1.0.44");
+	it("treats version 1.0.45 as up to date", () => {
+		const check = evaluateSwivalVersion("1.0.45");
 		expect(check.isOutdated).toBe(false);
 		expect(check.isIncompatible).toBe(false);
 		expect(check.advisoryMessage).toBeUndefined();
@@ -76,7 +76,7 @@ describe("version preflight semantics", () => {
 		let callCount = 0;
 		const mockExec = async () => {
 			callCount++;
-			return "1.0.44";
+			return "1.0.45";
 		};
 
 		const check1 = await preflightSwivalVersion(mockExec);

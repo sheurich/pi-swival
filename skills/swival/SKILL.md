@@ -11,7 +11,7 @@ description: >-
 
 # Swival
 
-Tracked against Swival 1.0.44.
+Tracked against Swival 1.0.45.
 
 Swival is a coding agent with a built-in reviewer loop, layered
 sandboxing (builtin + AgentFS + nono), format-preserving secret
@@ -35,6 +35,7 @@ Bundled definitions live at `../../agents/<name>.md` relative to this skill, so 
 | `audit-worker` | Read-only security or domain audit bucket; task must start with `/audit` (Stage 2 of the audit pipeline) |
 | `security-recon` | Survey a repository and emit `recon.json` bucket specs (Stage 1) |
 | `security-consolidator` | Merge per-bucket audit reports into one findings document (Stage 3) |
+| `a2a-coordinator` | Delegate part of a task to a remote A2A agent named in an `a2aConfig` TOML file; requires `network: full` |
 
 The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc. Use the `swival-worker-briefs` skill to write structured task briefs for `self-review-worker`.
 
@@ -173,6 +174,9 @@ definition:
 | `subagentsOverride` | Allow Swival to spawn native subagents |
 | `cacheOverride` | Enable LLM response caching |
 | `cacheDirOverride` | Cache directory |
+| `a2aConfigOverride` | Path to an A2A TOML config file; suppresses `--no-a2a` and requires `network: full` |
+| `providerTimeoutOverride` | Provider request timeout in seconds (default 900) |
+| `initialToolChoiceOverride` | Tool selection for the first model request (`auto`, `required`) |
 
 Swival's `/reasoning` command is REPL-only. Use `reasoningEffortOverride` (or the agent frontmatter `reasoningEffort`) as the Pi equivalent.
 
@@ -242,7 +246,8 @@ agent intended. The trap to watch for:
 - `noSandboxAutoSession: true` on `sandboxed-explorer` and `audit-worker` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
 - `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
 - The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
-- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips `yolo`, `extraArgs`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, `nonoAllowDomain`, `skillsDir`, `noSubagents`, and `subagents` from project-local agents. It also narrows `network` to `none` only and forces `sandbox: agentfs`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
+- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
+- A project-scope agent that shadows a bundled or user-scope agent name cannot unset `requiresReviewer: true` inherited from the shadowed name — the dispatcher forces it back to `true` so a repo-controlled file cannot impersonate `test-runner` (or any other reviewer-gated name) to silently drop its test-as-contract gate.
 
 When overriding a bundled agent name from the user scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
 
@@ -253,9 +258,9 @@ diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
 
 ## Capabilities Reference
 
-### Upstream Swival 1.0.44 behaviors
+### Upstream Swival 1.0.45 behaviors
 
-Upstream Swival 1.0.44 provides several behaviors that require no package changes:
+Upstream Swival 1.0.45 provides several behaviors that require no package changes:
 
 - Image-rejection retries and generic-provider session headers operate transparently.
 - Streamed A2A response limits and endpoint-scoped model corrections apply automatically.
@@ -297,6 +302,10 @@ Configure network egress policies with `network` in agent frontmatter or `networ
 | `none` | Complete air-gap isolation. Blocks all outbound traffic. Requires an offline provider. |
 
 Enable atomic filesystem snapshots with `nonoRollback: true` or `nonoRollbackOverride: true`. If a run fails or encounters errors, Swival reverts filesystem changes automatically.
+
+### A2A (agent-to-agent)
+
+Swival can delegate work to a remote agent over the A2A protocol. Set `a2aConfig` in frontmatter or `a2aConfigOverride` at dispatch time. Point to a TOML file with `[a2a_servers.*]` tables that name reachable endpoints. Relative paths resolve against the task `cwd`. Setting `a2aConfig` or `allowA2a: true` suppresses `--no-a2a`. A2A requires unrestricted network access. The dispatcher rejects A2A when `network` is not `full`. The bundled `a2a-coordinator` agent configures `noA2a: false` and `network: full`. Its system prompt treats remote agent output as untrusted data. Project-scope agents cannot enable A2A. The extension strips `a2aConfig` and forces `noA2a: true`.
 
 ### Task prompt delivery
 
@@ -478,7 +487,7 @@ uv tool upgrade swival
 
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
-- Recommended: Swival 1.0.44 or later. Earlier 1.x releases produce an advisory upgrade notice.
+- Recommended: Swival 1.0.45 or later. Earlier 1.x releases produce an advisory upgrade notice.
 - Minimum compatible: Swival 1.0.0 (requires report schema v1). Earlier releases (< 1.0.0) are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 
