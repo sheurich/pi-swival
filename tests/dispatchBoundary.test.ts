@@ -120,4 +120,40 @@ describe("argument-validation dispatch boundary", () => {
 		expect(fs.readdirSync(artifactRoot)).toEqual([]);
 		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
 	});
+
+	it("rejects a2aConfigOverride in parallel or chain modes", async () => {
+		const parallelResult = await tool.execute(
+			"test-parallel-a2a",
+			{
+				agentScope: "user",
+				a2aConfigOverride: "/tmp/a2a.toml",
+				tasks: [
+					{ agent: "swival", task: "one" },
+					{ agent: "swival", task: "two" },
+				],
+			},
+			undefined,
+			undefined,
+			{ cwd: process.cwd(), hasUI: false },
+		);
+		expect(parallelResult.isError).toBe(true);
+		expect(parallelResult.content[0].text).toMatch(/`a2aConfigOverride` is only supported in single mode/);
+
+		const chainResult = await tool.execute(
+			"test-chain-a2a",
+			{
+				agentScope: "user",
+				a2aConfigOverride: "/tmp/a2a.toml",
+				chain: [
+					{ agent: "swival", task: "one" },
+					{ agent: "swival", task: "two" },
+				],
+			},
+			undefined,
+			undefined,
+			{ cwd: process.cwd(), hasUI: false },
+		);
+		expect(chainResult.isError).toBe(true);
+		expect(chainResult.content[0].text).toMatch(/`a2aConfigOverride` is only supported in single mode/);
+	});
 });

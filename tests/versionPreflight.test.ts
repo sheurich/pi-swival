@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
+import registerExtension, {
 	compareSemver,
 	evaluateSwivalVersion,
 	parseSemver,
@@ -97,5 +97,30 @@ describe("version preflight semantics", () => {
 		resetSwivalVersionCache();
 		await preflightSwivalVersion(mockExec);
 		expect(callCount).toBe(2);
+	});
+
+	it("returns a clean config_error result when an incompatible version is detected", async () => {
+		let tool: any;
+		registerExtension({
+			registerTool: (t: any) => {
+				tool = t;
+			},
+		} as any);
+
+		// Force version preflight cache to report incompatible version 1.0.40
+		resetSwivalVersionCache();
+		await preflightSwivalVersion(async () => "1.0.40");
+
+		const result = await tool.execute(
+			"version-incompatible-test",
+			{ agent: "swival", task: "hello" },
+			undefined,
+			undefined,
+			{ cwd: process.cwd(), hasUI: false },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.details.results[0].reason?.code).toBe("config_error");
+		expect(result.details.results[0].errorMessage).toContain("minimum required: 1.0.44");
 	});
 });

@@ -1794,6 +1794,7 @@ export function startTraceTail(
 		if (!traceFile) void pickTraceFile();
 		else void consume();
 	}, 100);
+	pollInterval.unref?.();
 	void pickTraceFile();
 
 	return async () => {
@@ -2326,6 +2327,21 @@ async function runSingleSwival(
 		};
 	}
 
+	const versionCheck = await preflightSwivalVersion();
+	if (versionCheck.isIncompatible) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [versionCheck.errorMessage!],
+			durationMs: 0,
+			errorMessage: versionCheck.errorMessage,
+			reason: { code: "config_error", text: versionCheck.errorMessage! },
+		};
+	}
+
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
 	const traceDir = path.join(tmpDir, "trace");
@@ -2340,6 +2356,7 @@ async function runSingleSwival(
 		stderrTail: [],
 		durationMs: 0,
 		traceEvents: [],
+		versionAdvisory: versionCheck.advisoryMessage,
 	};
 
 	const stderrLines: string[] = [];
@@ -2400,14 +2417,6 @@ async function runSingleSwival(
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
 	const nonoRequested = isNonoRequested(args);
-
-	const versionCheck = await preflightSwivalVersion();
-	if (versionCheck.isIncompatible) {
-		throw new SwivalArgumentError(versionCheck.errorMessage!);
-	}
-	if (versionCheck.advisoryMessage) {
-		current.versionAdvisory = versionCheck.advisoryMessage;
-	}
 
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
@@ -3088,6 +3097,16 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			if (params.async && ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0)) {
 				return {
 					content: [{ type: "text", text: "`async: true` is only supported in single mode (agent + task). Remove `chain` or `tasks`, or omit `async`." }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
+			// Reject a2aConfigOverride in multi-agent modes (parallel/chain) to prevent
+			// leaking A2A credentials or egress across arbitrary tasks.
+			if (params.a2aConfigOverride && ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0)) {
+				return {
+					content: [{ type: "text", text: "`a2aConfigOverride` is only supported in single mode (agent + task). Remove `chain` or `tasks`, or configure A2A in agent frontmatter." }],
 					details: makeDetails("single")([]),
 					isError: true,
 				};
