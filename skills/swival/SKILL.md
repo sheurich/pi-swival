@@ -246,7 +246,7 @@ agent intended. The trap to watch for:
 - `noSandboxAutoSession: true` on `sandboxed-explorer` and `audit-worker` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
 - `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
 - The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
-- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
+- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
 - A project-scope agent that shadows a bundled or user-scope agent name cannot unset `requiresReviewer: true` inherited from the shadowed name — the dispatcher forces it back to `true` so a repo-controlled file cannot impersonate `test-runner` (or any other reviewer-gated name) to silently drop its test-as-contract gate.
 
 When overriding a bundled agent name from the user scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
@@ -262,7 +262,7 @@ diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
 
 Upstream Swival 1.0.45 provides several behaviors that require no package changes:
 
-- Image-rejection retries, generic session headers, and streamed A2A response limits apply automatically.
+- Image-rejection retries, generic session headers, streamed A2A response limits, and endpoint-scoped model corrections apply automatically.
 - Large MCP tool catalogs load schemas on demand via `tool_search`; applies automatically to agents forked with `noMcp: false`.
 - Concurrent `edit_file` calls serialize per file within a session, preventing agents and subagents from overwriting edits.
 - `swival --init-config` preserves existing configuration values.
@@ -489,7 +489,7 @@ uv tool upgrade swival
 
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
-- Recommended: Swival 1.0.45 or later. Earlier 1.x releases produce an advisory upgrade notice.
+- Recommended: Swival 1.0.45 or later. Releases between 1.0.44 and 1.0.45 produce an advisory upgrade notice.
 - Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 

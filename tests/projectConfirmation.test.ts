@@ -140,4 +140,37 @@ describe("project-local agent confirmation", () => {
 		);
 		expect(resultEnv.isError).not.toBe(true);
 	});
+
+	it("does not bypass confirmation when PI_SWIVAL_TRUST_PROJECT_AGENTS is 0 or false", async () => {
+		for (const val of ["0", "false"]) {
+			process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS = val;
+
+			const projectDir = path.join(tmp, ".pi", "swival-agents");
+			fs.mkdirSync(projectDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(projectDir, "local-helper.md"),
+				["---", "name: local-helper", "description: test", "---", "Helper prompt"].join("\n"),
+			);
+
+			let tool: any;
+			registerExtension(
+				{
+					registerTool: (t: any) => {
+						tool = t;
+					},
+				} as any,
+				{ artifactRoot: path.join(tmp, "artifacts") },
+			);
+
+			const resultEnv = await tool.execute(
+				`test-id-refuse-${val}`,
+				{ agent: "local-helper", task: "do work", agentScope: "project" },
+				undefined,
+				undefined,
+				{ cwd: tmp, hasUI: false },
+			);
+			expect(resultEnv.isError).toBe(true);
+			expect(resultEnv.content[0].text).toMatch(/Refusing to run project-local swival agents/);
+		}
+	});
 });

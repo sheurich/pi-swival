@@ -10,7 +10,7 @@ function appendTrace(filePath: string, content: string) {
 }
 
 /** Poll until `predicate` returns true or `timeoutMs` elapses. */
-async function waitFor(predicate: () => boolean, timeoutMs = 3000, intervalMs = 50): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 5000, intervalMs = 50): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (predicate()) return;

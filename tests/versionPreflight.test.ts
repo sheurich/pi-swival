@@ -73,6 +73,13 @@ describe("version preflight semantics", () => {
 		expect(check.isIncompatible).toBe(false);
 	});
 
+	it("treats unparseable version string as incompatible", () => {
+		const check = evaluateSwivalVersion("not-a-version");
+		expect(check.isOutdated).toBe(true);
+		expect(check.isIncompatible).toBe(true);
+		expect(check.errorMessage).toContain("could not be parsed as semver");
+	});
+
 	it("caches version probe and re-evaluates when cache is cleared", async () => {
 		let callCount = 0;
 		const mockExec = async () => {

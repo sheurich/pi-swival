@@ -601,6 +601,16 @@ describe("buildSwivalArgs", () => {
 		).toThrow(/A2A requires --network full/);
 	});
 
+	it("throws when noA2a: false is set but network is not full", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ noA2a: false, network: "provider-only" }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A requires --network full/);
+	});
+
 	it("throws when a2aConfig is empty string", () => {
 		expect(() =>
 			buildSwivalArgs(

@@ -97,3 +97,37 @@ it("writes the output file with mode 0600 regardless of the process umask", asyn
 	const mode = fs.statSync(outputPath).mode & 0o777;
 	expect(mode).toBe(0o600);
 });
+
+it("refuses to write output when a parent directory is an existing symlink", async () => {
+	const outsideDir = path.join(root, "outside_dir");
+	fs.mkdirSync(outsideDir);
+	const parentLink = path.join(root, "workspace", "link_dir");
+	fs.symlinkSync(outsideDir, parentLink);
+
+	const result = await execute({ agent: "swival", task: "fixture", output: "link_dir/out.txt" });
+
+	expect(result.isError).not.toBe(true);
+	expect(fs.existsSync(path.join(outsideDir, "out.txt"))).toBe(false);
+	expect(result.details.results[0].outputPath).toBeUndefined();
+	expect(result.details.results[0].stderrTail.join("\n")).toMatch(/symlink/i);
+});
+
+it("rolls back output file if chmod fails", async () => {
+	const outputPath = path.join(root, "workspace", "chmod-fail.txt");
+	const originalChmod = fs.promises.chmod;
+	const chmodSpy = vi.spyOn(fs.promises, "chmod").mockImplementation((async (p: any, m: any) => {
+		if (String(p).includes(".tmp-output-")) {
+			throw new Error("EPERM: operation not permitted, chmod");
+		}
+		return originalChmod(p, m);
+	}) as any);
+
+	try {
+		const result = await execute({ agent: "swival", task: "fixture", output: "chmod-fail.txt" });
+		expect(fs.existsSync(outputPath)).toBe(false);
+		expect(result.details.results[0].outputPath).toBeUndefined();
+		expect(result.details.results[0].stderrTail.join("\n")).toMatch(/chmod/i);
+	} finally {
+		chmodSpy.mockRestore();
+	}
+});

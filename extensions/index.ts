@@ -157,6 +157,23 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
+async function hasSymlinkInPath(targetPath: string, rootAnchor?: string): Promise<string | null> {
+	let current = path.resolve(targetPath);
+	const anchor = rootAnchor ? path.resolve(rootAnchor) : undefined;
+	while (current && current !== anchor) {
+		try {
+			const lst = await fs.promises.lstat(current);
+			if (lst.isSymbolicLink()) return current;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return null;
+}
+
 async function writeRunOutput(
 	r: SwivalResult,
 	outputPath: string,
@@ -165,29 +182,35 @@ async function writeRunOutput(
 ): Promise<void> {
 	const resolved = path.isAbsolute(outputPath) ? outputPath : path.resolve(cwdAnchor, outputPath);
 	try {
-		// Refuse to write through an existing symlink. `outputPath` is model-
-		// controlled; a hostile repo can pre-plant a symlink (e.g. a tracked
-		// `linked.txt` pointing outside the repo) so a caller-chosen relative
-		// path silently redirects the write to an attacker-chosen target.
-		try {
-			const lst = await fs.promises.lstat(resolved);
-			if (lst.isSymbolicLink()) {
-				throw new Error(`refusing to write through existing symlink at ${resolved}`);
-			}
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		// Refuse to write through an existing symlink (both the leaf file and
+		// any parent directory component). `outputPath` is model-controlled;
+		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
+		// or `linked.txt -> /etc/passwd`) so a caller-chosen relative path
+		// silently redirects writes to an attacker-chosen target.
+		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
+		if (symlinkFound) {
+			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
 		}
-		await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
+		const dir = path.dirname(resolved);
+		await fs.promises.mkdir(dir, { recursive: true });
+		// Double check after mkdir in case a parent directory was created or replaced
+		const postMkdirSymlink = await hasSymlinkInPath(dir, cwdAnchor);
+		if (postMkdirSymlink) {
+			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
+		}
 		const body = r.finalOutput ?? "";
 		// finalOutput may carry decrypted secrets or task-adjacent sensitive
-		// content; never leave the output file group/world-readable regardless
-		// of the process umask.
-		await fs.promises.writeFile(resolved, body, { encoding: "utf-8", mode: 0o600 });
+		// content; write to a temporary file with mode 0600, apply chmod, and
+		// atomically rename so the destination is never left world-readable or
+		// partially written on failure.
+		const tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600 });
 		try {
-			await fs.promises.chmod(resolved, 0o600);
-		} catch (chmodErr) {
-			await fs.promises.unlink(resolved).catch(() => {});
-			throw chmodErr;
+			await fs.promises.chmod(tmpFile, 0o600);
+			await fs.promises.rename(tmpFile, resolved);
+		} catch (writeErr) {
+			await fs.promises.unlink(tmpFile).catch(() => {});
+			throw writeErr;
 		}
 		r.outputPath = resolved;
 		// Default file-only when output is set; inline opts back in.
@@ -578,12 +601,12 @@ export function buildSwivalArgs(
 	if (rawA2aConfig !== undefined && rawA2aConfig.trim() === "") {
 		throw new SwivalArgumentError("A2A configuration path cannot be empty.");
 	}
-	if (agent.source === "project" && (rawA2aConfig !== undefined || agent.allowA2a === true)) {
+	const a2aConfig = rawA2aConfig?.trim();
+	const effectiveA2a = Boolean(a2aConfig) || agent.allowA2a === true || agent.noA2a === false;
+	if (agent.source === "project" && effectiveA2a) {
 		throw new SwivalArgumentError(`Project-scope agent "${agent.name}" cannot enable A2A.`);
 	}
-	const a2aConfig = rawA2aConfig?.trim();
-	const allowA2a = Boolean(a2aConfig) || agent.allowA2a === true;
-	if (agent.noA2a !== false && !allowA2a) args.push("--no-a2a");
+	if (agent.noA2a !== false && !effectiveA2a) args.push("--no-a2a");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
 	if (agent.noMemory !== false) args.push("--no-memory");
@@ -678,7 +701,7 @@ export function buildSwivalArgs(
 	// agents, so it requires unrestricted network egress; reject the
 	// contradictory combination up front rather than letting swival's own
 	// argparse produce a less legible failure.
-	if (allowA2a && network && network !== "full") {
+	if (effectiveA2a && network && network !== "full") {
 		throw new SwivalArgumentError(
 			`Agent "${agent.name}" enables A2A but network is "${network}"; A2A requires --network full.`,
 		);
@@ -1449,6 +1472,17 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
 			isOutdated: false,
 			isIncompatible: false,
+		};
+	}
+	const parsed = parseSemver(installedVersion);
+	if (!parsed) {
+		return {
+			installedVersion,
+			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+			isOutdated: true,
+			isIncompatible: true,
+			errorMessage: `Installed Swival version "${installedVersion}" could not be parsed as semver (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
 		};
 	}
 	const isTooOld = compareSemver(installedVersion, MIN_COMPATIBLE_SWIVAL_VERSION) < 0;
@@ -2987,7 +3021,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			const agents = discovery.agents;
 			const trustProjectAgents =
 				options.trustProjectAgents === true ||
-				Boolean(process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS);
+				process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS === "1" ||
+				process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS === "true";
 			const confirmProjectAgents = !trustProjectAgents;
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
