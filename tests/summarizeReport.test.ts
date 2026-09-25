@@ -91,6 +91,35 @@ describe("summarizeReport", () => {
 		expect(s.truncationRepairs).toBe(1);
 	});
 
+	it("extracts exposure and cost from Swival 1.0.45 stats.exposure schema", () => {
+		const s = summarizeReport({
+			result: { outcome: "success", exit_code: 0 },
+			stats: {
+				exposure: {
+					unit: "tokens",
+					input: {
+						total: 8200,
+						system: 500,
+						user: 1200,
+						assistant: 2500,
+						tool_schemas: { read_file: 300, edit: 500 },
+						tool_results: { read_file: 2000, grep: 800 },
+						summaries: { previous_round: 400 },
+					},
+					cost: {
+						known_usd: 0.057,
+					},
+				},
+			},
+		});
+		expect(s.estimatedCostUsd).toBe(0.057);
+		expect(s.exposure?.totalEstimatedInputTokens).toBe(8200);
+		expect(s.exposure?.toolSchemas).toBe(800);
+		expect(s.exposure?.toolResults).toBe(2800);
+		expect(s.exposure?.summaries).toBe(400);
+		expect(s.exposure?.history).toBe(4200);
+	});
+
 	it("extracts estimatedCostUsd and exposure breakdown when present", () => {
 		const s = summarizeReport({
 			result: { outcome: "success", exit_code: 0 },

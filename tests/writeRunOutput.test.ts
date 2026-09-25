@@ -112,6 +112,21 @@ it("refuses to write output when a parent directory is an existing symlink", asy
 	expect(result.details.results[0].stderrTail.join("\n")).toMatch(/symlink/i);
 });
 
+it("refuses to write output when an absolute in-repo path points through an existing directory symlink", async () => {
+	const outsideDir = path.join(root, "outside_dir_abs");
+	fs.mkdirSync(outsideDir);
+	const parentLink = path.join(root, "workspace", "abs_link_dir");
+	fs.symlinkSync(outsideDir, parentLink);
+	const inRepoAbsolute = path.join(root, "workspace", "abs_link_dir", "abs-out.txt");
+
+	const result = await execute({ agent: "swival", task: "fixture", output: inRepoAbsolute });
+
+	expect(result.isError).not.toBe(true);
+	expect(fs.existsSync(path.join(outsideDir, "abs-out.txt"))).toBe(false);
+	expect(result.details.results[0].outputPath).toBeUndefined();
+	expect(result.details.results[0].stderrTail.join("\n")).toMatch(/symlink/i);
+});
+
 it("rolls back output file if chmod fails", async () => {
 	const outputPath = path.join(root, "workspace", "chmod-fail.txt");
 	const originalChmod = fs.promises.chmod;

@@ -157,7 +157,7 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
-async function hasSymlinkInPath(resolved: string, cwdAnchor: string, isRelative: boolean): Promise<string | null> {
+async function hasSymlinkInPath(resolved: string, cwdAnchor: string): Promise<string | null> {
 	// 1. Check if the target leaf itself is an existing symlink
 	try {
 		const lst = await fs.promises.lstat(resolved);
@@ -166,22 +166,20 @@ async function hasSymlinkInPath(resolved: string, cwdAnchor: string, isRelative:
 		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 	}
 
-	// 2. For relative paths within cwdAnchor, verify no parent directory component
+	// 2. For any path that resolves inside cwdAnchor, verify no parent directory component
 	// under cwdAnchor is a symlink.
-	if (isRelative) {
-		const anchor = path.resolve(cwdAnchor);
-		let current = path.dirname(resolved);
-		while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
-			try {
-				const lst = await fs.promises.lstat(current);
-				if (lst.isSymbolicLink()) return current;
-			} catch (err) {
-				if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-			}
-			const parent = path.dirname(current);
-			if (parent === current) break;
-			current = parent;
+	const anchor = path.resolve(cwdAnchor);
+	let current = path.dirname(resolved);
+	while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
+		try {
+			const lst = await fs.promises.lstat(current);
+			if (lst.isSymbolicLink()) return current;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
 		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
 	}
 	return null;
 }
@@ -199,16 +197,16 @@ async function writeRunOutput(
 		// Refuse to write through an existing symlink (both the leaf file and
 		// any parent directory component within cwdAnchor). `outputPath` is model-controlled;
 		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
-		// or `linked.txt -> /etc/passwd`) so a caller-chosen relative path
+		// or `linked.txt -> /etc/passwd`) so a caller-chosen path
 		// silently redirects writes to an attacker-chosen target.
-		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor, isRelative);
+		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
 		if (symlinkFound) {
 			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
 		}
 		const dir = path.dirname(resolved);
 		await fs.promises.mkdir(dir, { recursive: true });
 		// Double check directory component after mkdir
-		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor, isRelative);
+		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor);
 		if (postMkdirSymlink) {
 			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
 		}
@@ -1100,11 +1098,8 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		security,
 		stormedCalls: toNum(stats.stormed_calls),
 		truncationRepairs: toNum(stats.truncation_repairs),
-		exposure: summarizeExposure(raw.exposure ?? stats.exposure),
-		estimatedCostUsd:
-			toNum(stats.estimated_cost_usd) ??
-			toNum(stats.total_cost_usd) ??
-			toNum(stats.cost_usd),
+		exposure: summarizeExposure(stats.exposure ?? raw.exposure),
+		estimatedCostUsd: summarizeCost(stats.exposure ?? raw.exposure, stats),
 		providerTimeout: toNum(settings.provider_timeout),
 		initialToolChoice:
 			toStr(settings.initial_tool_choice) === "required" ? "required" : toStr(settings.initial_tool_choice) === "auto" ? "auto" : undefined,
@@ -1112,14 +1107,47 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	};
 }
 
+function sumDictValues(val: unknown): number | undefined {
+	if (typeof val === "number") return val;
+	if (val && typeof val === "object" && !Array.isArray(val)) {
+		let sum = 0;
+		let hasNumber = false;
+		for (const v of Object.values(val as Record<string, unknown>)) {
+			if (typeof v === "number") {
+				sum += v;
+				hasNumber = true;
+			}
+		}
+		return hasNumber ? sum : undefined;
+	}
+	return undefined;
+}
+
+function summarizeCost(exposureRaw: unknown, stats: Record<string, unknown>): number | undefined {
+	const exp = (exposureRaw && typeof exposureRaw === "object" ? exposureRaw : undefined) as Record<string, unknown> | undefined;
+	const expCost = exp?.cost && typeof exp.cost === "object" ? (exp.cost as Record<string, unknown>).known_usd : undefined;
+	return (
+		toNum(expCost) ??
+		toNum(stats.estimated_cost_usd) ??
+		toNum(stats.total_cost_usd) ??
+		toNum(stats.cost_usd)
+	);
+}
+
 function summarizeExposure(raw: unknown): ReportSummary["exposure"] {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
 	const e = raw as Record<string, unknown>;
-	const toolResults = toNum(e.tool_results) ?? toNum(e.toolResults);
-	const toolSchemas = toNum(e.tool_schemas) ?? toNum(e.toolSchemas);
-	const history = toNum(e.history);
-	const summaries = toNum(e.summaries);
-	const totalEstimatedInputTokens = toNum(e.total_estimated_input_tokens) ?? toNum(e.total);
+	const input = (e.input && typeof e.input === "object" && !Array.isArray(e.input)) ? (e.input as Record<string, unknown>) : e;
+
+	const toolResults = sumDictValues(input.tool_results) ?? toNum(input.toolResults);
+	const toolSchemas = sumDictValues(input.tool_schemas) ?? toNum(input.toolSchemas);
+	const summaries = sumDictValues(input.summaries);
+	const user = toNum(input.user) ?? 0;
+	const assistant = toNum(input.assistant) ?? 0;
+	const system = toNum(input.system) ?? 0;
+	const history = toNum(input.history) ?? (user + assistant + system > 0 ? user + assistant + system : undefined);
+	const totalEstimatedInputTokens = toNum(input.total) ?? toNum(input.total_estimated_input_tokens);
+
 	if (
 		toolResults === undefined &&
 		toolSchemas === undefined &&
@@ -1762,9 +1790,14 @@ export function startTraceTail(
 	} catch {
 		/* ignore — trace tail is best-effort */
 	}
+	const pollInterval = setInterval(() => {
+		if (!traceFile) void pickTraceFile();
+		else void consume();
+	}, 100);
 	void pickTraceFile();
 
 	return async () => {
+		clearInterval(pollInterval);
 		watcher?.close();
 		fileWatcher?.close();
 		await consume();
@@ -3272,15 +3305,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						};
 					}
 				}
-			}
-
-			const versionCheck = await preflightSwivalVersion();
-			if (versionCheck.isIncompatible) {
-				return {
-					content: [{ type: "text", text: versionCheck.errorMessage! }],
-					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-					isError: true,
-				};
 			}
 
 			if (params.chain && params.chain.length > 0) {
