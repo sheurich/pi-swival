@@ -81,6 +81,8 @@ export interface RunMeta {
 	/** Whether this run effectively requested AgentFS. Optional for artifacts
 	 *  written before AgentFS intent was persisted. */
 	agentFsRequested?: boolean;
+	/** Whether this run effectively requested Nono. */
+	nonoRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -155,17 +157,74 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
+async function hasSymlinkInPath(resolved: string, cwdAnchor: string): Promise<string | null> {
+	// 1. Check if the target leaf itself is an existing symlink
+	try {
+		const lst = await fs.promises.lstat(resolved);
+		if (lst.isSymbolicLink()) return resolved;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+
+	// 2. For any path that resolves inside cwdAnchor, verify no parent directory component
+	// under cwdAnchor is a symlink.
+	const anchor = path.resolve(cwdAnchor);
+	let current = path.dirname(resolved);
+	while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
+		try {
+			const lst = await fs.promises.lstat(current);
+			if (lst.isSymbolicLink()) return current;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return null;
+}
+
 async function writeRunOutput(
 	r: SwivalResult,
 	outputPath: string,
 	outputMode: "inline" | "file-only" | undefined,
 	cwdAnchor: string,
 ): Promise<void> {
-	const resolved = path.isAbsolute(outputPath) ? outputPath : path.resolve(cwdAnchor, outputPath);
+	const isRelative = !path.isAbsolute(outputPath);
+	const resolved = isRelative ? path.resolve(cwdAnchor, outputPath) : outputPath;
+	let tmpFile: string | undefined;
 	try {
-		await fs.promises.mkdir(path.dirname(resolved), { recursive: true });
+		// Refuse to write through an existing symlink (both the leaf file and
+		// any parent directory component within cwdAnchor). `outputPath` is model-controlled;
+		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
+		// or `linked.txt -> /etc/passwd`) so a caller-chosen path
+		// silently redirects writes to an attacker-chosen target.
+		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
+		if (symlinkFound) {
+			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
+		}
+		const dir = path.dirname(resolved);
+		await fs.promises.mkdir(dir, { recursive: true });
+		// Double check directory component after mkdir
+		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor);
+		if (postMkdirSymlink) {
+			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
+		}
 		const body = r.finalOutput ?? "";
-		await fs.promises.writeFile(resolved, body, "utf-8");
+		// finalOutput may carry decrypted secrets or task-adjacent sensitive
+		// content; write to a temporary file opened with flag 'wx' and mode 0600,
+		// apply chmod, and atomically rename so the destination is never left
+		// world-readable or partially written on failure.
+		tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		try {
+			await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+			await fs.promises.chmod(tmpFile, 0o600);
+			await fs.promises.rename(tmpFile, resolved);
+		} finally {
+			if (tmpFile) {
+				await fs.promises.unlink(tmpFile).catch(() => {});
+			}
+		}
 		r.outputPath = resolved;
 		// Default file-only when output is set; inline opts back in.
 		r.outputMode = outputMode ?? "file-only";
@@ -252,6 +311,60 @@ export function enforceAgentFsBootstrap(
 	};
 }
 
+/**
+ * Detect a Nono sandbox that was requested but never proven to have actually
+ * engaged. `sandbox.mode` in the report is written straight from argv
+ * (`report.py:349`), so it reads "nono" whether or not the sandbox actually
+ * executed — it is not evidence. `sandbox.nono_version` is set only when
+ * Nono sandbox isolation actually took effect.
+ *
+ * A run that requested "nono" and cannot show this evidence is a bootstrap
+ * failure: the caller believed execution was sandboxed when it may not have
+ * been. Returns undefined when nono was not requested or when evidence is present.
+ */
+export function nonoBootstrapFailure(
+	nonoRequested: boolean,
+	report: ReportSummary | undefined,
+): FailureReason | undefined {
+	if (!nonoRequested) return undefined;
+	if (!report) {
+		return {
+			code: "config_error",
+			text: "Nono sandbox was requested but no report was produced, so nono sandbox engagement cannot be confirmed.",
+		};
+	}
+	if (report.sandbox?.mode !== "nono") {
+		return {
+			code: "config_error",
+			text: `Nono sandbox was requested but report.sandbox.mode is "${report.sandbox?.mode ?? "missing"}", not "nono".`,
+		};
+	}
+	if (typeof report.sandbox.nonoVersion !== "string" || report.sandbox.nonoVersion === "") {
+		return {
+			code: "config_error",
+			text: 'Nono sandbox was requested and report.sandbox.mode says "nono", but sandbox.nono_version is absent, so nono sandbox engagement cannot be confirmed.',
+		};
+	}
+	return undefined;
+}
+
+export function enforceNonoBootstrap(
+	nonoRequested: boolean,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const failure = nonoBootstrapFailure(nonoRequested, report);
+	if (!failure) return { report };
+	return {
+		report: {
+			...(report ?? {}),
+			outcome: "error",
+			accepted: false,
+			errorMessage: failure.text,
+		},
+		reason: failure,
+	};
+}
+
 function lastCliOptionValue(args: readonly string[], option: string): string | undefined {
 	let value: string | undefined;
 	const equalsPrefix = `${option}=`;
@@ -287,6 +400,11 @@ export function isAgentFsRequested(args: readonly string[]): boolean {
 	return lastCliOptionValue(args, "--sandbox") === "agentfs";
 }
 
+/** Derive effective Nono intent from the arguments emitted to Swival. */
+export function isNonoRequested(args: readonly string[]): boolean {
+	return lastCliOptionValue(args, "--sandbox") === "nono";
+}
+
 /**
  * Derive whether a sandbox requiring process re-exec (AgentFS or nono) may be
  * triggered. Swival merges ambient configuration (~/.config/swival/config.toml
@@ -312,6 +430,14 @@ export function enforceCompletedAsyncAgentFs(
 ): { report: ReportSummary | undefined; reason?: FailureReason } {
 	const requested = meta.agentFsRequested === true || report?.sandbox?.mode === "agentfs";
 	return enforceAgentFsBootstrap(requested, report);
+}
+
+export function enforceCompletedAsyncNono(
+	meta: Pick<RunMeta, "nonoRequested">,
+	report: ReportSummary | undefined,
+): { report: ReportSummary | undefined; reason?: FailureReason } {
+	const requested = meta.nonoRequested === true || report?.sandbox?.mode === "nono";
+	return enforceNonoBootstrap(requested, report);
 }
 
 /**
@@ -461,6 +587,9 @@ export interface SwivalOverrides {
 	shareSkills?: boolean;
 	subagents?: boolean;
 	timeoutMs?: number;
+	a2aConfig?: string;
+	providerTimeout?: number;
+	initialToolChoice?: "auto" | "required";
 }
 
 export function buildSwivalArgs(
@@ -481,7 +610,16 @@ export function buildSwivalArgs(
 	// in (field=false).
 	if (agent.noLifecycle !== false) args.push("--no-lifecycle");
 	if (agent.noMcp !== false) args.push("--no-mcp");
-	if (agent.noA2a !== false) args.push("--no-a2a");
+	const rawA2aConfig = overrides.a2aConfig ?? agent.a2aConfig;
+	if (rawA2aConfig !== undefined && rawA2aConfig.trim() === "") {
+		throw new SwivalArgumentError("A2A configuration path cannot be empty.");
+	}
+	const a2aConfig = rawA2aConfig?.trim();
+	const effectiveA2a = Boolean(a2aConfig) || agent.allowA2a === true || agent.noA2a === false;
+	if (agent.source === "project" && effectiveA2a) {
+		throw new SwivalArgumentError(`Project-scope agent "${agent.name}" cannot enable A2A.`);
+	}
+	if (agent.noA2a !== false && !effectiveA2a) args.push("--no-a2a");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
 	if (agent.noMemory !== false) args.push("--no-memory");
@@ -518,6 +656,10 @@ export function buildSwivalArgs(
 	if (maxOutputTokens !== undefined) args.push("--max-output-tokens", String(maxOutputTokens));
 	const maxTurns = overrides.maxTurns ?? agent.maxTurns;
 	if (maxTurns !== undefined) args.push("--max-turns", String(maxTurns));
+	const providerTimeout = overrides.providerTimeout ?? agent.providerTimeout;
+	if (providerTimeout !== undefined) args.push("--provider-timeout", String(providerTimeout));
+	const initialToolChoice = overrides.initialToolChoice ?? agent.initialToolChoice;
+	if (initialToolChoice) args.push("--initial-tool-choice", initialToolChoice);
 
 	// Caching
 	const cache = overrides.cache ?? agent.cache;
@@ -567,6 +709,22 @@ export function buildSwivalArgs(
 	// Network policy
 	const network = overrides.network ?? agent.network;
 	if (network) args.push("--network", network);
+
+	// A2A (agent-to-agent) client configuration. A2A dials out to other
+	// agents, so it requires unrestricted network egress; reject the
+	// contradictory combination up front rather than letting swival's own
+	// argparse produce a less legible failure.
+	if (effectiveA2a && network && network !== "full") {
+		throw new SwivalArgumentError(
+			`Agent "${agent.name}" enables A2A but network is "${network}"; A2A requires --network full.`,
+		);
+	}
+	if (a2aConfig) {
+		const resolvedA2aConfig = path.isAbsolute(a2aConfig)
+			? a2aConfig
+			: path.resolve(cwd ?? process.cwd(), a2aConfig);
+		args.push("--a2a-config", resolvedA2aConfig);
+	}
 
 	// Command middleware
 	const commandMiddleware = overrides.commandMiddleware ?? agent.commandMiddleware;
@@ -696,7 +854,9 @@ interface ReportSummary {
 	errorMessage?: string;
 	// From stats.turns — number of agent-loop iterations actually executed.
 	turns?: number;
-	// Tool usage stats (no token/cost totals in the report schema).
+	// Tool usage stats and LLM cost. Cumulative estimated LLM cost is populated
+	// from stats.estimated_cost_usd / total_cost_usd / cost_usd when pricing
+	// metadata was available (Swival 1.0.40+).
 	toolCallsTotal?: number;
 	toolCallsByName?: Record<string, { succeeded?: number; failed?: number }>;
 	// Wall-clock breakdown for the session.
@@ -704,6 +864,7 @@ interface ReportSummary {
 	totalToolTimeS?: number;
 	llmCalls?: number;
 	compactions?: number;
+	estimatedCostUsd?: number;
 	// Last reviewer feedback (populated from timeline[] when a review rejected).
 	lastReviewFeedback?: string;
 	// Final answer, if result.answer is present in the report.
@@ -739,6 +900,20 @@ interface ReportSummary {
 	};
 	stormedCalls?: number;
 	truncationRepairs?: number;
+	// Context budgeting telemetry (Swival 1.0.45+).
+	exposure?: {
+		toolResults?: number;
+		toolSchemas?: number;
+		history?: number;
+		summaries?: number;
+		totalEstimatedInputTokens?: number;
+	};
+	// From settings.provider_timeout / settings.initial_tool_choice (swival
+	// 1.0.45+). Not currently emitted by swival's own report.settings, but
+	// parsed defensively in case a future release starts surfacing the
+	// effective values there.
+	providerTimeout?: number;
+	initialToolChoice?: "auto" | "required";
 	raw?: Record<string, unknown>;
 }
 
@@ -819,7 +994,7 @@ export interface SwivalResult {
 	// Undefined means swival's built-in default (100) was used. Surfaced
 	// in the header as "N/M turns" when a non-default limit was configured.
 	effectiveMaxTurns?: number;
-	// Advisory message when installed Swival is outdated (< 1.0.44).
+	// Advisory message when installed Swival is outdated (< 1.0.45).
 	versionAdvisory?: string;
 	// Set when the caller asked for per-task file output in parallel mode.
 	// `outputPath` is the absolute path we wrote finalOutput to; `outputMode`
@@ -852,6 +1027,7 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	// but use the documented keys as the authoritative source.
 	const stats = (raw.stats ?? {}) as Record<string, unknown>;
 	const result = (raw.result ?? {}) as Record<string, unknown>;
+	const settings = (raw.settings ?? {}) as Record<string, unknown>;
 	const timelineRaw = Array.isArray(raw.timeline) ? (raw.timeline as Array<Record<string, unknown>>) : [];
 
 	const outcomeVal = toStr(result.outcome);
@@ -922,8 +1098,66 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		security,
 		stormedCalls: toNum(stats.stormed_calls),
 		truncationRepairs: toNum(stats.truncation_repairs),
+		exposure: summarizeExposure(stats.exposure ?? raw.exposure),
+		estimatedCostUsd: summarizeCost(stats.exposure ?? raw.exposure, stats),
+		providerTimeout: toNum(settings.provider_timeout),
+		initialToolChoice:
+			toStr(settings.initial_tool_choice) === "required" ? "required" : toStr(settings.initial_tool_choice) === "auto" ? "auto" : undefined,
 		raw,
 	};
+}
+
+function sumDictValues(val: unknown): number | undefined {
+	if (typeof val === "number") return val;
+	if (val && typeof val === "object" && !Array.isArray(val)) {
+		let sum = 0;
+		let hasNumber = false;
+		for (const v of Object.values(val as Record<string, unknown>)) {
+			if (typeof v === "number") {
+				sum += v;
+				hasNumber = true;
+			}
+		}
+		return hasNumber ? sum : undefined;
+	}
+	return undefined;
+}
+
+function summarizeCost(exposureRaw: unknown, stats: Record<string, unknown>): number | undefined {
+	const exp = (exposureRaw && typeof exposureRaw === "object" ? exposureRaw : undefined) as Record<string, unknown> | undefined;
+	const expCost = exp?.cost && typeof exp.cost === "object" ? (exp.cost as Record<string, unknown>).known_usd : undefined;
+	return (
+		toNum(expCost) ??
+		toNum(stats.estimated_cost_usd) ??
+		toNum(stats.total_cost_usd) ??
+		toNum(stats.cost_usd)
+	);
+}
+
+function summarizeExposure(raw: unknown): ReportSummary["exposure"] {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const e = raw as Record<string, unknown>;
+	const input = (e.input && typeof e.input === "object" && !Array.isArray(e.input)) ? (e.input as Record<string, unknown>) : e;
+
+	const toolResults = sumDictValues(input.tool_results) ?? toNum(input.toolResults);
+	const toolSchemas = sumDictValues(input.tool_schemas) ?? toNum(input.toolSchemas);
+	const summaries = sumDictValues(input.summaries);
+	const user = toNum(input.user) ?? 0;
+	const assistant = toNum(input.assistant) ?? 0;
+	const system = toNum(input.system) ?? 0;
+	const history = toNum(input.history) ?? (user + assistant + system > 0 ? user + assistant + system : undefined);
+	const totalEstimatedInputTokens = toNum(input.total) ?? toNum(input.total_estimated_input_tokens);
+
+	if (
+		toolResults === undefined &&
+		toolSchemas === undefined &&
+		history === undefined &&
+		summaries === undefined &&
+		totalEstimatedInputTokens === undefined
+	) {
+		return undefined;
+	}
+	return { toolResults, toolSchemas, history, summaries, totalEstimatedInputTokens };
 }
 
 function summarizeSandbox(raw: unknown): ReportSummary["sandbox"] {
@@ -1045,7 +1279,7 @@ export function classifyFailure(
 			return { code: "config_error", text: `Model does not support function calling — ${reportMsg}` };
 		if (/lifecycle.*hook failed|lifecycleerror/i.test(reportMsg))
 			return { code: "config_error", text: `Lifecycle hook failed — ${reportMsg}` };
-		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested/i.test(reportMsg))
+		if (/configerror|unknown provider|invalid provider|agentfs binary not found|agentfs sandbox was requested|nono sandbox was requested/i.test(reportMsg))
 			return { code: "config_error", text: reportMsg };
 		return { code: "unknown", text: reportMsg };
 	}
@@ -1256,8 +1490,8 @@ export interface SwivalVersionCheck {
 	errorMessage?: string;
 }
 
-export const RECOMMENDED_SWIVAL_VERSION = "1.0.44";
-export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.0";
+export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
+export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.44";
 
 export function parseSemver(v: string): [number, number, number] | null {
 	const match = v.match(/\bv?(\d+)\.(\d+)\.(\d+)\b/);
@@ -1279,8 +1513,20 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 		return {
 			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
 			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
-			isOutdated: false,
-			isIncompatible: false,
+			isOutdated: true,
+			isIncompatible: true,
+			errorMessage: `Could not determine installed Swival version (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Verify Swival is installed and runs with 'swival --version', or upgrade with: uv tool upgrade swival`,
+		};
+	}
+	const parsed = parseSemver(installedVersion);
+	if (!parsed) {
+		return {
+			installedVersion,
+			recommendedVersion: RECOMMENDED_SWIVAL_VERSION,
+			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
+			isOutdated: true,
+			isIncompatible: true,
+			errorMessage: `Installed Swival version "${installedVersion}" could not be parsed as semver (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
 		};
 	}
 	const isTooOld = compareSemver(installedVersion, MIN_COMPATIBLE_SWIVAL_VERSION) < 0;
@@ -1293,7 +1539,7 @@ export function evaluateSwivalVersion(installedVersion: string | undefined): Swi
 			minCompatibleVersion: MIN_COMPATIBLE_SWIVAL_VERSION,
 			isOutdated: true,
 			isIncompatible: true,
-			errorMessage: `Installed Swival version ${installedVersion} is incompatible with report schema v1 (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
+			errorMessage: `Installed Swival version ${installedVersion} is incompatible (minimum required: ${MIN_COMPATIBLE_SWIVAL_VERSION}). Upgrade with: uv tool upgrade swival`,
 		};
 	}
 
@@ -1544,9 +1790,15 @@ export function startTraceTail(
 	} catch {
 		/* ignore — trace tail is best-effort */
 	}
+	const pollInterval = setInterval(() => {
+		if (!traceFile) void pickTraceFile();
+		else void consume();
+	}, 100);
+	pollInterval.unref?.();
 	void pickTraceFile();
 
 	return async () => {
+		clearInterval(pollInterval);
 		watcher?.close();
 		fileWatcher?.close();
 		await consume();
@@ -1731,7 +1983,8 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.runId !== "string" ||
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
-				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean")
+				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
+				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -1827,15 +2080,18 @@ interface CompletedAsyncInspection {
 async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
 	const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
 	const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
+	const nonoCheck = enforceCompletedAsyncNono(state.meta, bootstrapCheck.report);
+	const effectiveReport = nonoCheck.report;
+	const effectiveBootstrapReason = bootstrapCheck.reason ?? nonoCheck.reason;
 	const stderr = await fs.promises.readFile(state.meta.stderrFile, "utf-8").catch(() => "");
 	const stderrLines = stderr.split("\n").filter(Boolean);
 	const reason = terminalFailureReason(
 		state.exitCode ?? 1,
-		bootstrapCheck.report,
+		effectiveReport,
 		stderrLines,
-		bootstrapCheck.reason,
+		effectiveBootstrapReason,
 	);
-	return { report: bootstrapCheck.report, reason };
+	return { report: effectiveReport, reason };
 }
 
 function formatCompletedAsyncFailure(
@@ -1845,6 +2101,8 @@ function formatCompletedAsyncFailure(
 ): string {
 	const label = reason.text.startsWith("AgentFS sandbox was requested")
 		? "failed AgentFS bootstrap validation"
+		: reason.text.startsWith("Nono sandbox was requested")
+		? "failed Nono bootstrap validation"
 		: `failed (${reason.code})`;
 	return `Run ${runId} ${label}: ${reason.text}\nArtifact dir: ${state.meta.artifactDir}`;
 }
@@ -1900,6 +2158,7 @@ export async function runSingleSwivalAsync(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
+	const nonoRequested = isNonoRequested(args);
 	const isReexec = isReexecSandboxRequested(args);
 	if (isReexec) {
 		args.push("--", task);
@@ -1944,6 +2203,7 @@ export async function runSingleSwivalAsync(
 		stdoutFile,
 		stderrFile,
 		agentFsRequested,
+		nonoRequested,
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
@@ -2067,6 +2327,21 @@ async function runSingleSwival(
 		};
 	}
 
+	const versionCheck = await preflightSwivalVersion();
+	if (versionCheck.isIncompatible) {
+		return {
+			agent: agent.name,
+			agentSource: agent.source,
+			task,
+			exitCode: 1,
+			finalOutput: "",
+			stderrTail: [versionCheck.errorMessage!],
+			durationMs: 0,
+			errorMessage: versionCheck.errorMessage,
+			reason: { code: "config_error", text: versionCheck.errorMessage! },
+		};
+	}
+
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-swival-"));
 	const reportPath = path.join(tmpDir, "report.json");
 	const traceDir = path.join(tmpDir, "trace");
@@ -2081,6 +2356,7 @@ async function runSingleSwival(
 		stderrTail: [],
 		durationMs: 0,
 		traceEvents: [],
+		versionAdvisory: versionCheck.advisoryMessage,
 	};
 
 	const stderrLines: string[] = [];
@@ -2140,14 +2416,7 @@ async function runSingleSwival(
 	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir: overrides.traceDir ?? traceDir };
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
-
-	const versionCheck = await preflightSwivalVersion();
-	if (versionCheck.isIncompatible) {
-		throw new SwivalArgumentError(versionCheck.errorMessage!);
-	}
-	if (versionCheck.advisoryMessage) {
-		current.versionAdvisory = versionCheck.advisoryMessage;
-	}
+	const nonoRequested = isNonoRequested(args);
 
 	// `--` separates options from positional arguments. Without it, a task
 	// starting with `-` or `--` would be consumed by swival's argparse as a
@@ -2274,11 +2543,16 @@ async function runSingleSwival(
 		current.report = await readReport(reportPath);
 
 		// Fail closed when emitted arguments or Swival configuration requested
-		// AgentFS but the report cannot prove the overlay re-exec happened.
+		// AgentFS or Nono but the report cannot prove sandbox engagement.
 		const sandboxRequested = agentFsRequested || current.report?.sandbox?.mode === "agentfs";
 		const bootstrapCheck = enforceAgentFsBootstrap(sandboxRequested, current.report);
 		current.report = bootstrapCheck.report;
 		if (bootstrapCheck.reason) current.reason = bootstrapCheck.reason;
+
+		const nonoReq = nonoRequested || current.report?.sandbox?.mode === "nono";
+		const nonoCheck = enforceNonoBootstrap(nonoReq, current.report);
+		current.report = nonoCheck.report;
+		if (nonoCheck.reason && !current.reason) current.reason = nonoCheck.reason;
 
 		// Prefer result.answer from the report JSON as the authoritative final
 		// output. Swival streams the answer to stdout too, but our 256 KB stdout
@@ -2411,9 +2685,6 @@ const SwivalParams = Type.Object({
 		}),
 	),
 	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the swival process (single mode)" })),
 
 	// Dispatch-time overrides (outrank agent frontmatter).
@@ -2472,6 +2743,20 @@ const SwivalParams = Type.Object({
 	networkOverride: Type.Optional(
 		StringEnum(["full", "provider-only", "none"] as const, {
 			description: "Override network policy: full, provider-only, or none.",
+		}),
+	),
+	a2aConfigOverride: Type.Optional(
+		Type.String({
+			description:
+				"Path to an A2A TOML config file with [a2a_servers.*] tables for this call. Relative paths resolve against cwd. Suppresses --no-a2a and requires networkOverride/network=full (or omitted, which defaults to full).",
+		}),
+	),
+	providerTimeoutOverride: Type.Optional(
+		Type.Number({ description: "Override --provider-timeout (seconds) for this call. Swival's default is 900." }),
+	),
+	initialToolChoiceOverride: Type.Optional(
+		StringEnum(["auto", "required"] as const, {
+			description: "Override --initial-tool-choice for this call. Swival's default is auto.",
 		}),
 	),
 	nonoRollbackOverride: Type.Optional(
@@ -2571,6 +2856,9 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		reasoningEffort: g<string>("reasoningEffortOverride"),
 		instructionsFull: g<boolean>("instructionsFullOverride") ?? g<boolean>("instructionsFull"),
 		network: g<"full" | "provider-only" | "none">("networkOverride"),
+		a2aConfig: g<string>("a2aConfigOverride"),
+		providerTimeout: g<number>("providerTimeoutOverride"),
+		initialToolChoice: g<"auto" | "required">("initialToolChoiceOverride"),
 		nonoRollback: g<boolean>("nonoRollbackOverride"),
 		nonoBlockNet: g<boolean>("nonoBlockNetOverride"),
 		commandMiddleware: g<string>("commandMiddlewareOverride"),
@@ -2749,6 +3037,7 @@ export function buildParallelSummary(
 
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
+	trustProjectAgents?: boolean;
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
@@ -2788,8 +3077,11 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			const discoveryCwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
 			const discovery = discoverSwivalAgents(discoveryCwd, agentScope);
 			const agents = discovery.agents;
-			const confirmProjectAgents =
-				params.confirmProjectAgents !== false && !process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS;
+			const trustProjectAgents =
+				options.trustProjectAgents === true ||
+				process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS === "1" ||
+				process.env.PI_SWIVAL_TRUST_PROJECT_AGENTS === "true";
+			const confirmProjectAgents = !trustProjectAgents;
 			const overrides = buildOverridesFromParams(params as unknown as Record<string, unknown>);
 
 			const makeDetails =
@@ -2805,6 +3097,16 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			if (params.async && ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0)) {
 				return {
 					content: [{ type: "text", text: "`async: true` is only supported in single mode (agent + task). Remove `chain` or `tasks`, or omit `async`." }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
+			// Reject a2aConfigOverride in multi-agent modes (parallel/chain) to prevent
+			// leaking A2A credentials or egress across arbitrary tasks.
+			if (params.a2aConfigOverride && ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0)) {
+				return {
+					content: [{ type: "text", text: "`a2aConfigOverride` is only supported in single mode (agent + task). Remove `chain` or `tasks`, or configure A2A in agent frontmatter." }],
 					details: makeDetails("single")([]),
 					isError: true,
 				};
@@ -3005,7 +3307,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					const names = projectRequested.map((a) => a.name).join(", ");
 					if (!ctx.hasUI) {
 						return {
-							content: [{ type: "text", text: `Refusing to run project-local swival agents (${names}) without UI confirmation. Pass confirmProjectAgents: false to opt out, or invoke from an interactive session.` }],
+							content: [{ type: "text", text: `Refusing to run project-local swival agents (${names}) without UI confirmation. Set PI_SWIVAL_TRUST_PROJECT_AGENTS=1 to opt out, or invoke from an interactive session.` }],
 							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 							isError: true,
 						};
@@ -3022,15 +3324,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						};
 					}
 				}
-			}
-
-			const versionCheck = await preflightSwivalVersion();
-			if (versionCheck.isIncompatible) {
-				return {
-					content: [{ type: "text", text: versionCheck.errorMessage! }],
-					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-					isError: true,
-				};
 			}
 
 			if (params.chain && params.chain.length > 0) {
@@ -3050,7 +3343,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
+					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
 					// Per-step seed outranks the shared override so callers can
 					// seed each step independently for reproducibility.
 					const perStepOverrides: SwivalOverrides =

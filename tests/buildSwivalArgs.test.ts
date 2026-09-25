@@ -529,4 +529,112 @@ describe("buildSwivalArgs", () => {
 		expect(args).toContain("--no-subagents");
 		expect(args).not.toContain("--subagents");
 	});
+
+	it("passes providerTimeout and initialToolChoice from frontmatter", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ providerTimeout: 120, initialToolChoice: "required" }),
+			"/tmp/r.json",
+			"/cwd",
+		);
+		expect(args).toContain("--provider-timeout");
+		expect(args).toContain("120");
+		expect(args).toContain("--initial-tool-choice");
+		expect(args).toContain("required");
+	});
+
+	it("overrides outrank frontmatter for providerTimeout/initialToolChoice", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ providerTimeout: 120, initialToolChoice: "required" }),
+			"/tmp/r.json",
+			"/cwd",
+			{ providerTimeout: 300, initialToolChoice: "auto" },
+		);
+		expect(args[args.indexOf("--provider-timeout") + 1]).toBe("300");
+		expect(args[args.indexOf("--initial-tool-choice") + 1]).toBe("auto");
+	});
+
+	it("a2aConfig suppresses --no-a2a and absolutizes a relative path against cwd", () => {
+		const args = buildSwivalArgs(
+			makeAgent({ a2aConfig: "a2a.toml" }),
+			"/tmp/r.json",
+			"/repo",
+		);
+		expect(args).not.toContain("--no-a2a");
+		expect(args).toContain("--a2a-config");
+		expect(args[args.indexOf("--a2a-config") + 1]).toBe("/repo/a2a.toml");
+	});
+
+	it("a2aConfigOverride outranks frontmatter and keeps an absolute path unchanged", () => {
+		const args = buildSwivalArgs(
+			makeAgent(),
+			"/tmp/r.json",
+			"/repo",
+			{ a2aConfig: "/etc/swival/a2a.toml" },
+		);
+		expect(args).not.toContain("--no-a2a");
+		expect(args[args.indexOf("--a2a-config") + 1]).toBe("/etc/swival/a2a.toml");
+	});
+
+	it("allowA2a: true suppresses --no-a2a without an a2aConfig", () => {
+		const args = buildSwivalArgs(makeAgent({ allowA2a: true }), "/tmp/r.json", "/cwd");
+		expect(args).not.toContain("--no-a2a");
+		expect(args).not.toContain("--a2a-config");
+	});
+
+	it("throws when a2aConfig is set but network is not full", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ a2aConfig: "a2a.toml", network: "provider-only" }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A requires --network full/);
+	});
+
+	it("throws when allowA2a is set but network is not full", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ allowA2a: true, network: "none" }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A requires --network full/);
+	});
+
+	it("throws when noA2a: false is set but network is not full", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ noA2a: false, network: "provider-only" }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A requires --network full/);
+	});
+
+	it("throws when a2aConfig is empty string", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ a2aConfig: "   " }),
+				"/tmp/r.json",
+				"/repo",
+			),
+		).toThrow(/A2A configuration path cannot be empty/);
+	});
+
+	it("throws when project agent attempts to enable A2A via override", () => {
+		expect(() =>
+			buildSwivalArgs(
+				makeAgent({ source: "project" }),
+				"/tmp/r.json",
+				"/repo",
+				{ a2aConfig: "/tmp/a2a.toml" },
+			),
+		).toThrow(/Project-scope agent "test-agent" cannot enable A2A/);
+	});
+
+	it("allows a2aConfig with network omitted (defaults to full)", () => {
+		const args = buildSwivalArgs(makeAgent({ a2aConfig: "a2a.toml" }), "/tmp/r.json", "/repo");
+		expect(args).not.toContain("--network");
+		expect(args).toContain("--a2a-config");
+	});
 });

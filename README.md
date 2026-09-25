@@ -11,7 +11,7 @@ The package bundles:
 - `auditing-with-swival` skill — a three-stage recon → per-bucket → consolidate pipeline for security audits over codebases too large for one worker.
 - `swival-worker-briefs` skill — task brief structure and evidence standards for `self-review-worker` dispatches.
 - `swival-audit` prompt template — slash-command-style invocation that walks an interactive operator through the audit pipeline.
-- Seven swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
+- Eight swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, `a2a-coordinator` (general-purpose), plus `audit-worker`, `security-recon`, `security-consolidator` (audit pipeline).
 
 ## Install
 
@@ -31,7 +31,7 @@ Or install from a local checkout:
 pi install /path/to/pi-swival
 ```
 
-The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The seven bundled swival agents under `agents/` are discovered automatically by the extension at runtime — no symlinks or manual copies needed.
+The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The eight bundled swival agents under `agents/` are discovered automatically by the extension at runtime — no symlinks or manual copies needed.
 
 To override a bundled agent or add your own, place `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` in a project root (project scope). Discovery priority: project > user > bundled.
 
@@ -89,11 +89,12 @@ Bundled in `agents/` for the `swival-subagent` tool:
 | `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks. |
 | `test-runner` | Task has a runnable test command as acceptance criterion (caller passes `reviewerOverride`). |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying. |
+| `a2a-coordinator` | Coordinate tasks across remote Agent2Agent (A2A) endpoints via `a2a__*` tools. |
 | `audit-worker` | Read-only security or domain audit (Stage 2 of the audit pipeline). |
 | `security-recon` | Survey a repository and emit `recon.json` (Stage 1 of the audit pipeline). |
 | `security-consolidator` | Merge per-bucket audit reports into one consolidated findings document (Stage 3). |
 
-The first four agents handle general-purpose development tasks (unreviewed execution, self-reviewed edits, test-driven validation, and sandboxed exploration). The last three implement the three-stage security audit pipeline documented in the `auditing-with-swival` skill.
+The first five agents handle general-purpose development tasks (unreviewed execution, self-reviewed edits, test-driven validation, sandboxed exploration, and A2A orchestration). The last three implement the three-stage security audit pipeline documented in the `auditing-with-swival` skill.
 
 Audit agents include built-in self-review with JSON / structure contract enforcement, an AgentFS sandbox, and a read-only command allowlist.
 
@@ -107,7 +108,7 @@ pi-swival/
 ├── extensions/
 │   ├── index.ts                # swival-subagent tool implementation
 │   └── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
-├── agents/                     # seven bundled swival agents (auto-discovered)
+├── agents/                     # eight bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md
 │   ├── auditing-with-swival/   # SKILL.md, references/{recon-contract,audit-prompt-template,consolidation-contract}.md

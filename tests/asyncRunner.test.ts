@@ -60,7 +60,7 @@ describe("durable async runner", () => {
 		fs.mkdirSync(bin);
 		fs.mkdirSync(artifacts);
 		const fakeSwival = path.join(bin, "swival");
-		fs.writeFileSync(fakeSwival, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+		fs.writeFileSync(fakeSwival, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "1.0.45"; exit 0; fi\nexit 0\n', { mode: 0o755 });
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${bin}:${originalPath ?? ""}`;
 		try {
@@ -91,7 +91,7 @@ describe("durable async runner", () => {
 		fs.mkdirSync(bin);
 		fs.mkdirSync(artifacts);
 		const fakeSwival = path.join(bin, "swival");
-		fs.writeFileSync(fakeSwival, "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n", { mode: 0o755 });
+		fs.writeFileSync(fakeSwival, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.0.45\"; exit 0; fi\ntrap '' TERM\nwhile :; do sleep 1; done\n", { mode: 0o755 });
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${bin}:${originalPath ?? ""}`;
 		let wrapperPid: number | undefined;

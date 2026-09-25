@@ -35,6 +35,8 @@ export interface SwivalAgentConfig {
 	reasoningEffort?: string;
 	maxOutputTokens?: number;
 	maxTurns?: number;
+	providerTimeout?: number;
+	initialToolChoice?: "auto" | "required";
 
 	// Reviewer loop
 	selfReview?: boolean;
@@ -86,6 +88,12 @@ export interface SwivalAgentConfig {
 	// Context-management / retries
 	proactiveSummaries?: boolean;
 	retries?: number;
+
+	// A2A (agent-to-agent) client configuration
+	a2aConfig?: string;
+	/** Positive opt-in companion to noA2a, mirroring the subagents/noSubagents
+	 *  pair — set true to enable A2A without supplying an a2aConfig path. */
+	allowA2a?: boolean;
 
 	// Nested-invocation hygiene (default true for all — see buildSwivalArgs)
 	noLifecycle?: boolean;
@@ -199,6 +207,8 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			reasoningEffort: typeof fm.reasoningEffort === "string" ? fm.reasoningEffort : undefined,
 			maxOutputTokens: asNumber(fm.maxOutputTokens),
 			maxTurns: asNumber(fm.maxTurns),
+			providerTimeout: asNumber(fm.providerTimeout),
+			initialToolChoice: asEnum(fm.initialToolChoice, ["auto", "required"] as const),
 
 			selfReview: asBool(fm.selfReview),
 			reviewer: typeof fm.reviewer === "string" ? fm.reviewer : undefined,
@@ -243,6 +253,9 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			noSubagents: asBool(fm.noSubagents),
 			subagents: asBool(fm.subagents),
 
+			a2aConfig: typeof fm.a2aConfig === "string" ? fm.a2aConfig : undefined,
+			allowA2a: asBool(fm.allowA2a),
+
 			quiet: asBool(fm.quiet),
 			extraArgs: asStringArray(fm.extraArgs),
 
@@ -267,10 +280,32 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 			// less restrictive network policy to prevent overriding ambient "none" config.
 			if (agentConfig.network !== "none") agentConfig.network = undefined;
 			agentConfig.nonoAllowDomain = undefined;
-			// Force sandbox for project agents that don't specify a safe sandbox
-			if (!agentConfig.sandbox || agentConfig.sandbox === "builtin") {
-				agentConfig.sandbox = "agentfs";
-			}
+			agentConfig.nonoRollback = undefined;
+			agentConfig.nonoBlockNet = undefined;
+			// Provider/model/baseUrl redirect the LLM request itself (including
+			// the Authorization header carrying the provider API key) to an
+			// attacker-controlled endpoint or a fake "command" provider that
+			// executes arbitrary shell commands as the "model". Never let a
+			// repo-controlled agent choose these.
+			agentConfig.provider = undefined;
+			agentConfig.model = undefined;
+			agentConfig.baseUrl = undefined;
+			agentConfig.profile = undefined;
+			// baseDir/addDir/addDirRo escape the repo-scoped working tree
+			// entirely (e.g. baseDir: "/", addDir: ["~/.ssh"]), regardless of
+			// the forced sandbox below.
+			agentConfig.baseDir = undefined;
+			agentConfig.addDir = undefined;
+			agentConfig.addDirRo = undefined;
+			// A2A connects to other agents over the network under the calling
+			// operator's identity; never let a repo-controlled agent enable it.
+			agentConfig.a2aConfig = undefined;
+			agentConfig.allowA2a = undefined;
+			agentConfig.noA2a = true;
+			// Force AgentFS for every project agent, including "nono" — the prior
+			// check only forced agentfs when sandbox was unset or "builtin",
+			// letting `sandbox: nono` pass through unmodified.
+			agentConfig.sandbox = "agentfs";
 		}
 		agents.push(agentConfig);
 	}
@@ -328,7 +363,15 @@ export function discoverSwivalAgents(cwd: string, scope: AgentScope): SwivalAgen
 		for (const a of userAgents) agentMap.set(a.name, a);
 	}
 	if (scope === "both" || scope === "project") {
-		for (const a of projectAgents) agentMap.set(a.name, a);
+		for (const a of projectAgents) {
+			// A repo-controlled project agent can shadow a trusted (bundled or
+			// user) name to silently defeat that name's reviewer/test contract
+			// (e.g. impersonating "test-runner" without requiresReviewer). Once
+			// a more-trusted source declares requiresReviewer, an untrusted
+			// project override cannot unset it.
+			if (agentMap.get(a.name)?.requiresReviewer === true) a.requiresReviewer = true;
+			agentMap.set(a.name, a);
+		}
 	}
 
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };

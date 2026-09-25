@@ -42,9 +42,9 @@ Confirm it shows up in your settings:
 pi list | grep pi-swival
 ```
 
-All seven bundled agents (`swival`, `self-review-worker`, `test-runner`,
+All eight bundled agents (`swival`, `self-review-worker`, `test-runner`,
 `sandboxed-explorer`, `audit-worker`, `security-recon`,
-`security-consolidator`) are auto-discovered from the package's `agents/`
+`security-consolidator`, `a2a-coordinator`) are auto-discovered from the package's `agents/`
 directory — no symlinks needed.
 
 ## Demo 1 — generic delegation

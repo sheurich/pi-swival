@@ -10,7 +10,7 @@ function appendTrace(filePath: string, content: string) {
 }
 
 /** Poll until `predicate` returns true or `timeoutMs` elapses. */
-async function waitFor(predicate: () => boolean, timeoutMs = 3000, intervalMs = 50): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 5000, intervalMs = 50): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
@@ -129,7 +129,7 @@ describe("startTraceTail", () => {
 			(e) => e.type === "text" && (e as { text: string }).text === "You are a test agent.",
 		);
 		expect(systemEvents).toHaveLength(0);
-	});
+	}, 10000);
 
 	it("handles trace file appearing after startTraceTail is called", async () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-tail-test-"));

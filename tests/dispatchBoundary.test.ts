@@ -7,12 +7,20 @@ import registerExtension from "../extensions/index.js";
 describe("argument-validation dispatch boundary", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const originalTmpDir = process.env.TMPDIR;
+	let originalPath: string | undefined;
 	let root: string;
 	let artifactRoot: string;
 	let tool: { execute: (...args: any[]) => Promise<any> };
 
 	beforeEach(() => {
 		root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-boundary-")));
+		const binDir = path.join(root, "bin");
+		fs.mkdirSync(binDir);
+		const fakeSwival = path.join(binDir, "swival");
+		fs.writeFileSync(fakeSwival, '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "1.0.45"; exit 0; fi\nexit 0\n', { mode: 0o755 });
+		originalPath = process.env.PATH;
+		process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+
 		const agentDir = path.join(root, "agent");
 		const agentsDir = path.join(agentDir, "swival-agents");
 		artifactRoot = path.join(root, "artifacts");
@@ -58,6 +66,7 @@ describe("argument-validation dispatch boundary", () => {
 	});
 
 	afterEach(() => {
+		if (originalPath !== undefined) process.env.PATH = originalPath;
 		if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 		if (originalTmpDir === undefined) delete process.env.TMPDIR;
@@ -110,5 +119,41 @@ describe("argument-validation dispatch boundary", () => {
 		expect(result.content[0].text).toMatch(/Refusing to dispatch/);
 		expect(fs.readdirSync(artifactRoot)).toEqual([]);
 		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
+	});
+
+	it("rejects a2aConfigOverride in parallel or chain modes", async () => {
+		const parallelResult = await tool.execute(
+			"test-parallel-a2a",
+			{
+				agentScope: "user",
+				a2aConfigOverride: "/tmp/a2a.toml",
+				tasks: [
+					{ agent: "swival", task: "one" },
+					{ agent: "swival", task: "two" },
+				],
+			},
+			undefined,
+			undefined,
+			{ cwd: process.cwd(), hasUI: false },
+		);
+		expect(parallelResult.isError).toBe(true);
+		expect(parallelResult.content[0].text).toMatch(/`a2aConfigOverride` is only supported in single mode/);
+
+		const chainResult = await tool.execute(
+			"test-chain-a2a",
+			{
+				agentScope: "user",
+				a2aConfigOverride: "/tmp/a2a.toml",
+				chain: [
+					{ agent: "swival", task: "one" },
+					{ agent: "swival", task: "two" },
+				],
+			},
+			undefined,
+			undefined,
+			{ cwd: process.cwd(), hasUI: false },
+		);
+		expect(chainResult.isError).toBe(true);
+		expect(chainResult.content[0].text).toMatch(/`a2aConfigOverride` is only supported in single mode/);
 	});
 });
