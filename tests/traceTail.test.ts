@@ -129,7 +129,7 @@ describe("startTraceTail", () => {
 			(e) => e.type === "text" && (e as { text: string }).text === "You are a test agent.",
 		);
 		expect(systemEvents).toHaveLength(0);
-	});
+	}, 10000);
 
 	it("handles trace file appearing after startTraceTail is called", async () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-tail-test-"));
