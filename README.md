@@ -89,7 +89,7 @@ Bundled in `agents/` for the `swival-subagent` tool:
 | `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks. |
 | `test-runner` | Task has a runnable test command as acceptance criterion (caller passes `reviewerOverride`). |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying. |
-| `a2a-coordinator` | Coordinate tasks across remote Agent2Agent (A2A) endpoints via `a2a__*` tools. |
+| `a2a-coordinator` | Coordinate tasks across remote Agent2Agent (A2A) endpoints configured via a2aConfig; requires network: full. |
 | `audit-worker` | Read-only security or domain audit (Stage 2 of the audit pipeline). |
 | `security-recon` | Survey a repository and emit `recon.json` (Stage 1 of the audit pipeline). |
 | `security-consolidator` | Merge per-bucket audit reports into one consolidated findings document (Stage 3). |

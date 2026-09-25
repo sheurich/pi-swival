@@ -174,7 +174,7 @@ definition:
 | `subagentsOverride` | Allow Swival to spawn native subagents |
 | `cacheOverride` | Enable LLM response caching |
 | `cacheDirOverride` | Cache directory |
-| `a2aConfigOverride` | Path to an A2A TOML config file; suppresses `--no-a2a` and requires `network: full` |
+| `a2aConfigOverride` | Path to an A2A TOML config file (single mode only); requires `network: full` |
 | `providerTimeoutOverride` | Provider request timeout in seconds (default 900) |
 | `initialToolChoiceOverride` | Tool selection for the first model request (`auto`, `required`) |
 
