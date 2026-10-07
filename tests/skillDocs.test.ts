@@ -15,7 +15,7 @@ const BRIEFS_SKILL_DIR = join(SKILLS_DIR, "swival-worker-briefs");
 const BRIEFS_SKILL = join(BRIEFS_SKILL_DIR, "SKILL.md");
 const AGENTS_DIR = join(PACKAGE_ROOT, "agents");
 
-const SWIVAL_VERSION = "1.0.45";
+const SWIVAL_VERSION = "1.0.46";
 
 function read(file: string): string {
 	return readFileSync(file, "utf8");
@@ -152,8 +152,8 @@ describe("swival SKILL.md preserves package mechanics", () => {
 		}
 	});
 
-	it("covers all eight bundled agents", () => {
-		expect(bundledAgentNames()).toHaveLength(8);
+	it("covers all five bundled agents", () => {
+		expect(bundledAgentNames()).toHaveLength(5);
 	});
 
 	it("stays under 500 lines", () => {
@@ -161,19 +161,64 @@ describe("swival SKILL.md preserves package mechanics", () => {
 	});
 });
 
-describe("auditing-with-swival points at the bundled audit-worker", () => {
-	const skill = () => read(AUDIT_SKILL);
-
-	it("uses the bundled relative source path", () => {
-		expect(skill()).toContain("../../agents/audit-worker.md");
+describe("native audit documentation and routing handoff", () => {
+	it.each(["README.md", "skills/swival/SKILL.md", "skills/auditing-with-swival/SKILL.md", "prompts/swival-audit.md"])(
+		"%s documents native connection lifetime and fail-closed disk recovery", (file) => {
+			const doc = read(join(PACKAGE_ROOT, file));
+			expect(doc).toMatch(/originating Pi[^\n]{0,100}connected/i);
+			expect(doc).toMatch(/disconnect cancels[^\n]{0,50}native audit/i);
+			expect(doc).toMatch(/disk-only[^\n]{0,100}unknown/i);
+			expect(doc).toMatch(/retain[^\n]{0,100}snapshot|snapshot[^\n]{0,100}retain/i);
+			expect(doc).toContain("spawn-error.txt");
+		},
+	);
+	it("documents retention when automatic pruning lacks trustworthy metadata or shutdown evidence", () => {
+		const doc = read(join(PACKAGE_ROOT, "README.md"));
+		expect(doc).toMatch(/untrusted metadata/i);
+		expect(doc).toMatch(/native[^\n]{0,100}shutdown evidence/);
 	});
-
-	it("drops the stale user-scope source pointer", () => {
-		expect(skill().includes("~/.pi/agent/swival-agents/audit-worker.md")).toBe(false);
+	it.each(["README.md", "skills/swival/SKILL.md", "skills/auditing-with-swival/SKILL.md"])(
+		"%s separates ordinary plain-text delivery from native command execution", (file) => {
+			const doc = read(join(PACKAGE_ROOT, file));
+			expect(doc).toContain("plain-text heading");
+			expect(doc).toContain("oneshot_commands=true");
+			expect(doc).toMatch(/explicit `audit` API/);
+		},
+	);
+	it.each([
+		"README.md", "examples/demo.md", "prompts/swival-audit.md",
+		"skills/auditing-with-swival/SKILL.md", "skills/swival/SKILL.md",
+		"skills/swival/references/setup.md",
+	])("%s states the native platform restriction and required isolation canary", (file) => {
+		const doc = read(join(PACKAGE_ROOT, file));
+		expect(doc).toMatch(/Linux[^\n]{0,80}AgentFS 0\.6\.4/);
+		expect(doc).toMatch(/Darwin\/macOS[^\n]{0,80}blocked/);
+		expect(doc).toMatch(/unverified[^\n]{0,100}fail closed/i);
+		expect(doc).toMatch(/native[^\n]{0,80}canary/i);
 	});
-
-	it("keeps the noSandboxAutoSession guidance", () => {
-		expect(skill()).toContain("noSandboxAutoSession: true");
+	it.each([
+		["skill", AUDIT_SKILL], ["prompt", join(PACKAGE_ROOT, "prompts", "swival-audit.md")],
+	])("%s resolves approved audit routing without fallback", (_label, file) => {
+		const doc = read(file);
+		for (const required of ["chatgpt-daybreak-blue", "xhigh", "frontier", "high",
+			"swival --list-profiles", "provider and data boundaries", '"<audit-profile>"', '"<audit-effort>"', '"audit"']) {
+			expect(doc).toContain(required);
+		}
+		expect(doc).toMatch(/no.*fallback|do not.*fall back|never.*fall back/i);
+		expect(doc).toMatch(/not guaranteed/);
+	});
+	it("documents unsupported protection controls and committed-only source", () => {
+		const doc = read(AUDIT_SKILL);
+		for (const required of ["encryption", "filtering", "staged", "untracked", "nono", "patch", "native-state",
+			"commands", "none", "provider-only", "Session.ask", "parse_commands=True"]) expect(doc).toContain(required);
+	});
+	it("removes the custom audit agents and contracts from all documentation", () => {
+		for (const file of documentationFiles()) expect(read(file), file).not.toMatch(/audit-worker|security-recon|security-consolidator|recon-contract|consolidation-contract/);
+	});
+	it("corrects the claim that finalization traces are live tool streaming", () => {
+		const doc = read(join(PACKAGE_ROOT, "README.md"));
+		expect(doc).toMatch(/finalization/);
+		expect(doc).not.toMatch(/yes \(`--trace-dir` watcher/);
 	});
 });
 

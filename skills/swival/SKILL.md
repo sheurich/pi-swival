@@ -11,16 +11,13 @@ description: >-
 
 # Swival
 
-Tracked against Swival 1.0.45.
+Tracked against Swival 1.0.46.
 
-Swival is a coding agent with a built-in reviewer loop, layered
-sandboxing (builtin + AgentFS + nono), format-preserving secret
-encryption, outbound request filtering, and A2A orchestration.
-Access it from Pi via the `swival-subagent` tool.
+Swival combines reviewer loops, filesystem sandboxing, secret encryption, request filtering, and A2A orchestration. Access it through `swival-subagent`.
 
 ## Delegation via swival-subagent
 
-The `swival-subagent` tool dispatches tasks to swival with streaming, structured results, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with `PI_SWIVAL_TRUST_PROJECT_AGENTS=1` (or `true`) or extension options.
+The `swival-subagent` tool dispatches tasks with structured results, finalization trace display, and error classification. Bundled agents ship with the package and work immediately. Override or extend them by placing `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` (project scope). Discovery priority: project > user > bundled. By default, `agentScope` defaults to `user`. Project-scope agents require `agentScope: "project"` or `"both"`. Every project-scope dispatch prompts for user confirmation unless disabled with `PI_SWIVAL_TRUST_PROJECT_AGENTS=1` (or `true`) or extension options.
 
 Bundled definitions live at `../../agents/<name>.md` relative to this skill, so the path holds wherever Pi installed the package. Read that file to see an agent's real frontmatter.
 
@@ -32,12 +29,9 @@ Bundled definitions live at `../../agents/<name>.md` relative to this skill, so 
 | `test-runner` | Task has a runnable test command as acceptance criterion (pass `reviewerOverride`) |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying |
 | `swival` | Simple delegation, no review needed (also the default when agent is omitted) |
-| `audit-worker` | Read-only security or domain audit bucket; task must start with `/audit` (Stage 2 of the audit pipeline) |
-| `security-recon` | Survey a repository and emit `recon.json` bucket specs (Stage 1) |
-| `security-consolidator` | Merge per-bucket audit reports into one findings document (Stage 3) |
 | `a2a-coordinator` | Delegate part of a task to a remote A2A agent named in an `a2aConfig` TOML file; requires `network: full` |
 
-The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc. Use the `swival-worker-briefs` skill to write structured task briefs for `self-review-worker`.
+Use `auditing-with-swival` and the explicit `audit` API for native execution. Ordinary delegation adds one fixed plain-text heading; slash/bang text stays a prompt even with ambient `oneshot_commands=true`. Task metadata remains unchanged. This prevents unintended command-script dispatch, not model prompt injection. Use `swival-worker-briefs` for `self-review-worker` task briefs.
 
 ### Dispatch examples
 
@@ -83,7 +77,7 @@ swival-subagent with tasks: [
 ]
 ```
 
-AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on the agent definition. Both `sandboxed-explorer` and `audit-worker` enable this setting.
+AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` and no named shared session. `sandboxed-explorer` enables this setting. Command-name allowlists are write-capable, including `git`; without fresh overlays, same-cwd parallel dispatch requires both `files=none` and `commands=none`.
 
 Git worktree isolation for real filesystem mutations:
 
@@ -126,7 +120,7 @@ Run a long task in the background and return immediately:
 swival-subagent with agent: "self-review-worker", task: "Refactor the auth module", async: true
 ```
 
-The tool returns a `runId` (e.g. `swival-run-1716326580000`). `async: true` is only supported in single-agent mode, not chain/parallel.
+The tool returns a `runId` (e.g. `swival-run-1716326580000`). `async: true` is only supported in single-agent mode, not chain/parallel. Native `async` requires the originating Pi process to stay connected. Pi disconnect cancels the native audit; ordinary delegation keeps its existing background behavior. After verified shutdown, native finalization preserves bounded partial evidence before cleanup. Preservation failure retains the remaining snapshot for diagnosis. The wrapper writes a `spawn-error.txt` failure fallback if completion-marker persistence fails, even after Pi exits. Without live ownership or valid terminal evidence, disk-only native state is unknown. The extension never signals or probes a PID recovered from disk.
 
 Once started, manage it using `action` and `id`:
 
@@ -143,8 +137,7 @@ swival-subagent with action: "status", id: "swival-run-1716326580000"
 
 ### Dispatch-time overrides
 
-Override agent frontmatter per call without editing the agent
-definition:
+Override agent frontmatter per call without editing its definition:
 
 | Parameter | Controls |
 |-----------|----------|
@@ -202,7 +195,7 @@ sandbox: agentfs                  # builtin | agentfs | nono
 files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
-noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS runs
+noSandboxAutoSession: false       # sandboxed-explorer sets true for fresh overlays
 nonoRollback: true                # nono only: atomic rollback snapshots
 network: provider-only            # full | provider-only | none
 
@@ -236,14 +229,9 @@ Do not specify `model`, `provider`, or `baseUrl` in agent definitions. Model rou
 
 ### Agent configs do not inherit
 
-Each agent's frontmatter is independent. There is no base agent, no
-`extends:` field, and no implicit inheritance from the bundled set.
-When you fork a bundled agent into `~/.pi/agent/swival-agents/` or
-`.pi/swival-agents/`, copy the entire frontmatter; flags you omit
-revert to the schema default, which is rarely what the bundled
-agent intended. The trap to watch for:
+Each agent's frontmatter is independent. There is no base agent, `extends:` field, or implicit inheritance. When you fork a bundled agent, copy its entire frontmatter; omitted flags revert to schema defaults. Preserve these constraints:
 
-- `noSandboxAutoSession: true` on `sandboxed-explorer` and `audit-worker` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
+- `noSandboxAutoSession: true` on `sandboxed-explorer` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
 - `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
 - The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
 - Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
@@ -253,14 +241,14 @@ When overriding a bundled agent name from the user scope, diff your frontmatter 
 
 ```bash
 # run from this skill's directory
-diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
+diff ../../agents/sandboxed-explorer.md ~/.pi/agent/swival-agents/sandboxed-explorer.md
 ```
 
 ## Capabilities Reference
 
-### Upstream Swival 1.0.45 behaviors
+### Upstream Swival 1.0.46 behaviors
 
-Upstream Swival 1.0.45 provides several behaviors that require no package changes:
+Swival 1.0.46 includes these released behaviors:
 
 - Image-rejection retries, generic session headers, streamed A2A response limits, and endpoint-scoped model corrections apply automatically.
 - Large MCP tool catalogs load schemas on demand via `tool_search`; applies automatically to agents forked with `noMcp: false`.
@@ -399,8 +387,7 @@ Use native subagents when Swival must decompose a single prompt into independent
 
 ## Model Selection
 
-Agents inherit from `~/.config/swival/config.toml`. Override at
-dispatch time with `profileOverride` or `modelOverride`.
+Agents inherit from `~/.config/swival/config.toml`. Override at dispatch time with `profileOverride` or `modelOverride`.
 
 Named profiles:
 
@@ -425,11 +412,25 @@ Configuration constraints: `bedrock` and `vertexai` both reject `api_key`, and a
 
 ## Interactive REPL
 
-For direct terminal use (outside Pi):
+For direct terminal use (outside Pi), select an approved audit profile:
 
 ```bash
-swival --repl
+swival --profile <audit-profile> --repl
 ```
+
+For approved personal content, verify `chatgpt-daybreak-blue` with `xhigh` using `swival --list-profiles`. For other approved routes, use `frontier` with `high` unless the operator selects another route. Preserve provider and data boundaries; a configured profile is not permission to use its provider. In the REPL, `/audit <paths-or-globs>` takes paths, not bucket prose. It can generate patches and edit-capable worktrees. Native auxiliary calls omit effort, shielding, and filtering; requested effort is not guaranteed for every phase.
+
+For delegated native audit, start Pi at the target Git root and use:
+
+```json
+{
+  "audit": { "paths": ["src/**/*.py"], "all": true },
+  "profileOverride": "<audit-profile>",
+  "reasoningEffortOverride": "<audit-effort>"
+}
+```
+
+This mode requires Swival 1.0.46, Python 3.13+, Linux with AgentFS 0.6.4, and nono. Darwin/macOS with AgentFS 0.6.4 is blocked because writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. It isolates committed contents and preserves state/reports/patches outside the source checkout. It rejects protected or unsupported routes without fallback. See `auditing-with-swival` for scope limits and verification caveats. Ordinary plain-language delegation remains separate.
 
 | Command | Effect |
 |---------|--------|
@@ -446,8 +447,7 @@ swival --repl
 | `/learn` | Distil session into persistent memory |
 | `/compact` | Compress context |
 
-The REPL is useful for long exploratory sessions. For delegated
-work from Pi, use `swival-subagent` instead.
+The REPL is useful for long exploratory sessions. For delegated work from Pi, use `swival-subagent` instead.
 
 ## Configuration
 
@@ -489,7 +489,7 @@ uv tool upgrade swival
 
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
-- Recommended: Swival 1.0.45 or later. Releases between 1.0.44 and 1.0.45 produce an advisory upgrade notice.
+- Recommended: Swival 1.0.46 or later for ordinary delegation. Earlier compatible releases produce an advisory upgrade notice. Native audit verifies only Swival 1.0.46 and fails closed on other releases.
 - Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) or unverified versions are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 

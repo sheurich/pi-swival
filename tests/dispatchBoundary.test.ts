@@ -99,6 +99,21 @@ describe("argument-validation dispatch boundary", () => {
 		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
 	});
 
+	it.each([false, true])("refuses same-cwd parallel git allowlists before spawning (extraArgs=%s)", async (extraArgs) => {
+		fs.writeFileSync(path.join(root, "agent", "swival-agents", "git-writer.md"), [
+			"---", "name: git-writer", "description: git can write", "files: none",
+			`commands: ${extraArgs ? "none" : "git,ls,find,rg,grep,head,tail,wc,pwd"}`,
+			...(extraArgs ? ["extraArgs:", '  - "--commands=git,ls,find,rg,grep,head,tail,wc,pwd"'] : []),
+			"---", "Prompt",
+		].join("\n"));
+		const result = await tool.execute("git-guard", { tasks: [
+			{ agent: "git-writer", task: "first" }, { agent: "git-writer", task: "second" },
+		] }, undefined, undefined, { cwd: root, hasUI: false });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/same cwd|share.*cwd|write-capable/i);
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+	});
+
 	it("uses effective overrides in parallel safety guards", async () => {
 		const result = await tool.execute(
 			"test-call",

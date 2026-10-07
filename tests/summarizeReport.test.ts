@@ -9,6 +9,128 @@ const loadFixture = (name: string): Record<string, unknown> =>
 	JSON.parse(fs.readFileSync(path.join(here, "fixtures", name), "utf-8")) as Record<string, unknown>;
 
 describe("summarizeReport", () => {
+	it.each([1, 2, 127])("rejects raw success when the final reviewer exits %i", (exit) => {
+		const report = summarizeReport({
+			result: { outcome: "success", exit_code: 0 },
+			stats: { review_rounds: 2 },
+			timeline: [
+				{ type: "review", exit_code: 0, feedback: "accept earlier" },
+				{ type: "review", exit_code: exit, feedback: "final rejection" },
+			],
+		});
+		expect(report.outcome).toBe("success");
+		expect(report.accepted).toBe(false);
+		expect(report.lastReviewExitCode).toBe(exit);
+		expect(isRunFailure({ exitCode: 0, report })).toBe(true);
+		expect(terminalFailureReason(0, report, [])?.code).toBe("review_rejected");
+		expect(renderStatus({ exitCode: 0, report } as any)).toBe("rejected");
+	});
+
+	it("accepts reject-then-accept using only the final review", () => {
+		const report = summarizeReport({ result: { outcome: "success", exit_code: 0 }, stats: { review_rounds: 2 },
+			timeline: [{ type: "review", exit_code: 1 }, { type: "review", exit_code: 0 }] });
+		expect(report.lastReviewExitCode).toBe(0);
+		expect(report.accepted).toBe(true);
+		expect(isRunFailure({ exitCode: 0, report })).toBe(false);
+		expect(renderStatus({ exitCode: 0, report } as any)).toBe("accepted");
+	});
+
+	it("does not borrow older feedback or acceptance from a missing final review exit", () => {
+		const report = summarizeReport({ result: { outcome: "success", exit_code: 0 }, stats: { review_rounds: 2 },
+			timeline: [{ type: "review", exit_code: 0, feedback: "old" }, { type: "review" }] });
+		expect(report.lastReviewFeedback).toBeUndefined();
+		expect(report.accepted).not.toBe(true);
+		expect(isRunFailure({ exitCode: 0, report })).toBe(true);
+		expect(renderStatus({ exitCode: 0, report } as any)).toBe("error");
+	});
+
+	it("requires review evidence when settings enable a reviewer even with zero rounds", () => {
+		const report = summarizeReport({ result: { outcome: "success", exit_code: 0 },
+			settings: { self_review: true }, stats: { review_rounds: 0 } });
+		expect(isRunFailure({ exitCode: 0, report })).toBe(true);
+	});
+
+	it("preserves exhausted/2 and separates max-turns from context exhaustion", () => {
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 } });
+		expect(report.outcome).toBe("exhausted");
+		expect(report.resultExitCode).toBe(2);
+		expect(report.accepted).toBe(false);
+		expect(terminalFailureReason(2, report, [])?.code).toBe("max_turns");
+		expect(terminalFailureReason(2, report, ["context window exceeded"])?.code).toBe("context_overflow");
+		expect(terminalFailureReason(2, undefined, [])?.code).toBe("config_error");
+	});
+
+	it.each([false, true])("uses terminal structured context exhaustion with empty stderr (earlier rejection=%s)", (rejected) => {
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 },
+			stats: { turns: 3, review_rounds: rejected ? 1 : 0 },
+			timeline: [
+				...(rejected ? [{ type: "review", exit_code: 1, feedback: "earlier rejection" }] : []),
+				{ type: "llm_call", turn: 3 },
+				{ type: "recovered_response", turn: 3, reason: "context_exhausted" },
+			] });
+		expect(report.outcome).toBe("exhausted");
+		expect(report.resultExitCode).toBe(2);
+		expect(report.accepted).toBe(false);
+		expect(classifyFailure([], report)?.code).toBe("context_overflow");
+		expect(terminalFailureReason(2, report, [])?.code).toBe("context_overflow");
+	});
+
+	it.each(["success", "exhausted"])("ignores a nonterminal context marker before later %s", (outcome) => {
+		const report = summarizeReport({ result: { outcome, exit_code: outcome === "success" ? 0 : 2 },
+			stats: { turns: 4 }, timeline: [
+				{ type: "recovered_response", turn: 3, reason: "context_exhausted" },
+				{ type: "llm_call", turn: 4 },
+			] });
+		expect(terminalFailureReason(outcome === "success" ? 0 : 2, report, [])?.code)
+			.toBe(outcome === "success" ? undefined : "max_turns");
+	});
+
+	it("keeps final reviewer rejection after a stale context marker", () => {
+		const report = summarizeReport({ result: { outcome: "success", exit_code: 0 },
+			stats: { review_rounds: 1 }, timeline: [
+				{ type: "recovered_response", turn: 3, reason: "context_exhausted" },
+				{ type: "review", exit_code: 1 },
+			] });
+		expect(report.lastReviewExitCode).toBe(1);
+		expect(terminalFailureReason(0, report, [])?.code).toBe("review_rejected");
+	});
+
+	it("uses max_turns without a terminal context marker after an earlier rejection", () => {
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 },
+			stats: { review_rounds: 1, turns: 4 }, timeline: [
+				{ type: "review", exit_code: 1 }, { type: "llm_call", turn: 4 },
+			] });
+		expect(terminalFailureReason(2, report, [])?.code).toBe("max_turns");
+	});
+
+	it("retains context exhaustion through final lifecycle bookkeeping", () => {
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 },
+			stats: { turns: 3 }, timeline: [
+				{ type: "recovered_response", turn: 3, reason: "context_exhausted" },
+				{ type: "lifecycle", event: "run.end" },
+			] });
+		expect(terminalFailureReason(2, report, [])?.code).toBe("context_overflow");
+	});
+
+	it("uses terminal context evidence when released max_turn_seen lags the marker", () => {
+		// The unknown-window terminal-floor failure records no successful LLM
+		// call. record_recovered_response does not advance max_turn_seen.
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 },
+			stats: { turns: 0 }, timeline: [
+				{ type: "recovered_response", turn: 1, reason: "context_exhausted" },
+			] });
+		expect(report.turns).toBe(0);
+		expect(terminalFailureReason(2, report, [])?.code).toBe("context_overflow");
+	});
+
+	it("ignores a context marker from an older turn even when it ends the timeline", () => {
+		const report = summarizeReport({ result: { outcome: "exhausted", exit_code: 2 },
+			stats: { turns: 4 }, timeline: [
+				{ type: "recovered_response", turn: 3, reason: "context_exhausted" },
+			] });
+		expect(terminalFailureReason(2, report, [])?.code).toBe("max_turns");
+	});
+
 	it("maps schema v1 success + one review round", () => {
 		const raw = loadFixture("report-success-with-review.json");
 		const s = summarizeReport(raw);

@@ -1,7 +1,7 @@
 {
   "name": "pi-swival",
   "version": "1.0.0",
-  "description": "Swival integration for Pi — reviewer loops, sandboxed execution, and multi-bucket security audits",
+  "description": "Swival integration for Pi — reviewer loops, sandboxed execution, and isolated native audits",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -25,11 +25,12 @@
     "prompts": ["./prompts"]
   },
   "scripts": {
-    "test": "cd tests && ./setup.sh && npx vitest run",
-    "test:watch": "cd tests && ./setup.sh && npx vitest",
+    "test": "cd tests && ./node_modules/.bin/vitest run",
+    "test:watch": "cd tests && ./node_modules/.bin/vitest",
+    "typecheck": "cd tests && ./node_modules/.bin/tsc -p tsconfig.json",
     "smoke": "./scripts/smoke-test.sh",
     "agentfs-integration": "./scripts/agentfs-integration-test.sh",
-    "ci": "npm run smoke && npm run agentfs-integration && npm test"
+    "ci": "npm run typecheck && npm run smoke && npm run agentfs-integration && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

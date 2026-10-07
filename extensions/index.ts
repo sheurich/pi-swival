@@ -36,6 +36,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { canonicalFuturePath, captureNativeRuntime, inspectNativeAudit, prepareNativeAudit,
+	recordNativeAuditFailure, readNativeTerminal, validateNativeAuditParams, type NativeAuditResult,
+	type NativeOwnership } from "./native-audit.js";
 import {
 	type AgentScope,
 	discoverSwivalAgents,
@@ -83,6 +86,9 @@ export interface RunMeta {
 	agentFsRequested?: boolean;
 	/** Whether this run effectively requested Nono. */
 	nonoRequested?: boolean;
+	/** Required reviewer evidence from the effective launch arguments. */
+	reviewRequired?: boolean;
+	nativeAuditRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -90,6 +96,7 @@ interface AsyncRunEntry {
 	proc: ChildProcess;
 	exited: boolean;
 	exitCode: number | null;
+	interruptNative?: () => void;
 }
 
 /** Written to `<artifactDir>/completed.json` when an async run exits (or fails to start). */
@@ -109,6 +116,8 @@ interface RunStateInfo {
 	completed?: CompletedMarker;
 	/** Contents of spawn-error.txt when swival failed to start (e.g. ENOENT). */
 	spawnError?: string;
+	/** Disk-only native recovery cannot infer execution or shutdown from a PID. */
+	nativeUnknown?: boolean;
 }
 
 /**
@@ -241,8 +250,17 @@ async function writeRunOutput(
  * outcome=success. Reviewer rejection and AgentError subclasses can exit zero,
  * so missing, malformed, or unknown reports must fail closed.
  */
-export function isRunFailure(r: { exitCode: number; report?: { outcome?: string } }): boolean {
-	return r.exitCode !== 0 || r.report?.outcome !== "success";
+export function isRunFailure(r: {
+	exitCode: number;
+	nativeAudit?: NativeAuditResult;
+	report?: { outcome?: string; accepted?: boolean; reviewRequired?: boolean;
+		lastReviewExitCode?: number; resultExitCode?: number };
+}): boolean {
+	if (r.nativeAudit) return r.exitCode !== 0 || r.nativeAudit.status !== "completed";
+	const report = r.report;
+	return r.exitCode !== 0 || report?.outcome !== "success" || report.accepted === false ||
+		(report.resultExitCode !== undefined && report.resultExitCode !== 0) ||
+		(report.reviewRequired === true && report.lastReviewExitCode !== 0);
 }
 
 /**
@@ -441,13 +459,6 @@ export function enforceCompletedAsyncNono(
 }
 
 /**
- * The exact `commands` allowlist that marks shell execution as read-only.
- * Drift-sensitive: if the bundled audit-worker's allowlist changes, update
- * this constant in lockstep.
- */
-export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
-
-/**
  * True when an agent could plausibly mutate its cwd. Safety classification is
  * based on the final emitted arguments because extraArgs can override typed
  * frontmatter fields.
@@ -470,7 +481,7 @@ export function isMutatingCwdAgent(
 	const files = lastCliOptionValue(args, "--files");
 	const commands = lastCliOptionValue(args, "--commands");
 	const fileWritesDisabled = files === "none";
-	const mutatingCommandsDisabled = commands === "none" || commands === READ_ONLY_AUDIT_COMMANDS;
+	const mutatingCommandsDisabled = commands === "none";
 	return !(fileWritesDisabled && mutatingCommandsDisabled);
 }
 
@@ -842,12 +853,14 @@ function getSwivalArgumentError(
 interface ReportSummary {
 	// From stats.review_rounds — number of reviewer retry rounds that ran.
 	reviewRounds?: number;
-	// Derived from result.outcome. "success" means reviewer accepted (or
-	// review was disabled and swival returned a terminal answer). "failed"
-	// is a reviewer rejection. "error" is an internal AgentError (see
-	// errorMessage for the specific cause).
-	outcome?: "success" | "failed" | "error" | "interrupted" | "unknown";
+	// Preserve the reported outcome; final reviewer exits govern acceptance
+	// separately because upstream can report success after reviewer rejection.
+	outcome?: "success" | "failed" | "error" | "exhausted" | "interrupted" | "unknown";
 	accepted?: boolean;
+	resultExitCode?: number;
+	reviewRequired?: boolean;
+	lastReviewExitCode?: number;
+	terminalContextExhausted?: boolean;
 	// From result.error_message — populated when swival raised an AgentError
 	// subclass (ConfigError, ContextOverflowError, ToolsNotSupportedError,
 	// LifecycleError). Prefer this over stderr-tail classification when present.
@@ -927,6 +940,8 @@ export interface TraceToolCall {
 	type: "toolCall";
 	name: string;
 	args: Record<string, unknown>;
+	sessionId?: string;
+	toolUseId?: string;
 	ok?: boolean; // set when a matching tool_result arrives
 }
 export interface TraceText {
@@ -980,6 +995,7 @@ export interface SwivalResult {
 	stderrTail: string[];
 	durationMs: number;
 	report?: ReportSummary;
+	nativeAudit?: NativeAuditResult;
 	errorMessage?: string;
 	// Populated only on failure. Use `renderStatus(result)` for the terminal
 	// state; use `result.reason?.code` for a machine-readable failure cause.
@@ -1036,21 +1052,24 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	else if (outcomeVal === "failed") outcome = "failed";
 	else if (outcomeVal === "error") outcome = "error";
 	else if (outcomeVal === "interrupted") outcome = "interrupted";
+	else if (outcomeVal === "exhausted") outcome = "exhausted";
 
-	// Last reviewer feedback: the most recent timeline entry of type "review".
-	// We include its feedback even on accepted runs (for visibility), but
-	// only surface it by default on rejections.
-	let lastReviewFeedback: string | undefined;
-	for (let i = timelineRaw.length - 1; i >= 0; i--) {
-		const entry = timelineRaw[i];
-		if (entry?.type === "review") {
-			const fb = toStr(entry.feedback);
-			if (fb && fb.trim()) {
-				lastReviewFeedback = fb.trim();
-				break;
-			}
-		}
-	}
+	const finalReview = timelineRaw.slice().reverse().find((entry) => entry?.type === "review");
+	const reviewRounds = toNum(stats.review_rounds);
+	const reviewRequired = Boolean(finalReview || (reviewRounds ?? 0) > 0 ||
+		settings.self_review === true || toStr(settings.reviewer)?.trim());
+	const lastReviewExitCode = toNum(finalReview?.exit_code);
+	const resultExitCode = toNum(result.exit_code);
+	const lastReviewFeedback = toStr(finalReview?.feedback)?.trim() || undefined;
+	// run.end lifecycle bookkeeping may follow the terminal loop event.
+	const terminalEvent = timelineRaw.slice().reverse().find((entry) => entry?.type !== "lifecycle");
+	const turns = toNum(stats.turns);
+	const terminalTurn = toNum(terminalEvent?.turn);
+	// Released recovered_response does not advance max_turn_seen, so stats
+	// can lag a terminal-floor failure. A marker older than stats is stale.
+	const terminalContextExhausted = outcome === "exhausted" && resultExitCode === 2 &&
+		terminalEvent?.type === "recovered_response" && terminalEvent.reason === "context_exhausted" &&
+		(turns === undefined || (terminalTurn !== undefined && terminalTurn >= turns));
 
 	const promptCacheRaw = stats.prompt_cache as Record<string, unknown> | undefined;
 	const promptCache =
@@ -1072,16 +1091,17 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 			: undefined;
 
 	return {
-		reviewRounds: toNum(stats.review_rounds),
+		reviewRounds,
 		outcome,
-		accepted:
-			outcome === "success"
-				? true
-				: outcome === "failed" || outcome === "error" || outcome === "interrupted"
-					? false
-					: undefined,
+		resultExitCode,
+		reviewRequired,
+		lastReviewExitCode,
+		terminalContextExhausted,
+		accepted: outcome === "unknown" ? undefined : outcome === "success" &&
+			(resultExitCode === undefined || resultExitCode === 0) &&
+			(!reviewRequired || lastReviewExitCode === 0),
 		errorMessage: toStr(result.error_message),
-		turns: toNum(stats.turns),
+		turns,
 		toolCallsTotal: toNum(stats.tool_calls_total),
 		toolCallsByName: validateToolCallsByName(stats.tool_calls_by_name),
 		totalLlmTimeS: toNum(stats.total_llm_time_s),
@@ -1246,10 +1266,14 @@ export function classifyFailure(
 	stderrLines: readonly string[],
 	report?: ReportSummary,
 ): FailureReason | undefined {
+	if (report?.terminalContextExhausted) {
+		return { code: "context_overflow", text: "Context window exhausted; even the minimal recovery prompt was rejected." };
+	}
 	// Review budget exhausted is usually success-from-swival-cli's POV (exit 0)
 	// but outcome=failed in the report. We surface it specifically so the
 	// caller knows *why* the run is marked failed rather than showing stderr.
-	if (report?.outcome === "failed" && typeof report.reviewRounds === "number" && report.reviewRounds > 0) {
+	if (report?.outcome !== "exhausted" && ((report?.lastReviewExitCode !== undefined && report.lastReviewExitCode !== 0) ||
+		(report?.outcome === "failed" && typeof report.reviewRounds === "number" && report.reviewRounds > 0))) {
 		return {
 			code: "review_rejected",
 			text: `Reviewer rejected after ${report.reviewRounds} round${report.reviewRounds === 1 ? "" : "s"}. See 'reviewer feedback' below.`,
@@ -1382,6 +1406,12 @@ export function terminalFailureReason(
 	}
 	const classified = classifyFailure(stderrLines, report);
 	if (classified) return classified;
+	if (report?.outcome === "exhausted") {
+		return { code: "max_turns", text: "Swival exhausted its turn budget (exit 2)." };
+	}
+	if (report?.reviewRequired && report.lastReviewExitCode === undefined) {
+		return { code: "config_error", text: "Required final reviewer exit evidence is missing." };
+	}
 	if (!report || report.outcome === "unknown") {
 		return {
 			code: "config_error",
@@ -1490,7 +1520,7 @@ export interface SwivalVersionCheck {
 	errorMessage?: string;
 }
 
-export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
+export const RECOMMENDED_SWIVAL_VERSION = "1.0.46";
 export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.44";
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -1666,12 +1696,14 @@ export function startTraceTail(
 	let buffer = "";
 	const toolUseNames = new Map<string, string>();
 
-	let consuming = false;
+	let pendingRead: Promise<void> | undefined;
 	let shouldRerun = false;
-	const consume = async () => {
-		if (consuming) { shouldRerun = true; return; }
-		consuming = true;
-		try {
+	const consume = (): Promise<void> => {
+		if (pendingRead) { shouldRerun = true; return pendingRead; }
+		pendingRead = readAvailable().finally(() => { pendingRead = undefined; });
+		return pendingRead;
+	};
+	const readAvailable = async () => {
 			do {
 				shouldRerun = false;
 				if (!traceFile) return;
@@ -1725,7 +1757,8 @@ export function startTraceTail(
 									if (p.type === "tool_use" && typeof p.name === "string") {
 										if (typeof p.id === "string") toolUseNames.set(p.id, p.name);
 										const args = (p.input as Record<string, unknown>) ?? {};
-										onEvent({ type: "toolCall", name: p.name, args });
+										onEvent({ type: "toolCall", name: p.name, args,
+											sessionId: path.basename(traceFile!, ".jsonl"), toolUseId: toStr(p.id) });
 									} else if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
 										onEvent({ type: "text", text: p.text });
 									}
@@ -1743,7 +1776,8 @@ export function startTraceTail(
 									if (p.type === "tool_result" && typeof p.tool_use_id === "string") {
 										const name = toolUseNames.get(p.tool_use_id) ?? "tool";
 										const ok = p.is_error !== true;
-										onEvent({ type: "toolCall", name, args: {}, ok });
+										onEvent({ type: "toolCall", name, args: {}, ok,
+											sessionId: path.basename(traceFile!, ".jsonl"), toolUseId: p.tool_use_id });
 									}
 								}
 							}
@@ -1753,9 +1787,6 @@ export function startTraceTail(
 					if (handle) await handle.close().catch(() => undefined);
 				}
 			} while (shouldRerun);
-		} finally {
-			consuming = false;
-		}
 	};
 
 	const attachFileWatcher = () => {
@@ -1800,6 +1831,8 @@ export function startTraceTail(
 	return async () => {
 		clearInterval(pollInterval);
 		watcher?.close();
+		fileWatcher?.close();
+		await pickTraceFile();
 		fileWatcher?.close();
 		await consume();
 	};
@@ -1939,13 +1972,30 @@ export async function pruneOldArtifacts(
 			if (!stat.isDirectory() || stat.mtimeMs >= cutoff) continue;
 			// Fix 4: never prune a directory belonging to an in-flight run.
 			if (activeArtifactDirs.has(fullPath)) continue;
-			// Fix 4: require completed.json — a missing marker means the run is
-			// still active or was interrupted before it could write its marker;
-			// do not prune based on mtime alone.
+			let native = name.startsWith("native-audit-");
+			for (const identifier of ["request.json", "snapshot", "runtime-bin", path.join("evidence", "native-result.json"),
+				path.join("evidence", "native-state")]) {
+				try { await fs.promises.lstat(path.join(fullPath, identifier)); native = true; }
+				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+			}
 			try {
-				await fs.promises.access(path.join(fullPath, "completed.json"));
-			} catch {
-				continue;
+				const metaFile = path.join(fullPath, "run-meta.json");
+				const metaStat = await fs.promises.lstat(metaFile);
+				if (!metaStat.isFile() || metaStat.size > 65536) continue;
+				const meta = JSON.parse(await fs.promises.readFile(metaFile, "utf8"));
+				if (!meta || typeof meta !== "object" || Array.isArray(meta) ||
+					(meta.nativeAuditRequested !== undefined && typeof meta.nativeAuditRequested !== "boolean")) continue;
+				native ||= meta.nativeAuditRequested === true;
+			} catch (error) {
+				if (native || (error as NodeJS.ErrnoException).code !== "ENOENT") continue;
+			}
+			if (native) {
+				const terminal = readNativeTerminal(fullPath);
+				if (!terminal || terminal.shutdown === "unverified") continue;
+			} else {
+				// Ordinary runs retain their existing completion-marker requirement.
+				try { await fs.promises.access(path.join(fullPath, "completed.json")); }
+				catch { continue; }
 			}
 			await fs.promises.rm(fullPath, { recursive: true, force: true });
 		} catch {
@@ -1964,13 +2014,15 @@ export async function pruneOldArtifacts(
  */
 export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT_ROOT): Promise<RunMeta | undefined> {
 	let entries: string[];
+	let resolvedRoot: string;
 	try {
-		entries = await fs.promises.readdir(artifactRoot);
+		resolvedRoot = await canonicalFuturePath(artifactRoot);
+		entries = await fs.promises.readdir(resolvedRoot);
 	} catch {
 		return undefined;
 	}
 	for (const name of entries) {
-		const metaPath = path.join(artifactRoot, name, "run-meta.json");
+		const metaPath = path.join(resolvedRoot, name, "run-meta.json");
 		try {
 			try {
 				const metaStat = await fs.promises.stat(metaPath);
@@ -1984,20 +2036,21 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
 				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
-				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean")
+				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean") ||
+				("nativeAuditRequested" in parsed && typeof parsed.nativeAuditRequested !== "boolean") ||
+				("reviewRequired" in parsed && typeof parsed.reviewRequired !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
-			const resolvedArtifact = path.resolve(parsed.artifactDir as string);
-			const resolvedRoot = path.resolve(artifactRoot);
+			const resolvedArtifact = await canonicalFuturePath(parsed.artifactDir as string);
 			if (!resolvedArtifact.startsWith(resolvedRoot + path.sep)) continue;
 
 			// stdoutFile and stderrFile must be under artifactDir
 			if (typeof (parsed as any).stdoutFile === "string") {
-				if (!path.resolve((parsed as any).stdoutFile).startsWith(resolvedArtifact + path.sep)) continue;
+				if (!(await canonicalFuturePath((parsed as any).stdoutFile)).startsWith(resolvedArtifact + path.sep)) continue;
 			}
 			if (typeof (parsed as any).stderrFile === "string") {
-				if (!path.resolve((parsed as any).stderrFile).startsWith(resolvedArtifact + path.sep)) continue;
+				if (!(await canonicalFuturePath((parsed as any).stderrFile)).startsWith(resolvedArtifact + path.sep)) continue;
 			}
 
 			// PID range: reject 0, 1, negative, and non-integer values
@@ -2038,6 +2091,14 @@ async function loadRunState(
 			exited: entry.exited,
 			exitCode: entry.exitCode,
 		};
+		if (entry.meta.nativeAuditRequested) {
+			const terminal = readNativeTerminal(entry.meta.artifactDir);
+			if (entry.exited && terminal) {
+				info.completed = terminal;
+				info.exitCode = terminal.exitCode;
+			}
+			return info;
+		}
 		// Also read completed.json when the entry says exited, so callers
 		// that need the marker (e.g. resume) get it without a separate read.
 		if (entry.exited) {
@@ -2055,6 +2116,11 @@ async function loadRunState(
 	// Disk fallback: find run-meta.json, then read completed.json + spawn-error.txt.
 	const meta = await findRunMeta(runId, artifactRoot);
 	if (!meta) return undefined;
+	if (meta.nativeAuditRequested) {
+		const terminal = readNativeTerminal(meta.artifactDir);
+		return { meta, exited: terminal !== undefined, exitCode: terminal?.exitCode ?? null,
+			completed: terminal, nativeUnknown: terminal === undefined };
+	}
 
 	let completed: CompletedMarker | undefined;
 	try {
@@ -2068,7 +2134,7 @@ async function loadRunState(
 	} catch { /* no spawn error */ }
 
 	const exited = completed !== undefined;
-	const exitCode = completed?.exitCode ?? null;
+	const exitCode = completed?.exitCode ?? (exited ? 1 : null);
 	return { meta, exited, exitCode, completed, spawnError };
 }
 
@@ -2079,6 +2145,7 @@ interface CompletedAsyncInspection {
 
 async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
 	const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
+	if (report && state.meta.reviewRequired) report.reviewRequired = true;
 	const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
 	const nonoCheck = enforceCompletedAsyncNono(state.meta, bootstrapCheck.report);
 	const effectiveReport = nonoCheck.report;
@@ -2108,6 +2175,11 @@ function formatCompletedAsyncFailure(
 }
 
 // ------------------------------------------------ async (background) --
+
+/** Keep ordinary tasks out of ambient one-shot slash/bang command dispatch. */
+function ordinaryTaskPrompt(task: string): string {
+	return `Delegated task (plain text):\n\n${task}`;
+}
 
 /**
  * Spawn Swival through a detached durable wrapper. The wrapper writes the
@@ -2160,11 +2232,12 @@ export async function runSingleSwivalAsync(
 	const agentFsRequested = isAgentFsRequested(args);
 	const nonoRequested = isNonoRequested(args);
 	const isReexec = isReexecSandboxRequested(args);
+	const taskPrompt = ordinaryTaskPrompt(task);
 	if (isReexec) {
-		args.push("--", task);
+		args.push("--", taskPrompt);
 	} else {
 		const taskFile = path.join(artifactDir, "task.txt");
-		await fs.promises.writeFile(taskFile, task, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(taskFile, taskPrompt, { encoding: "utf-8", mode: 0o600 });
 		args.push("--");
 	}
 
@@ -2204,6 +2277,7 @@ export async function runSingleSwivalAsync(
 		stderrFile,
 		agentFsRequested,
 		nonoRequested,
+		reviewRequired: hasCliFlag(args, "--self-review") || Boolean(lastCliOptionValue(args, "--reviewer")),
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
@@ -2389,14 +2463,12 @@ async function runSingleSwival(
 
 	const stopTrace = startTraceTail(traceDir, (event) => {
 		if (!current.traceEvents) current.traceEvents = [];
-		// Merge tool_result results into the matching toolCall to avoid
-		// doubling events; we only track the most recent pending call for a
-		// name because the trace does not carry unique ids we can cheaply key
-		// on from this side.
-		if (event.type === "toolCall" && event.ok !== undefined) {
+		// Match completion by session and tool-use ID, never by tool name.
+		if (event.type === "toolCall" && event.ok !== undefined && event.toolUseId) {
 			for (let i = current.traceEvents.length - 1; i >= 0; i--) {
 				const prev = current.traceEvents[i];
-				if (prev.type === "toolCall" && prev.name === event.name && prev.ok === undefined) {
+				if (prev.type === "toolCall" && prev.toolUseId === event.toolUseId &&
+					prev.sessionId === event.sessionId && prev.ok === undefined) {
 					prev.ok = event.ok;
 					scheduleEmit();
 					return;
@@ -2425,8 +2497,9 @@ async function runSingleSwival(
 	// input; every other run, including sandbox-less ones, passes it on argv
 	// because ambient configuration may enable a re-executing sandbox.
 	const isReexec = isReexecSandboxRequested(args);
+	const taskPrompt = ordinaryTaskPrompt(task);
 	if (isReexec) {
-		args.push("--", task);
+		args.push("--", taskPrompt);
 	} else {
 		args.push("--");
 	}
@@ -2440,7 +2513,7 @@ async function runSingleSwival(
 			});
 			if (!isReexec) {
 				proc.stdin?.on("error", () => { /* child exited before reading prompt */ });
-				proc.stdin?.end(task, "utf-8");
+				proc.stdin?.end(taskPrompt, "utf-8");
 			}
 
 			const stdoutDecoder = new TextDecoder("utf-8");
@@ -2461,7 +2534,8 @@ async function runSingleSwival(
 				timeoutTimer.unref?.();
 			}
 
-			proc.stdout.on("data", (buf: Buffer) => {
+			// Both output streams always use "pipe"; only stdin varies above.
+			proc.stdout!.on("data", (buf: Buffer) => {
 				stdoutBuf += stripAnsi(stdoutDecoder.decode(buf, { stream: true }));
 				if (stdoutBuf.length > STDOUT_RING_CHARS) {
 					stdoutBuf = stdoutBuf.slice(-STDOUT_RING_CHARS);
@@ -2470,7 +2544,7 @@ async function runSingleSwival(
 				scheduleEmit();
 			});
 
-			proc.stderr.on("data", (buf: Buffer) => {
+			proc.stderr!.on("data", (buf: Buffer) => {
 				stderrBuf += stripAnsi(stderrDecoder.decode(buf, { stream: true }));
 				const lines = stderrBuf.split("\n");
 				stderrBuf = lines.pop() ?? "";
@@ -2541,6 +2615,9 @@ async function runSingleSwival(
 		current.exitCode = exitCode;
 		current.durationMs = Date.now() - started;
 		current.report = await readReport(reportPath);
+		if (current.report && (hasCliFlag(args, "--self-review") || lastCliOptionValue(args, "--reviewer"))) {
+			current.report.reviewRequired = true;
+		}
 
 		// Fail closed when emitted arguments or Swival configuration requested
 		// AgentFS or Nono but the report cannot prove sandbox engagement.
@@ -2565,6 +2642,7 @@ async function runSingleSwival(
 		}
 		emit(); // synchronous final emit: caller must see canonical end state
 
+		await stopTrace();
 		// Persist artifacts BEFORE the finally-block removes tmpDir. Callers
 		// expect report.json and <session>.jsonl to outlive the run so failure
 		// diagnosis has source material to point at.
@@ -2675,6 +2753,12 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 const SwivalParams = Type.Object({
+	audit: Type.Optional(Type.Object({
+		paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs. No command text or host paths." })),
+		all: Type.Optional(Type.Boolean({ description: "Deep-review every file in the selected native scope." })),
+		workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+		patchMaxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+	}, { additionalProperties: false, description: "One native audit on an independent committed snapshot of Pi's repository-root cwd. Incompatible with task, agent, cwd, reviews, or permission overrides." })),
 	agent: Type.Optional(Type.String({ description: "Swival agent name (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -2878,7 +2962,7 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 /**
  * Render the terminal status of a run. Preserves four distinct success/
  * failure states so the caller can tell:
- *   - accepted:  reviewer approved (review_rounds ≥ 1, outcome=success)
+ *   - accepted:  terminal success with final reviewer exit 0
  *   - completed: ran without a reviewer to natural success (review_rounds=0)
  *   - rejected:  reviewer said no (outcome=failed, exit=0)
  *   - failed:    non-zero exit (swival itself crashed or was killed)
@@ -2891,14 +2975,16 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
  */
 export function renderStatus(r: SwivalResult): RunStatus {
 	if (r.exitCode === -1) return "running";
+	if (r.nativeAudit) return r.exitCode === 0 && r.nativeAudit.status === "completed" ? "completed" : "failed";
 	if (r.exitCode !== 0) return "failed";
 	if (r.report?.outcome === "error") return "error";
 	if (r.report?.outcome === "failed") return "rejected";
 	if (r.report?.outcome === "interrupted") return "failed";
-	if (r.report?.outcome === "success") {
-		const rounds = r.report.reviewRounds ?? 0;
-		return rounds > 0 ? "accepted" : "completed";
+	if (r.report?.lastReviewExitCode !== undefined && r.report.lastReviewExitCode !== 0) return "rejected";
+	if (r.report?.outcome === "success" && !isRunFailure(r)) {
+		return r.report.reviewRequired || (r.report.reviewRounds ?? 0) > 0 ? "accepted" : "completed";
 	}
+	if (r.report?.outcome === "exhausted") return "failed";
 	// Exit zero with a missing or unknown report fails closed because no
 	// valid terminal outcome proves that the run completed successfully.
 	return "error";
@@ -3038,16 +3124,32 @@ export function buildParallelSummary(
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
 	trustProjectAgents?: boolean;
+	/** Operator-selected installed Swival interpreter; never a tool argument. */
+	nativePython?: string;
+	/** Native wall-clock ceiling. Defaults to 30 minutes. */
+	nativeMaxTimeoutMs?: number;
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
 	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
+	const nativeRuntime = captureNativeRuntime(options.nativePython);
+	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
+	const nativeResult = (meta: RunMeta, exitCode: number, nativeAudit: NativeAuditResult): SwivalResult => ({
+		agent: "native-audit", agentSource: "bundled", task: meta.task, exitCode, nativeAudit,
+		finalOutput: nativeAudit.answer ? applyInlineCap(
+			`Native verifier judgment; project commands and PoCs cannot execute.\n\n${nativeAudit.answer}`,
+			64 * 1024, path.join(meta.artifactDir, "evidence", "native-result.json")) : "",
+		stderrTail: [], durationMs: Date.now() - meta.startedAt,
+		artifactDir: meta.artifactDir, errorMessage: nativeAudit.error,
+		...(nativeAudit.error ? { reason: { code: "unknown" as const, text: nativeAudit.error } } : {}),
+	});
 	pi.registerTool({
 		name: "swival-subagent",
 		label: "Swival subagent",
 		description: [
 			"Delegate a task to a swival subprocess with its built-in reviewer loop.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution).",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution), or native audit (audit object).",
+			"Native audit isolates committed source and artifacts, uses AgentFS/provider-only, and rejects protected or unsupported routes without fallback.",
 			"Bundled agents work out of the box; override or extend via ~/.pi/agent/swival-agents/ (user) or .pi/swival-agents/ (project).",
 			"Use this when you want the reviewer loop, test-as-contract, sandbox overlay, or secret encryption to wrap the subagent's work.",
 		].join(" "),
@@ -3064,6 +3166,135 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			if ("audit" in params) {
+				try {
+					const input = params as unknown as Record<string, unknown>;
+					const audit = validateNativeAuditParams(input);
+					if (signal?.aborted) throw new Error("Native audit was cancelled before launch.");
+					if (!Number.isInteger(nativeMaxTimeoutMs) || nativeMaxTimeoutMs < 1 || nativeMaxTimeoutMs > 2_147_483_647) {
+						throw new Error("Invalid operator-configured native timeout ceiling.");
+					}
+					const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
+					const { meta, proc } = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
+						artifactDir, runId, nativeMaxTimeoutMs, signal);
+					const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
+					asyncRuns.set(runId, entry);
+					let ownedChildPid: number | undefined;
+					let childOwnership: NativeOwnership | undefined;
+					let wrapperClosed = false;
+					let ready = false;
+					let lifecycleFailure: string | undefined;
+					let persistenceFailure: string | undefined;
+					let notifyReady!: () => void;
+					const readiness = new Promise<void>((resolve) => { notifyReady = resolve; });
+					const stopWrapper = (reason: string) => {
+						lifecycleFailure ??= reason;
+						if (proc.pid && !wrapperClosed) {
+							try { proc.kill("SIGTERM"); } catch { /* exit will transfer finalization */ }
+						}
+					};
+					entry.interruptNative = () => stopWrapper("Native audit was interrupted.");
+					const abort = () => stopWrapper("Native audit was cancelled before handoff.");
+					signal?.addEventListener("abort", abort, { once: true });
+					// Only this tracked wrapper's inherited IPC channel grants authority.
+					const ownership = (message: unknown) => {
+						const child = message as { type?: unknown; pid?: unknown } | null;
+						if (!child || typeof child !== "object" || Array.isArray(child) ||
+							Object.keys(child).sort().join(",") !== "pid,type" ||
+							!Number.isInteger(child.pid) || (child.pid as number) < 2 || (child.pid as number) > 2_147_483_647 ||
+							child.pid === process.pid || child.pid === proc.pid) {
+							stopWrapper("Native child ownership message was invalid."); return;
+						}
+						if (child.type === "native-child" && ownedChildPid === undefined) {
+							const pid = child.pid as number;
+							ownedChildPid = pid;
+							childOwnership = { signal: (name) => process.kill(-pid, name) };
+							// Register ownership before ACK, and never authorize a cancelled run.
+							if (signal?.aborted || lifecycleFailure) { abort(); return; }
+							try {
+								proc.send({ type: "native-child-owned", pid }, (error) => {
+									if (error) stopWrapper("Native child ownership acknowledgement failed.");
+								});
+							} catch { stopWrapper("Native child ownership acknowledgement failed."); }
+						} else if (child.type === "native-started" && child.pid === ownedChildPid && !ready) {
+							if (signal?.aborted || lifecycleFailure) { abort(); return; }
+							ready = true; notifyReady();
+						} else stopWrapper("Native lifecycle message was invalid.");
+					};
+					proc.on("message", ownership);
+					const completion = new Promise<number>((resolve) => {
+						let finalization: Promise<void> | undefined;
+						const settle = (code: number | null) => {
+							if (finalization) return;
+							wrapperClosed = true;
+							proc.removeListener("message", ownership);
+							finalization = (async () => {
+								let terminalCode = code ?? 1;
+								try {
+									let terminal = readNativeTerminal(meta.artifactDir);
+									if (!terminal || (terminal.shutdown === "unverified" && childOwnership)) {
+										terminal = await recordNativeAuditFailure(meta,
+											lifecycleFailure ?? "Native runner exited without verified terminal evidence.", childOwnership,
+											!childOwnership && proc.pid ? () => new Promise((done) => setTimeout(done, 5000)) : undefined);
+									}
+									terminalCode = terminal.exitCode;
+								} catch (error) {
+									terminalCode ||= 1;
+									persistenceFailure = (error as Error).message;
+								} finally {
+									childOwnership = undefined;
+									entry.exited = true;
+									entry.exitCode = terminalCode;
+									resolve(terminalCode);
+								}
+							})();
+						};
+						proc.once("error", () => { lifecycleFailure = "Native runner failed to start."; });
+						// The parent writes only after wrapper exit. A valid terminal record
+						// prevents duplicate signalling, evidence export, and rewriting.
+						proc.once("exit", settle);
+						proc.once("close", settle);
+					});
+					let readinessTimer: ReturnType<typeof setTimeout> | undefined;
+					await Promise.race([readiness, completion, new Promise<void>((resolve) => {
+						readinessTimer = setTimeout(resolve, 5000);
+					})]);
+					clearTimeout(readinessTimer);
+					if (!ready && !wrapperClosed) {
+						stopWrapper("Native runner did not establish its lifecycle.");
+						if (proc.pid) await terminateProcessGroup(proc, proc.pid, process.kill, 1000);
+					}
+					if (signal?.aborted) {
+						abort();
+						await completion;
+						signal.removeEventListener("abort", abort);
+						asyncRuns.delete(runId);
+						throw new Error(`Native audit was cancelled; runner exited. Artifacts: ${meta.artifactDir}.`);
+					}
+					const makeNativeDetails = (results: SwivalResult[]) => ({ mode: "single" as const,
+						agentScope: "user" as const, projectAgentsDir: null, results, runId });
+					if (params.async && ready && !wrapperClosed && proc.exitCode === null && proc.signalCode === null &&
+						!readNativeTerminal(meta.artifactDir)) {
+						signal?.removeEventListener("abort", abort);
+						proc.unref();
+						proc.channel?.unref();
+						void completion.then(() => setTimeout(() => asyncRuns.delete(runId), 60 * 60_000).unref());
+						return { content: [{ type: "text", text: `Native audit started.\nrunId: ${runId}\nArtifact dir: ${meta.artifactDir}` }],
+							details: makeNativeDetails([]) };
+					}
+					if (signal?.aborted) abort();
+					let code: number;
+					try { code = await completion; } finally { signal?.removeEventListener("abort", abort); asyncRuns.delete(runId); }
+					if (persistenceFailure) throw new Error(persistenceFailure);
+					const result = nativeResult(meta, code, await inspectNativeAudit(meta.artifactDir, code));
+					result.finalOutput = applyInlineCap(result.finalOutput, params.maxInlineBytes,
+						path.join(meta.artifactDir, "evidence", "native-result.json"));
+					return { content: [{ type: "text", text: `${result.errorMessage ?? result.finalOutput}\nArtifact dir: ${meta.artifactDir}` }],
+						details: makeNativeDetails([result]), isError: isRunFailure(result) };
+				} catch (error) {
+					return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
+				}
+			}
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
 			void pruneOldArtifacts(artifactRoot);
 
@@ -3114,8 +3345,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 			// Fix 7b: action is mutually exclusive with run-dispatch fields.
 			if (params.action) {
-				const conflicting = (["agent", "task", "tasks", "chain", "async"] as const)
-					.filter((k) => params[k] != null && params[k] !== false);
+				const conflicting = Object.keys(params).filter((key) => !["action", "id"].includes(key));
 				if (conflicting.length > 0) {
 					return {
 						content: [{ type: "text", text: `\`action\` cannot be combined with: ${conflicting.join(", ")}. Use \`action\` + \`id\` alone.` }],
@@ -3139,6 +3369,14 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					};
 				}
 
+				const nativeControl = async (state: RunStateInfo) => {
+					const summary = await inspectNativeAudit(state.meta.artifactDir, state.exitCode ?? 1);
+					const result = nativeResult(state.meta, state.exitCode ?? 1, summary);
+					const text = params.action === "resume" ? result.errorMessage ?? result.finalOutput :
+						result.errorMessage ?? `Native audit ${runId} completed.`;
+					return { content: [{ type: "text" as const, text: `${text}\nArtifact dir: ${state.meta.artifactDir}` }],
+						details: makeDetails("single")([result]), isError: isRunFailure(result) };
+				};
 				if (params.action === "status") {
 					const state = await loadRunState(runId, artifactRoot);
 					if (!state) {
@@ -3148,6 +3386,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
+					if (state.nativeUnknown) return nativeControl(state);
 					if (!state.exited) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"}).\nArtifact dir: ${state.meta.artifactDir}` }],
@@ -3161,6 +3400,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
+					if (state.meta.nativeAuditRequested) return nativeControl(state);
 					const inspection = await inspectCompletedAsyncRun(state);
 					if (inspection.reason) {
 						return {
@@ -3192,6 +3432,11 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							details: makeDetails("single")([]),
 							isError: true,
 						};
+					}
+					if (state.meta.nativeAuditRequested && state.entry.interruptNative) {
+						state.entry.interruptNative();
+						return { content: [{ type: "text", text: `Native audit ${runId} was interrupted; supervised shutdown and evidence retention are in progress.` }],
+							details: makeDetails("single")([]) };
 					}
 				const pid = state.meta.pid;
 				if (pid == null) {
@@ -3236,6 +3481,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
+					if (state.nativeUnknown) return nativeControl(state);
 					if (!state.exited) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is still in progress (pid: ${state.meta.pid ?? "unknown"}). Wait for it to complete, or interrupt it first.` }],
@@ -3250,6 +3496,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
+					if (state.meta.nativeAuditRequested) return nativeControl(state);
 					const inspection = await inspectCompletedAsyncRun(state);
 					if (inspection.reason) {
 						return {
@@ -3648,6 +3895,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			if (args.audit) return new Text(theme.fg("toolTitle", "swival native audit") +
+				`\n  ${(args.audit.paths ?? []).join(" ") || "committed repository"}`, 0, 0);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("swival ")) +

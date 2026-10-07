@@ -32,7 +32,7 @@ describe("version preflight semantics", () => {
 		expect(evaluateSwivalVersion("swival 0.9.0").isIncompatible).toBe(true);
 		expect(evaluateSwivalVersion("warn: check\nswival 1.0.44").isOutdated).toBe(true);
 		expect(evaluateSwivalVersion("warn: check\nswival 1.0.44").isIncompatible).toBe(false);
-		expect(evaluateSwivalVersion("swival 1.0.45").isOutdated).toBe(false);
+		expect(evaluateSwivalVersion("swival 1.0.46").isOutdated).toBe(false);
 	});
 
 	it("compares semver correctly", () => {
@@ -42,16 +42,16 @@ describe("version preflight semantics", () => {
 		expect(compareSemver("2.0.0", "1.99.99")).toBeGreaterThan(0);
 	});
 
-	it("treats version 1.0.45 as up to date", () => {
-		const check = evaluateSwivalVersion("1.0.45");
+	it("treats version 1.0.46 as up to date", () => {
+		const check = evaluateSwivalVersion("1.0.46");
 		expect(check.isOutdated).toBe(false);
 		expect(check.isIncompatible).toBe(false);
 		expect(check.advisoryMessage).toBeUndefined();
 		expect(check.errorMessage).toBeUndefined();
 	});
 
-	it("treats version 1.0.44 as outdated but advisory (not incompatible)", () => {
-		const check = evaluateSwivalVersion("1.0.44");
+	it("treats version 1.0.45 as outdated but advisory (not incompatible)", () => {
+		const check = evaluateSwivalVersion("1.0.45");
 		expect(check.isOutdated).toBe(true);
 		expect(check.isIncompatible).toBe(false);
 		expect(check.advisoryMessage).toContain("uv tool upgrade swival");
@@ -85,7 +85,7 @@ describe("version preflight semantics", () => {
 		let callCount = 0;
 		const mockExec = async () => {
 			callCount++;
-			return "1.0.45";
+			return "1.0.46";
 		};
 
 		const check1 = await preflightSwivalVersion(mockExec);

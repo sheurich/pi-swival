@@ -1,205 +1,100 @@
 ---
 name: auditing-with-swival
-description: >-
-  Run reproducible multi-bucket security audits using swival-subagent. Use
-  when auditing a non-trivial codebase for security issues — splits work into
-  recon, parallel per-bucket audit, and consolidation stages with structured
-  output contracts at each stage. Triggers on: security audit, audit a repo,
-  audit a codebase, multi-bucket audit, reproducible audit, consolidate audit
-  findings, "Swival audit", "/swival-audit".
+description: Run one native Swival security audit on an isolated committed snapshot. Use for repository audits, native audit evidence, findings, and patch proposals through swival-subagent.
 ---
 
 # Auditing with Swival
 
-A three-stage pipeline for security audits over codebases too large for one worker. Each stage has a structured output contract so the pipeline is reproducible across runs and across operators.
+Use `swival-subagent` with an `audit` object. The extension invokes the released `Session.ask(..., parse_commands=True)` API with exactly one native `/audit`. Do not send slash commands or bucket prose through `task`.
 
-## When to use
+Generic delegation adds one fixed plain-text heading and never interprets slash/bang scripts, even with ambient `oneshot_commands=true`. Native execution uses the explicit `audit` API. This prevents unintended command dispatch, not model prompt injection.
 
-Run this pipeline when:
+## Preconditions
 
-- The target codebase is larger than ~5 k LOC or spans multiple trust boundaries
-- You need a defensible audit trail (prompts, reports, consolidated findings, hashes)
-- The output will be reviewed by another human or fed into a remediation plan
+- Start Pi from the target Git repository root. The native target comes from Pi's cwd, not a caller-supplied host path.
+- Require Swival 1.0.46 on Python 3.13+, Linux with AgentFS 0.6.4, and nono. Other Swival releases and unverified platform/version combinations fail closed.
+- Darwin/macOS with AgentFS 0.6.4 is blocked: writable temporary roots expose source files and Git metadata. Non-temp source paths do not establish safety. There is no sandbox fallback.
+- Require a passing real native-layout isolation canary on Linux before use. Offline transport tests do not prove OS isolation.
+- Follow the operator's provider and data boundaries. A configured profile does not authorize sending repository contents to its provider.
+- Verify the selected profile, provider, model, and supported effort with `swival --list-profiles`. Halt when a required profile is absent. Do not silently fall back.
+- Native mode rejects required secret encryption or outbound request filtering. Upstream auxiliary calls and traces omit those controls. Never turn them off to make an audit run.
 
-For a one-off read of a small file or a quick "is X safe", just read the code directly. Don't spin up the pipeline.
+Choose `chatgpt-daybreak-blue` with `xhigh` for approved personal content when that profile is configured. For other approved routes, use `frontier` with `high` unless the operator chooses another profile. Keep model IDs in Swival configuration.
 
-## What the human stops doing
+Swival accepts effort through `xhigh`, not Pi's `max`. Requested effort is not guaranteed for every native phase: upstream auxiliary `call_llm_text` requests omit it. Report the configured route and requested effort, not uniform per-phase effort.
 
-This skill exists to absorb the consolidation and routing labor:
+## Dispatch
 
-- Before: human reads N raw worker reports, manually deduplicates, ranks by severity, writes a summary doc. Hours per audit.
-- After: human reviews one recon JSON (confirm bucket cuts), then one consolidated findings doc. Minutes.
+Replace the route placeholders with verified values:
 
-Bucket discovery moves from a session-local judgment call to a recon worker output that's inspectable, version-controlled, and re-runnable.
-
-## Pipeline
-
-```
-Stage 1: recon          (1 worker)   → recon.json with bucket specs
-   ↓
-[checkpoint: human reviews bucket list]
-   ↓
-Stage 2: per-bucket     (N workers)  → reports/<bucket>.report.md (one per bucket)
-   ↓
-Stage 3: consolidation  (1 worker)   → consolidated-findings.md
-   ↓
-[checkpoint: human reviews consolidated doc]
-```
-
-The orchestrator coordinates between stages but does not synthesize findings itself. All synthesis happens inside Swival workers with explicit contracts, so the orchestrator's judgment doesn't drift the output.
-
-## Workspace layout
-
-```
-$WORKSPACE/
-├── preflight/
-│   └── commits.txt              # repo path, ref, SHA at audit time
-├── recon.json                   # Stage 1 output, parsed for fan-out
-├── prompts/
-│   └── <bucket-id>.md           # generated per bucket from template
-├── reports/
-│   ├── <bucket-id>.report.md    # Stage 2 worker stdout
-│   └── <bucket-id>.swival-report.json
-├── consolidated-findings.md     # Stage 3 output
-└── SHA256SUMS.txt               # all reports hashed for auditability
+```json
+{
+  "audit": {
+    "paths": ["src/**/*.py"],
+    "all": true,
+    "workers": 4,
+    "patchMaxTurns": 50
+  },
+  "profileOverride": "<audit-profile>",
+  "reasoningEffortOverride": "<audit-effort>",
+  "timeoutMs": 900000
+}
 ```
 
-Set `WORKSPACE=$HOME/.cache/swival-audit-<repo-slug>-<date>` and create it before Stage 1.
+- `paths`: up to 64 relative committed path/glob tokens. Omit for the repository's auditable scope. Paths with spaces, controls, shell syntax, absolute paths, or traversal are unsupported.
+- `all`: deep-review every selected file; otherwise native triage selects deep-review candidates.
+- `workers`: 1–8 native pipeline workers, not autonomous Swival subagents.
+- `patchMaxTurns`: 1–100 turns per patch loop. Native audit has no no-patch option.
+- `timeoutMs`: bounded runtime, 15 minutes by default and at most the operator-configured ceiling (30 minutes by default).
+- `async`: optional; returns a `runId` for `status`, `resume`, and `interrupt` while the originating Pi process stays connected. Pi disconnect cancels the native audit.
 
-## Models and effort
+Do not combine native audit with `task`, `agent`, `cwd`, `tasks`, `chain`, reviewer/self-review settings, output routing, extra arguments, or security overrides. Native mode permits only the structured audit options, existing model/profile/sampling overrides, and its runtime/output budgets. Invalid combinations fail before launch.
 
-Pass these as dispatch-time overrides on every worker. Do not hardcode model names — they live in `~/.config/swival/config.toml`.
+## Source and permissions
 
-| Override | Value | Rationale |
-|---|---|---|
-| `profileOverride` | `"frontier"` | Frontier-tier judgment. Audit is novel reasoning across call graphs; review loop alone doesn't compensate for a weaker model. |
-| `reasoningEffortOverride` | `"high"` | Multi-step exploit reasoning needs extended thinking. |
-| `temperatureOverride` | `0.2` | Audit reports should be deterministic; suppress confident hallucination. |
-| `maxReviewRoundsOverride` | `2` | One review pass catches attention-lapse errors without unbounded spend. |
-| `seedOverride` | `<fixed int>` | Reproducibility on re-run. Pick a date-based int. |
+The extension builds an independent repository under the configured artifact root, outside the source checkout and its Git metadata. It imports committed objects with hardened Git plumbing. It does not execute source hooks or filters, share object stores, retain remotes, or update source refs.
 
-Verify `swival --list-profiles` includes `frontier` before Stage 1. If not, halt — do not silently fall back.
+All staged, unstaged, and untracked changes are excluded. The manifest records source commit/tree and snapshot commit. The snapshot commit is synthetic; it preserves the committed tree, not commit history. Existing source status must remain unchanged, even when it was dirty before the audit.
 
-## Stage 1 — recon
+Native audit may edit its snapshot, create internal Git worktrees, and generate reports and patches. AgentFS uses a fresh session and `--no-default-allows`, with write exceptions only for the isolated snapshot and evidence directory. The native Session uses `files="some"`, `commands="none"`, and `network="provider-only"`. Instructions, skills, memory, history, lifecycle hooks, MCP, A2A, and autonomous subagents remain disabled.
 
-Dispatch one `security-recon` worker. Its only job is to survey the repo and emit `recon.json` matching the contract.
+Verifier and patch loops inherit these restricted modes. They cannot execute project commands or PoCs. Treat verification as native verifier judgment, not independent exploit reproduction. Patch generation is optional evidence, not permission to apply a fix.
 
-```
-swival-subagent with
-  agent: "security-recon"
-  cwd: "<repo absolute path>"
-  task: "<contents of recon prompt — see below>"
-  output: "$WORKSPACE/recon.json"
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-```
+Unsupported tracked links, gitlinks, unsafe names, secret-shaped paths, recognized credential content, oversized snapshots, and protected or unknown configurations fail closed. Snapshot limits are 4096 entries, 8 MiB per object, and 64 MiB total. Do not treat credential scanning as a guarantee that a repository has no secrets.
 
-Recon prompt body (substitute repo metadata):
+Project-supplied routing and executable provider routes are unsupported. More restrictive configured isolation requirements are not silently replaced. If native mode cannot preserve a requirement, stop; do not weaken permissions, broaden egress, or substitute a prompt audit.
 
-```
-Survey the repository at <absolute path>, branch <branch>, commit <SHA>.
-Identify production code paths grouped by trust boundary or threat model.
-Emit recon.json matching the contract.
-```
+## Evidence and completion
 
-Output contract: see `references/recon-contract.md`.
+The tool returns the artifact directory. It preserves:
 
-Checkpoint: read `recon.json`. Confirm buckets are non-overlapping, named meaningfully, and globs cover the production surface. Adjust if needed (re-dispatch or hand-edit) before Stage 2.
-
-## Stage 2 — parallel per-bucket audits
-
-Parse `recon.json`. For each bucket, render the prompt template (`references/audit-prompt-template.md`) into `$WORKSPACE/prompts/<bucket-id>.md`, then dispatch as one parallel call:
-
-```
-swival-subagent with
-  agent: "audit-worker"
-  concurrency: 3
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-  tasks: [
-    { agent: "audit-worker",
-      cwd:  "<repo absolute path>",
-      task: "/audit\n<contents of prompts/<bucket-id>.md>",
-      output: "$WORKSPACE/reports/<bucket-id>.report.md" },
-    ...one per bucket
-  ]
+```text
+<artifact-dir>/
+├── manifest.json
+├── run-meta.json
+├── completed.json (or spawn-error.txt failure fallback)
+├── stdout.txt
+├── stderr.txt
+└── evidence/
+    ├── native-result.json
+    ├── native-state/<audit-id>/state.json
+    └── audit-findings/<number>-<title>.md and .patch
 ```
 
-The `audit-worker` agent is the bundled read-only auditor, at `../../agents/audit-worker.md` relative to this skill. The leading `/audit` is required by that agent.
+Both synchronous and asynchronous execution use the same wrapper and shared finalizer. Live ownership precedes external execution. Timeout, interruption, or Pi disconnect cancels the native audit. The finalizer verifies process-group absence, drains bounded logs, and exports regular-file partial evidence before removing owned temporary resources. Evidence limits are 4096 scanned entries, 8 MiB per file, and 64 MiB total; combined subprocess output is capped at 2 MiB.
 
-Set `concurrency` based on token budget and rate limits. Defaults: 3 for `frontier` profile, 4 for lighter.
+Preservation failure retains the remaining snapshot for diagnosis and fails the run. Unverified shutdown prevents copying or deleting mutable sources. Cleanup and persistence failures remain separate diagnostics. If completion-marker persistence fails, the wrapper atomically writes a failure fallback to `spawn-error.txt`, independently of Pi's lifetime. A failure of both terminal writes leaves disk-only recovery unknown.
 
-AgentFS parallel-dispatch warning: `audit-worker` runs under `sandbox: agentfs`, whose overlay state lives in a per-session SQLite database, so invocations sharing a session id fight over one lock and most workers die before reading anything. The bundled `audit-worker.md` sets `noSandboxAutoSession: true` to give each parallel invocation its own overlay; keep that flag if you fork the agent. The same rule applies to any `sandbox: agentfs` agent you fan out against a shared cwd — the dispatcher refuses parallel dispatch of write-capable agents there unless one escape is in effect: serial dispatch, per-task `cwd`, or `noSandboxAutoSession: true`.
+Exit zero or a plausible answer alone does not prove completion. The extension checks native state, snapshot/scope identity, reviewed-file coverage, deep-review coverage, verification state, and report/patch pairs. Empty scope, partial phases, truncated coverage, missing state, and incomplete artifacts are not successful audits. Zero findings with complete state means the native pipeline completed; it does not establish that the code is secure.
 
-Output contract per report: see `references/audit-prompt-template.md` § "Required finding format".
+Use `status` or `resume` with only the returned `id` and `action`. Valid terminal results survive extension reloads. Without live ownership or valid terminal evidence, disk-only native state is unknown; inspect the returned artifact directory. The extension never signals or probes a PID recovered from disk.
 
-After dispatch, run `git -C <repo> status --porcelain` and halt on any output. The audit-worker is read-only by command allowlist; uncommitted changes mean a worker violated its sandbox.
+Compare source content, Git status, and refs with their initial values. Inspect every patch manually. Never apply audit patches automatically.
 
-## Stage 3 — consolidation
+## Validation and live probes
 
-Dispatch one `security-consolidator` worker with read access to the reports directory.
+`npm test` uses local transport stubs and released Swival entry points with stubbed LLM responses and denied sockets. It provides offline native execution and lifecycle evidence, not live provider proof or per-phase effort attestation. A prior prompt-only probe does not prove native execution.
 
-```
-swival-subagent with
-  agent: "security-consolidator"
-  cwd: "$WORKSPACE"
-  task: "<consolidation prompt — see below>"
-  output: "$WORKSPACE/consolidated-findings.md"
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-```
+A live probe requires explicit operator approval and all sandbox prerequisites. Use only a disposable synthetic Git repository, an explicit approved profile, and generated artifacts outside that repository. Start a separate Pi session from its root, run the dispatch above against one synthetic file, then inspect native state, artifacts, source status, and refs. Bound its timeout and worker/patch budgets. If nono or another prerequisite is missing, mark the live probe blocked; do not install tools or fall back to unrestricted network.
 
-Consolidation prompt body:
-
-```
-Read every file under reports/. For each finding, dedupe across buckets
-and produce a consolidated report matching the contract.
-```
-
-Output contract: see `references/consolidation-contract.md`.
-
-After Stage 3:
-
-```bash
-shasum -a 256 "$WORKSPACE"/{recon.json,reports/*,consolidated-findings.md} \
-  > "$WORKSPACE/SHA256SUMS.txt"
-```
-
-Share `consolidated-findings.md` through whatever channel the audit consumer expects — a Google Doc, a tracking ticket, an internal wiki page. The pipeline produces a self-contained Markdown document; downstream distribution is out of scope for this skill.
-
-## Re-dispatch heuristics
-
-A worker returning "No concrete findings." is acceptable only if its coverage notes substantiate full scope review. If coverage notes are thin or absent, re-dispatch that single bucket once with `maxReviewRoundsOverride: 3`. Escalating beyond that requires a human decision.
-
-If two buckets report overlapping findings (same file:line), Stage 3 dedupes them. If two buckets report contradictory verdicts on the same file:line, halt and ask the human — that's a signal of buggy bucket boundaries.
-
-## Anti-patterns
-
-- Skipping recon and writing buckets in your head. Bucket choices are the single biggest determinant of audit quality and they need to be inspectable.
-- Letting one worker see another worker's output. The review boundary depends on independence.
-- Hardcoding model IDs in agent definitions or dispatches. Routing belongs in `~/.config/swival/config.toml`.
-- Accepting "No concrete findings" without coverage notes. That report is unverified, not negative.
-- Running consolidation in the orchestrator's context. The orchestrator has too much extra context; synthesis drifts. Use the dedicated agent.
-- Mixing audit and remediation in one pipeline. This skill is read-only. Backports are a separate flow that uses `self-review-worker`.
-
-## Cross-references
-
-- The companion `swival-audit` prompt template (`prompts/swival-audit.md` in this package) walks an interactive operator through the same pipeline as a slash-command-style invocation.
-- For implementing fixes from audit findings, dispatch a `self-review-worker` separately. This skill is read-only; remediation is a separate flow.
-
-## Reference files
-
-| File | Purpose |
-|---|---|
-| `references/recon-contract.md` | JSON schema for Stage 1 output |
-| `references/audit-prompt-template.md` | Template for per-bucket prompts in Stage 2 |
-| `references/consolidation-contract.md` | Output format for Stage 3 |
+For prompt-only review, use existing review skills or generic plain-language delegation. Keep it separate from native audit evidence. For remediation, dispatch `self-review-worker` only after the operator approves the findings and scope.

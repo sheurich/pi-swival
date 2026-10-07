@@ -42,10 +42,7 @@ Confirm it shows up in your settings:
 pi list | grep pi-swival
 ```
 
-All eight bundled agents (`swival`, `self-review-worker`, `test-runner`,
-`sandboxed-explorer`, `audit-worker`, `security-recon`,
-`security-consolidator`, `a2a-coordinator`) are auto-discovered from the package's `agents/`
-directory — no symlinks needed.
+All five bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`) are auto-discovered from the package's `agents/` directory.
 
 ## Demo 1 — generic delegation
 
@@ -110,28 +107,22 @@ Expected behaviour:
 This is the key value of `sandboxed-explorer`: you see what swival would
 do, then decide whether to apply it.
 
-## Demo 4 — security audit prompt template
+## Demo 4 — native audit prompt template
 
-Run the `/swival-audit` prompt template against a small public repo. The
-template walks Pi through the recon → per-bucket → consolidate pipeline
-documented in the `auditing-with-swival` skill.
+Use only a disposable synthetic Git repository for this probe. Start Pi from its root. Require Swival 1.0.46, Python 3.13+, Linux with AgentFS 0.6.4, nono, and explicit approval for the selected provider/profile. Darwin/macOS with AgentFS 0.6.4 is blocked because writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. Missing prerequisites block the probe; do not weaken network policy or substitute a sandbox.
 
 ```text
-/swival-audit https://github.com/example-org/some-small-repo
+/swival-audit src/**/*.py
 ```
 
 Expected behaviour:
 
-1. Pi expands the slash command into the audit walkthrough prompt.
-2. Pi clones the repo, inspects layout, and asks clarifying questions.
-3. After you confirm, Pi dispatches `audit-worker` agents per bucket.
+1. Pi expands the prompt and confirms relative scopes and approved routing.
+2. Pi dispatches one `audit` object, not a slash-prefixed freeform task.
+3. Native audit runs on an independent committed snapshot and returns preserved state, reports, and patch proposals.
+4. Source contents, status, and Git refs remain unchanged.
 
-For a faster demo without an external clone:
-
-```text
-/swival-audit /path/to/a/local/repo "Audit only the HTTP handlers,
-skip everything else."
-```
+Inspect native coverage and artifact pairs before treating the pipeline as complete. Native verifier judgment is not independently executed exploit reproduction. This demo does not prove uniform per-phase effort, and no patch applies automatically.
 
 ## Demo 5 — parallel dispatch
 
@@ -160,5 +151,5 @@ pi remove pi-swival
 | 1 | Extension loads, `swival-subagent` tool dispatches, default agent works |
 | 2 | Reviewer loop runs, structured report parsed |
 | 3 | AgentFS sandbox isolates writes |
-| 4 | `/swival-audit` prompt template registers, audit pipeline agents dispatch |
+| 4 | Prompt registration and native committed-snapshot execution, when all prerequisites are met |
 | 5 | Parallel task dispatch and per-task result blocks |
