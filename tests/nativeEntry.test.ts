@@ -7,15 +7,21 @@ import { nativeTestPython } from "./nativePython.js";
 import { inspectNativeAudit } from "../extensions/native-audit.js";
 
 it("executes released Session.ask native phases and inherited isolation with denied sockets", async () => {
-	const result = await new Promise<{ code: number; output: string }>((resolve) => {
+	// The aggregate includes five cold subprocesses; allow startup under full-suite load.
+	const result = await new Promise<{ code: number; output: string; diagnostics: string }>((resolve) => {
 		execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py")],
-			{ timeout: 20_000, maxBuffer: 64 * 1024, env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True" } },
-			(error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+			{ timeout: 60_000, maxBuffer: 64 * 1024,
+				env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True" } },
+			(error, stdout, stderr) => {
+				const output = stdout + stderr;
+				resolve({ code: error ? 1 : 0, output, diagnostics: JSON.stringify({ output,
+					error: error && { code: error.code, killed: error.killed, signal: error.signal } }) });
+			});
 	});
-	expect(result.code, result.output).toBe(0);
-	expect(result.output).toContain("Ran 12 tests");
+	expect(result.code, result.diagnostics).toBe(0);
+	expect(result.output).toContain("Ran 36 tests");
 	expect(result.output).toMatch(/\bOK\b/);
-}, 25_000);
+}, 65_000);
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(
 	"validates released finding/verification/patch/%s-report evidence without provider transport", async (report) => {

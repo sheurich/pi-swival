@@ -65,8 +65,12 @@ process.stdin.on('end',()=>{
  if (['output-close','disconnect-finalizing'].includes(${JSON.stringify(failure)})) {process.exit(0);return;}
  setInterval(()=>{},1000);
 });`, { mode: 0o755 });
+	// Log fixtures test successful draining or injected I/O faults, not the audit
+	// deadline. A 1s budget preempted fault delivery under full-suite Node 24 load.
+	// Keep ownership, cancellation, and deadline fixtures on their original budget.
+	const timeoutMs = logOutput ? 2000 : 1000;
 	fs.writeFileSync(path.join(root, "request.json"), JSON.stringify({ snapshot: path.join(root, "snapshot"),
-		evidence: path.join(root, "evidence"), session, agentfs: worker, python, timeoutMs: 1000 }));
+		evidence: path.join(root, "evidence"), session, agentfs: worker, python, timeoutMs }));
 	if (failure.endsWith("-open")) fs.mkdirSync(path.join(root, failure === "stdout-open" ? "stdout.txt" : "stderr.txt"));
 	if (failure === "completion") fs.mkdirSync(path.join(root, "completed.json"));
 	if (failure === "both-terminal") for (const name of ["completed.json", "spawn-error.txt"]) fs.mkdirSync(path.join(root, name));
@@ -106,6 +110,7 @@ if(mode==='disconnect-finalizing')fs.linkSync=(...args)=>{if(process.connected)p
 }
 
 async function execute(f: ReturnType<typeof fixture>, failure: string) {
+	const began = Date.now();
 	const proc = spawn(process.execPath, ["--require", f.preload, runner, f.root], {
 		env: { ...process.env, HOME: f.root }, detached: true, shell: false,
 		stdio: failure === "no-ipc" ? ["ignore", "pipe", "pipe"] : ["ignore", "pipe", "pipe", "ipc"],
@@ -137,7 +142,11 @@ async function execute(f: ReturnType<typeof fixture>, failure: string) {
 		proc.once("error", reject);
 		proc.once("exit", (exit) => { clearTimeout(timeout); proc.stdout?.destroy(); proc.stderr?.destroy(); resolve(exit); });
 	});
-	return { code, launcherPid, ready, output };
+	// Capture terminal and launch evidence before afterEach removes the fixture.
+	const diagnostics = JSON.stringify({ code, elapsedMs: Date.now() - began, ready, output,
+		terminal: readNativeTerminal(f.root), externalExecuted: fs.existsSync(f.marker),
+		requestReceived: fs.existsSync(f.requestFile) });
+	return { code, launcherPid, ready, output, diagnostics };
 }
 
 // Real wrappers, trusted Python bootstrap, live IPC, and real process groups.
@@ -149,8 +158,8 @@ describe("native-audit-runner short log writes", () => {
 	};
 	it("drains short positive writes to byte-identical stdout and stderr", async () => {
 		const f = fixture("short-write", expected); const result = await execute(f, "short-write");
-		expect(result.code, result.output).toBe(0);
-		expect(readNativeTerminal(f.root)?.exitCode).toBe(0);
+		expect(result.code, result.diagnostics).toBe(0);
+		expect(readNativeTerminal(f.root)?.exitCode, result.diagnostics).toBe(0);
 		for (const name of ["stdout", "stderr"] as const) {
 			const actual = fs.readFileSync(path.join(f.root, `${name}.txt`));
 			expect(actual.equals(expected[name])).toBe(true);
@@ -189,7 +198,7 @@ describe("native-audit-runner short log writes", () => {
 			const terminal = readNativeTerminal(f.root);
 			expect(terminal, result.output).toBeDefined();
 			expect(terminal?.exitCode).toBe(1);
-			expect(terminal?.stopped).toBe("Native runner I/O failed.");
+			expect(terminal?.stopped, result.diagnostics).toBe("Native runner I/O failed.");
 			expect(terminal?.shutdown).toBe("verified");
 			expect(result.launcherPid).toBeGreaterThan(1);
 			expect(() => process.kill(-result.launcherPid!, 0)).toThrow();

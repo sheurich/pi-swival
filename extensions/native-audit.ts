@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import { isDeepStrictEqual } from "node:util";
 import type { RunMeta } from "./index.js";
 
 export interface NativeAuditOptions {
@@ -339,6 +340,7 @@ export async function prepareNativeAudit(
 	let route: Record<string, unknown>;
 	try { route = await preflight(); }
 	catch { throw new Error("Native audit configuration preflight failed: protected, unknown, or unsupported requirements. No native worker/provider was started."); }
+	request.expectedRoute = route;
 	checkCancelled();
 	if (!agentfs || !nono) throw new Error("Native audit requires AgentFS and nono for provider-only network policy; no fallback.");
 	const version = (await boundedExec(agentfs, ["--version"], cwd, undefined, trustedGit.env, 5000, 16384)).toString();
@@ -367,7 +369,9 @@ export async function prepareNativeAudit(
 		checkCancelled();
 		const scoped = await preflight();
 		checkCancelled();
-		request.expectedScope = scoped.scope;
+		const { scope, ...secondRoute } = scoped;
+		if (!isDeepStrictEqual(route, secondRoute)) throw new Error("Native route changed after preflight; no fallback.");
+		request.expectedScope = scope;
 		await fs.mkdir(request.evidence, { mode: 0o700 });
 		await fs.mkdir(path.join(runDir, "sandbox"), { mode: 0o700 });
 		await fs.writeFile(path.join(runDir, "manifest.json"), JSON.stringify({ ...manifest, scope: scoped.scope, audit, route }, null, 2), { mode: 0o600 });
@@ -442,6 +446,12 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 			return { status: "failed", error: "Native runtime/sandbox completion evidence is missing." };
 		}
 		const manifest = await regularJson(path.join(artifactDir, "manifest.json"), artifactDir);
+		const request = await regularJson(path.join(artifactDir, "request.json"), artifactDir);
+		if (manifest.route?.version !== 1 || !isDeepStrictEqual(manifest.route, request.expectedRoute) ||
+			!isDeepStrictEqual(manifest.route, result.route) || result.provider !== manifest.route.provider ||
+			result.model !== manifest.route.model || result.requestedEffort !== manifest.route.reasoningEffort) {
+			return { status: "failed", error: "Native route completion evidence does not match preflight." };
+		}
 		const scope = manifest.scope;
 		const statesDir = path.join(artifactDir, "evidence", "native-state");
 		const entries = await fs.readdir(statesDir);

@@ -123,16 +123,31 @@ function temporary(target) { return `${target}.${process.pid}.${randomBytes(8).t
 function exclusiveWrite(target, bytes) {
 	fs.writeFileSync(target, bytes, { mode: 0o600, flag: "wx" });
 }
+function accountRetained(target, size, budget) {
+	if (budget.paths.has(target)) return;
+	scanned(budget);
+	budget.bytes += size;
+	if (budget.bytes > totalLimit) throw new Error("Native evidence byte limit.");
+	budget.paths.add(target);
+}
 function publishEvidence(runDir, source, target, budget) {
 	const bytes = regularBytes(runDir, source, fileLimit);
-	budget.bytes += bytes.length;
-	if (budget.bytes > totalLimit) throw new Error("Native evidence byte limit.");
-	ensureDirectory(runDir, path.dirname(target));
 	try {
 		const existing = regularBytes(runDir, target, fileLimit);
 		if (!existing.equals(bytes)) throw new Error("Conflicting retained native evidence.");
+		accountRetained(target, existing.length, budget);
 		return;
 	} catch (error) { if (error.code !== "ENOENT") throw error; }
+	// Charge the destination union, including new directories. Matching retry
+	// files are already charged by the retained-tree scan, never twice.
+	accountRetained(target, bytes.length, budget);
+	let parent = path.dirname(target);
+	const evidence = path.join(runDir, "evidence");
+	while (parent !== evidence) {
+		accountRetained(parent, 0, budget);
+		parent = path.dirname(parent);
+	}
+	ensureDirectory(runDir, path.dirname(target));
 	const temp = temporary(target);
 	try {
 		exclusiveWrite(temp, bytes);
@@ -162,25 +177,31 @@ function scanDirectory(runDir, directory, budget, visit) {
 function preserveEvidence(runDir) {
 	const snapshot = path.join(runDir, "snapshot");
 	const evidence = path.join(runDir, "evidence");
-	const budget = { entries: 0, bytes: 0 };
-	// Direct evidence is already durable. Account for its resource use, but
-	// never replace it with snapshot output.
-	scanDirectory(runDir, evidence, budget, (name) => {
-		if (["native-state", "audit-findings"].includes(name)) return;
-		const target = path.join(evidence, name);
+	const budget = { entries: 0, bytes: 0, paths: new Set() };
+	const retainedScan = { entries: 0 };
+	const retained = (directory) => scanDirectory(runDir, directory, retainedScan, (name) => {
+		const target = path.join(directory, name);
 		const stat = checkedPath(runDir, target);
-		if (!stat.isFile() || stat.size > fileLimit) throw new Error("Unsupported direct native evidence.");
-		budget.bytes += stat.size;
-		if (budget.bytes > totalLimit) throw new Error("Native evidence byte limit.");
+		if (stat.isDirectory()) {
+			accountRetained(target, 0, budget);
+			retained(target);
+		} else {
+			if (!stat.isFile() || stat.size > fileLimit) throw new Error("Unsupported retained native evidence.");
+			accountRetained(target, stat.size, budget);
+		}
 	});
+	// Every retained entry counts, including unmatched files in export namespaces.
+	retained(evidence);
+	// Bound source traversal independently from the logical destination union.
+	const sourceScan = { entries: 0 };
 	const states = path.join(snapshot, ".swival", "audit");
-	scanDirectory(runDir, states, budget, (name) => {
+	scanDirectory(runDir, states, sourceScan, (name) => {
 		if (!/^[a-f0-9]{8}$/.test(name)) return;
 		const source = path.join(states, name, "state.json");
-		scanned(budget);
+		scanned(sourceScan);
 		publishEvidence(runDir, source, path.join(evidence, "native-state", name, "state.json"), budget);
 	});
-	const findings = (source, target) => scanDirectory(runDir, source, budget, (name) => {
+	const findings = (source, target) => scanDirectory(runDir, source, sourceScan, (name) => {
 		const file = path.join(source, name);
 		const stat = checkedPath(runDir, file);
 		if (stat.isDirectory()) findings(file, path.join(target, name));

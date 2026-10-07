@@ -82,7 +82,9 @@ if (['patch','empty-report','blank-report','kill-evidence','disconnect-evidence'
 }
 fs.writeFileSync(path.join(stateDir,'state.json'),JSON.stringify(state));
 fs.writeFileSync(path.join(request.evidence,'native-result.json'), JSON.stringify({status:'completed', answer:'Native audit result',
- sandbox:{agentfs:true,agentfsVersion:'0.6.4'}, network:'provider-only', scope:request.expectedScope}));
+ sandbox:{agentfs:true,agentfsVersion:'0.6.4'}, network:'provider-only', scope:request.expectedScope,
+ route:request.expectedRoute,provider:request.expectedRoute.provider,model:request.expectedRoute.model,
+ requestedEffort:request.expectedRoute.reasoningEffort}));
 if (${JSON.stringify(behavior)} === 'ordinary') fs.rmSync(stateDir,{recursive:true});
 if (${JSON.stringify(behavior)} === 'missing-patch') {
  state.artifact_state={'finding':{status:'written',report_filename:'001-test.md',patch_filename:'001-test.patch'}};
@@ -262,6 +264,53 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 			}
 		} finally { if (pid) { try { process.kill(-pid, "SIGKILL"); } catch { /* live origin IPC identity already stopped */ } } }
 	}, 25000);
+
+	it.each(["model", "endpoint", "options"])("rejects %s route drift between preflights without launching", async (field) => {
+		const f = fixture();
+		const configDir = path.join(f.root, "config", "swival"); fs.mkdirSync(configDir, { recursive: true });
+		const config = path.join(configDir, "config.toml");
+		fs.writeFileSync(config, '[profiles.test]\nprovider="lmstudio"\nmodel="offline-A"\nbase_url="http://route-a.invalid"\n');
+		const params: any = { ...f.params, profileOverride: "test" }; delete params.modelOverride;
+		const write = vi.mocked(fsPromises.writeFile).getMockImplementation()!;
+		const launches = vi.mocked(spawn).mock.calls.length;
+		const spy = vi.spyOn(fsPromises, "writeFile").mockImplementation(async (file, data, options) => {
+			await write(file, data, options);
+			if (String(file).endsWith(`${path.sep}snapshot${path.sep}swival.toml`)) {
+				fs.writeFileSync(config, '[profiles.test]\nprovider="lmstudio"\n' +
+					`model="${field === "model" ? "offline-B" : "offline-A"}"\n` +
+					`base_url="http://${field === "endpoint" ? "route-b" : "route-a"}.invalid"\n` +
+					(field === "options" ? 'temperature=0.25\n' : ''));
+			}
+		});
+		try {
+			const result = await f.call(params);
+			expect(result.isError, result.content[0].text).toBe(true);
+			expect(result.content[0].text).toMatch(/route.*changed|routing.*changed/i);
+			expect(fs.readdirSync(f.artifacts)).toEqual([]);
+			expect(vi.mocked(spawn).mock.calls.slice(launches)).toEqual([]);
+			expect(f.git("show-ref")).toBe(f.before);
+		} finally { spy.mockRestore(); }
+	});
+
+	it.each(["model", "endpoint", "options", "top-model", "missing", "request"])("rejects %s completion route evidence drift", async (field) => {
+		const f = fixture(); const initial = await f.call();
+		expect(initial.isError, initial.content[0].text).not.toBe(true);
+		const runDir = initial.details.results[0].artifactDir;
+		const manifest = JSON.parse(fs.readFileSync(path.join(runDir, "manifest.json"), "utf8"));
+		const target = path.join(runDir, field === "request" ? "request.json" : "evidence/native-result.json");
+		const record = JSON.parse(fs.readFileSync(target, "utf8"));
+		const route = structuredClone(manifest.route);
+		if (field === "model" || field === "request") route.model = "offline-drift";
+		if (field === "endpoint") route.destination = { ...route.destination, apiBase: "http://drift.invalid/v1" };
+		if (field === "options") route.options = { ...route.options, max_turns: 1 };
+		if (field === "request") record.expectedRoute = route;
+		else if (field === "missing") delete record.route;
+		else if (field === "top-model") record.model = "offline-drift";
+		else record.route = route;
+		fs.writeFileSync(target, JSON.stringify(record));
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+	});
 
 	it("writes native metadata once and preserves its original bytes for fresh recovery", async () => {
 		const f = fixture();

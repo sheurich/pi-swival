@@ -89,6 +89,22 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		expect(result.output).toMatch(/protected|unknown|unsupported/i);
 		expect(result.output).not.toContain("synthetic-never-log-this");
 	});
+	it.each(Object.entries({
+		network: '"none"', files: '"none"', sandbox: '"nono"', sandbox_strict_read: "true",
+		lifecycle_fail_closed: "true", nono_profile: '"required-profile"', nono_rollback: "true",
+		nono_block_net: "true", nono_allow_domain: '["offline.invalid"]',
+		nono_network_profile: '"required-profile"', nono_credential: '["required-reference"]',
+		nono_audit_integrity: "true",
+	}).flatMap(([key, value]) => ["explicit", "active"].map((selection) => [key, selection, value])))
+		("keeps released restrictive-profile rejection for %s under %s selection", async (key, selection, value) => {
+			const home = scratch(); fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+			fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"),
+				`${selection === "active" ? 'active_profile="test"\n' : ''}[profiles.test]\n` +
+				`provider="lmstudio"\nmodel="offline-model"\ndescription="synthetic-never-log-this"\n${key}=${value}\n`);
+			const result = await runPreflight(repository(), home, {}, selection === "explicit" ? { profile: "test" } : {});
+			expect(result.code).toBe(1); expect(result.output).toMatch(/unknown|unsupported/i);
+			expect(result.output).not.toContain("synthetic-never-log-this");
+		});
 	it("rejects SWIVAL_ENCRYPT_KEY presence without inspecting or logging its value", async () => {
 		const result = await runPreflight(repository(), scratch(), { SWIVAL_ENCRYPT_KEY: "synthetic-never-log-this" });
 		expect(result.code).toBe(1);
@@ -102,6 +118,17 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		const result = await runPreflight(repository(), home, {}, { profile: "test", model: "override-model", reasoningEffort: "xhigh" });
 		expect(result.code, result.output).toBe(0);
 		expect(JSON.parse(result.output)).toMatchObject({ provider: "lmstudio", model: "override-model", reasoningEffort: "xhigh", profile: "test" });
+	});
+	it("preserves released ChatGPT profile routing without opening OAuth credentials", async () => {
+		const home = scratch(); fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"),
+			'active_profile="test"\n[profiles.test]\nprovider="chatgpt"\nmodel="chatgpt/gpt-offline"\n');
+		const result = await runPreflight(repository(), home);
+		expect(result.code, result.output).toBe(0);
+		expect(JSON.parse(result.output)).toMatchObject({ provider: "chatgpt", profile: "test",
+			model: "chatgpt/gpt-offline", transportModel: "chatgpt/gpt-offline",
+			destination: { apiBase: "https://chatgpt.com/backend-api/codex" } });
+		expect(fs.existsSync(path.join(home, ".config", "litellm"))).toBe(false);
 	});
 	it.each(["missing", "", false])("rejects missing or invalid profiles without fallback: %s", async (profile) => {
 		const result = await runPreflight(repository(), scratch(), {}, { profile, model: "offline-model" });
@@ -147,6 +174,29 @@ describe("independent committed snapshot", () => {
 		expect(git(source, "show-ref")).toBe(before);
 		expect(fs.readFileSync(path.join(source, "src", "code.py"), "utf8")).toBe("dirty\n");
 	});
+	it("keeps tracked swival.toml HEAD bytes in released phases while its runtime copy stays inert", async () => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const source = repository();
+		const original = '# committed-content-sentinel\n[audit]\nforce_review=["src/code.py"]\n';
+		fs.writeFileSync(path.join(source, "swival.toml"), original);
+		git(source, "add", "swival.toml"); git(source, "commit", "-m", "tracked config fixture");
+		const before = { refs: git(source, "show-ref"), status: git(source, "status", "--porcelain=v1") };
+		const dest = path.join(scratch(), "snapshot");
+		const manifest = await createCommittedSnapshot(source, dest);
+		expect(manifest.files).toContain("swival.toml");
+		expect(git(dest, "show", "HEAD:swival.toml")).toBe(original);
+		expect(git(dest, "rev-parse", "HEAD^{tree}").trim()).toBe(manifest.sourceTree);
+		expect(fs.readFileSync(path.join(dest, "swival.toml"), "utf8")).toBe("# Native audit runtime configuration is inert.\n");
+		const output = execFileSync(python, ["-I", "-B", path.join(ROOT, "tests", "native_audit_test.py"), "--check-content", dest], {
+			timeout: 15000, maxBuffer: 64 * 1024,
+			env: { PATH: process.env.PATH, HOME: scratch(), LITELLM_LOCAL_MODEL_COST_MAP: "True" },
+			stdio: ["ignore", "pipe", "pipe"],
+		}).toString();
+		expect(output).toContain("Released committed config phases passed");
+		expect(git(source, "show-ref")).toBe(before.refs);
+		expect(git(source, "status", "--porcelain=v1")).toBe(before.status);
+		expect(fs.readFileSync(path.join(source, "swival.toml"), "utf8")).toBe(original);
+	}, 20000);
 	it.each(["link", "credential", "control"])('rejects unsupported %s paths before native dispatch', async (kind) => {
 		const native = await import("../extensions/native-audit.js").catch(() => undefined);
 		expect(native?.createCommittedSnapshot).toBeTypeOf("function");

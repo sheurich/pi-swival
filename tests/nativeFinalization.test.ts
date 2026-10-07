@@ -124,6 +124,56 @@ describe("native-audit-lifecycle shared finalization", () => {
 		}, 10000,
 	);
 
+	it.each(["native-state", "audit-findings"].flatMap((namespace) =>
+		["oversize", "total", "entries", "symlink", "directory-symlink", "nonregular"].map((kind) => [namespace, kind] as const)))
+		("rejects unmatched retained %s/%s evidence before snapshot cleanup", async (namespace, kind) => {
+			const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+			const retained = path.join(f.runDir, "evidence", namespace, "extra");
+			fs.mkdirSync(retained, { recursive: true });
+			const file = path.join(retained, "unmatched.bin");
+			if (kind === "oversize") { fs.writeFileSync(file, ""); fs.truncateSync(file, 8 * 1024 * 1024 + 1); }
+			if (kind === "total") for (let i = 0; i < 9; i++) {
+				const target = path.join(retained, `${i}.bin`); fs.writeFileSync(target, ""); fs.truncateSync(target, 8 * 1024 * 1024);
+			}
+			if (kind === "entries") for (let i = 0; i < 4097; i++) fs.writeFileSync(path.join(retained, `${i}.bin`), "");
+			if (kind === "symlink") fs.symlinkSync(path.join(f.runDir, "missing"), file);
+			if (kind === "directory-symlink") fs.symlinkSync(f.findings, file);
+			if (kind === "nonregular") {
+				const { execFileSync } = await import("node:child_process");
+				execFileSync("/usr/bin/mkfifo", [file], { timeout: 5000, stdio: "pipe" });
+			}
+			const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
+			expect(term.exitCode).toBe(1); expect(term.preservationFailure).toBeTruthy();
+			expect(term.retainedResources).toContain(path.join(f.runDir, "snapshot"));
+			expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(true);
+		}, 10000);
+
+	it("limits the union of unmatched retained bytes and newly published bytes", async () => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const retained = path.join(f.runDir, "evidence", "audit-findings"); fs.mkdirSync(retained);
+		for (let i = 0; i < 9; i++) {
+			const file = path.join(i < 4 ? retained : f.findings, `${i}.patch`);
+			fs.writeFileSync(file, ""); fs.truncateSync(file, 8 * 1024 * 1024);
+		}
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
+		expect(term.preservationFailure).toBeTruthy(); expect(term.exitCode).toBe(1);
+		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(true);
+	});
+
+	it("does not double-charge byte-identical retry destinations near the combined limit", async () => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const retained = path.join(f.runDir, "evidence", "audit-findings"); fs.mkdirSync(retained);
+		for (let i = 0; i < 7; i++) {
+			const file = path.join(retained, `${i}.bin`); fs.writeFileSync(file, ""); fs.truncateSync(file, 8 * 1024 * 1024);
+		}
+		const source = path.join(f.state, "state.json"); fs.truncateSync(source, 8 * 1024 * 1024 - 4096);
+		const state = path.join(f.runDir, "evidence", "native-state", "abc12345"); fs.mkdirSync(state, { recursive: true });
+		fs.copyFileSync(source, path.join(state, "state.json"));
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
+		expect(term.preservationFailure).toBeUndefined(); expect(term.exitCode).toBe(0);
+		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
+	});
+
 	it("keeps preservation and cleanup diagnostics distinct", async () => {
 		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
 		fs.truncateSync(path.join(f.state, "state.json"), 8 * 1024 * 1024 + 1);

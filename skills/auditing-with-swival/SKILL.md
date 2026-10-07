@@ -12,7 +12,7 @@ Generic delegation adds one fixed plain-text heading and never interprets slash/
 ## Preconditions
 
 - Start Pi from the target Git repository root. The native target comes from Pi's cwd, not a caller-supplied host path.
-- Require Swival 1.0.46 on Python 3.13+, Linux with AgentFS 0.6.4, and nono. Other Swival releases and unverified platform/version combinations fail closed.
+- Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux with AgentFS 0.6.4, and nono. Other releases and unverified platform/version combinations fail closed.
 - Darwin/macOS with AgentFS 0.6.4 is blocked: writable temporary roots expose source files and Git metadata. Non-temp source paths do not establish safety. There is no sandbox fallback.
 - Require a passing real native-layout isolation canary on Linux before use. Offline transport tests do not prove OS isolation.
 - Follow the operator's provider and data boundaries. A configured profile does not authorize sending repository contents to its provider.
@@ -22,6 +22,24 @@ Generic delegation adds one fixed plain-text heading and never interprets slash/
 Choose `chatgpt-daybreak-blue` with `xhigh` for approved personal content when that profile is configured. For other approved routes, use `frontier` with `high` unless the operator chooses another profile. Keep model IDs in Swival configuration.
 
 Swival accepts effort through `xhigh`, not Pi's `max`. Requested effort is not guaranteed for every native phase: upstream auxiliary `call_llm_text` requests omit it. Report the configured route and requested effort, not uniform per-phase effort.
+
+## Native routing
+
+The first preflight binds the selected profile, effective client provider/model/endpoint, supported cloud selectors, and safe requested execution options. The second preflight and execution must match it. Drift fails before Session construction. A native-only guard checks primary, auxiliary, and retry transports, blocks model-list discovery/replacement and Hugging Face text-generation fallback, and rejects cached alternate models. A caught route failure still fails the run. Ordinary delegation is unchanged.
+
+| Provider | Supported destination selection |
+| --- | --- |
+| `lmstudio` | Explicit model; configured HTTP base or released loopback default. |
+| `generic` | Explicit model and HTTP base, with released `/vN` normalization. |
+| `openrouter` | Explicit model; configured base, `OPENROUTER_API_BASE`, or released default. |
+| `chatgpt` | Released GPT Responses routing, including profile/model prefixes. Bind `CHATGPT_API_BASE`, then `OPENAI_CHATGPT_API_BASE`, then the released Codex endpoint. Upstream ignores the configured base; native mode accepts it only when it matches that effective selection. |
+| `huggingface` | `org/model`, with optional `huggingface/` prefix; configured base, `HF_API_BASE`, `HUGGINGFACE_API_BASE`, or released router endpoint. Dynamic provider/model mapping and the released non-chat text-generation fallback are unsupported. |
+| `bedrock` | Explicit region in `base_url`; regular runtime endpoint from that region or `AWS_BEDROCK_RUNTIME_ENDPOINT`. Bind configured/ambient account-profile selectors. Region discovery, isolated-region partitions, and alternate Mantle/agent/Claude Platform/OpenAI endpoint routes are unsupported. |
+| `vertexai` | Explicit project/location and a bare model selected by the released `GEMINI` handler. Legacy, partner, model-garden, agent-engine, and other dispatch modes are unsupported. Use a configured base or the released location-derived endpoint; without a configured base, reject `VERTEXAI_API_BASE` and `litellm.api_base` overrides. Reject location replacement. |
+
+Endpoints must be representable HTTP URLs without userinfo, queries, fragments, encoded/opaque components, or recognized credential content. Nonempty routing-affecting `extra_body`, executable providers, and `USE_LITELLM_PROXY` are unsupported. Profile/model/cloud selectors use bounded token grammars; unrepresentable selectors fail with value-free diagnostics. Native mode does not discover destination selectors from credential or configuration stores. Vertex uses the released selector before Session and on each call. Its first metadata import uses production mode and the bundled model-cost map, with no dotenv or remote fetch. It caches the selector under a lock, then restores the prior environment flags, including absent values and import failures. Imported modules remain initialized in the private native process; audit threads do not change these flags. Swival's pre-existing package import may set the offline-map flag when it was absent.
+
+The binding records typed constructor options, including context/output limits, turns, retries, timeout, sampling, thinking/cache settings, and requested effort. It does not assert that every phase forwards them. Credentials and custom `user_agent` metadata stay runtime-only and outside the binding. Credential-source metadata describes configuration or runtime lookup, not credential values, store contents, owner, billing provenance, or provider authorization. Remote server routing is not an attestation of the server's internal model selection. Do not put secrets in model, profile, endpoint, or cloud-selector fields. Token validation cannot detect every secret deliberately placed in a routing identifier.
 
 ## Dispatch
 
@@ -54,7 +72,7 @@ Do not combine native audit with `task`, `agent`, `cwd`, `tasks`, `chain`, revie
 
 The extension builds an independent repository under the configured artifact root, outside the source checkout and its Git metadata. It imports committed objects with hardened Git plumbing. It does not execute source hooks or filters, share object stores, retain remotes, or update source refs.
 
-All staged, unstaged, and untracked changes are excluded. The manifest records source commit/tree and snapshot commit. The snapshot commit is synthetic; it preserves the committed tree, not commit history. Existing source status must remain unchanged, even when it was dirty before the audit.
+All staged, unstaged, and untracked changes are excluded. The manifest records source commit/tree and snapshot commit. The snapshot commit is synthetic; it preserves the committed tree, not commit history. Existing source status must remain unchanged, even when it was dirty before the audit. A tracked `swival.toml` stays in committed scope and released phase inputs. Its snapshot working copy is inert so project `[audit]` runtime settings do not execute; original source bytes and Git objects remain unchanged.
 
 Native audit may edit its snapshot, create internal Git worktrees, and generate reports and patches. AgentFS uses a fresh session and `--no-default-allows`, with write exceptions only for the isolated snapshot and evidence directory. The native Session uses `files="some"`, `commands="none"`, and `network="provider-only"`. Instructions, skills, memory, history, lifecycle hooks, MCP, A2A, and autonomous subagents remain disabled.
 
@@ -71,6 +89,7 @@ The tool returns the artifact directory. It preserves:
 ```text
 <artifact-dir>/
 ├── manifest.json
+├── request.json
 ├── run-meta.json
 ├── completed.json (or spawn-error.txt failure fallback)
 ├── stdout.txt
@@ -81,11 +100,11 @@ The tool returns the artifact directory. It preserves:
     └── audit-findings/<number>-<title>.md and .patch
 ```
 
-Both synchronous and asynchronous execution use the same wrapper and shared finalizer. Live ownership precedes external execution. Timeout, interruption, or Pi disconnect cancels the native audit. The finalizer verifies process-group absence, drains bounded logs, and exports regular-file partial evidence before removing owned temporary resources. Evidence limits are 4096 scanned entries, 8 MiB per file, and 64 MiB total; combined subprocess output is capped at 2 MiB.
+Both synchronous and asynchronous execution use the same wrapper and shared finalizer. Live ownership precedes external execution. Timeout, interruption, or Pi disconnect cancels the native audit. The finalizer verifies process-group absence, drains bounded logs, and exports regular-file partial evidence before removing owned temporary resources. Every retained evidence subtree receives recursive type and resource checks, including unmatched files in export namespaces. Limits are 4096 retained entries, 8 MiB per regular file, and 64 MiB combined retained bytes; source traversal has a separate 4096-entry limit. Byte-identical retry destinations count once; conflicting destinations fail. Combined subprocess output is capped at 2 MiB.
 
 Preservation failure retains the remaining snapshot for diagnosis and fails the run. Unverified shutdown prevents copying or deleting mutable sources. Cleanup and persistence failures remain separate diagnostics. If completion-marker persistence fails, the wrapper atomically writes a failure fallback to `spawn-error.txt`, independently of Pi's lifetime. A failure of both terminal writes leaves disk-only recovery unknown.
 
-Exit zero or a plausible answer alone does not prove completion. The extension checks native state, snapshot/scope identity, reviewed-file coverage, deep-review coverage, verification state, and report/patch pairs. Empty scope, partial phases, truncated coverage, missing state, and incomplete artifacts are not successful audits. Zero findings with complete state means the native pipeline completed; it does not establish that the code is secure.
+Exit zero or a plausible answer alone does not prove completion. The extension checks the route binding in request/manifest/result, native state, snapshot/scope identity, reviewed-file coverage, deep-review coverage, verification state, and report/patch pairs. Empty scope, partial phases, truncated coverage, missing state, and incomplete artifacts are not successful audits. Zero findings with complete state means the native pipeline completed; it does not establish that the code is secure.
 
 Use `status` or `resume` with only the returned `id` and `action`. Valid terminal results survive extension reloads. Without live ownership or valid terminal evidence, disk-only native state is unknown; inspect the returned artifact directory. The extension never signals or probes a PID recovered from disk.
 
