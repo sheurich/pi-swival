@@ -32,6 +32,9 @@ jobs:
           python-version: '3.13'
           enable-cache: false
 
+      - name: Install Python 3.13
+        run: uv --no-config python install 3.13
+
       - name: Bootstrap offline test dependencies
         run: ./tests/setup.sh
 
