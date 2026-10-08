@@ -841,8 +841,9 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 });
 
 it("runs released native entry-point regressions with stubbed LLM calls and a socket denial", () => {
+	// Match nativeEntry.test.ts: this whole suite includes five cold subprocesses.
 	const output = execFileSync(python, ["-I", path.join(ROOT, "tests", "native_audit_test.py")], {
-		cwd: ROOT, timeout: 30_000, maxBuffer: 256 * 1024, stdio: ["ignore", "pipe", "pipe"],
+		cwd: ROOT, timeout: 60_000, maxBuffer: 256 * 1024, stdio: ["ignore", "pipe", "pipe"],
 	});
 	expect(output.toString()).not.toContain("provider/network forbidden");
-}, 35000);
+}, 65_000);
