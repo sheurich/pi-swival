@@ -364,6 +364,7 @@ export async function prepareNativeAudit(
 		const runtimeBin = path.join(runDir, "runtime-bin");
 		await fs.mkdir(runtimeBin, { mode: 0o700 });
 		await fs.symlink(trustedGit.executable, path.join(runtimeBin, "git"));
+		await fs.symlink(nono, path.join(runtimeBin, "nono"));
 		request.runtimePath = [runtimeBin, trustedGit.env.PATH].join(path.delimiter);
 		const manifest = await createCommittedSnapshot(identity.sourceRoot, request.snapshot, trustedGit);
 		checkCancelled();

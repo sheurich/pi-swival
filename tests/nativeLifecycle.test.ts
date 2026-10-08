@@ -58,6 +58,19 @@ const fs = require('node:fs'); const path = require('node:path');
 if (process.argv.includes('--version')) { console.log('agentfs 0.6.4'); process.exit(0); }
 let input=''; process.stdin.on('data', x=>input+=x); process.stdin.on('end', ()=> {
 const request = JSON.parse(input);
+if (${JSON.stringify(behavior)} === 'nono-lookup') {
+ const {spawnSync} = require('node:child_process');
+ const lookup = spawnSync(request.python, ['-I','-B','-c', [
+  "import json, os, subprocess",
+  "from swival.sandbox_nono import build_block_net_wrapper",
+  "wrapper = build_block_net_wrapper(base_dir=os.getcwd())",
+  "version = subprocess.check_output([wrapper[0], '--version'], timeout=5, text=True).strip()",
+  "print(json.dumps({'executable':os.path.realpath(wrapper[0]), 'version':version, 'wrapper':wrapper}))",
+ ].join('; ')],
+  {timeout:10000,maxBuffer:65536,env:{...process.env,LITELLM_LOCAL_MODEL_COST_MAP:'True'}});
+ if (lookup.error || lookup.status !== 0) {process.stderr.write(lookup.stderr ?? ''); process.exit(1);}
+ fs.writeFileSync(path.join(request.evidence,'nono-lookup.json'),lookup.stdout);
+}
 if (${JSON.stringify(behavior)} === 'lost-expansion') {
  const {spawnSync} = require('node:child_process');
  const result = spawnSync(${JSON.stringify(python)}, ['-I','-B',${JSON.stringify(path.join(ROOT, "tests", "native_audit_test.py"))},'--run-finding'],
@@ -233,6 +246,77 @@ try {
 }
 
 describe("native audit durable lifecycle (offline transport stub)", () => {
+	it("prunes expired artifacts during synchronous native-only dispatch while retaining uncertain runs", async () => {
+		const f = fixture();
+		const removable = ["verified", "verified-fallback", "not-started", "ordinary"];
+		const retained = ["missing", "malformed", "unverified", "recent"];
+		for (const kind of [...removable, ...retained]) {
+			const runDir = path.join(f.artifacts, kind); fs.mkdirSync(runDir);
+			fs.writeFileSync(path.join(runDir, "run-meta.json"), JSON.stringify({ nativeAuditRequested: kind !== "ordinary" }));
+			if (kind !== "missing") fs.writeFileSync(path.join(runDir,
+				kind === "verified-fallback" ? "spawn-error.txt" : "completed.json"), kind === "malformed" ? "{" :
+				JSON.stringify({ exitCode: 1, exitedAt: new Date().toISOString(),
+					...(kind !== "ordinary" ? { shutdown: kind === "unverified" ? "unverified" :
+						kind === "not-started" ? "not-started" : "verified" } : {}) }));
+			if (kind !== "recent") {
+				const old = new Date(Date.now() - 10 * 24 * 60 * 60_000); fs.utimesSync(runDir, old, old);
+			}
+		}
+		const result = await f.call();
+		expect(result.isError, result.content[0].text).not.toBe(true);
+		await vi.waitFor(() => {
+			for (const kind of removable) expect(fs.existsSync(path.join(f.artifacts, kind)), kind).toBe(false);
+		});
+		for (const kind of retained) expect(fs.existsSync(path.join(f.artifacts, kind)), kind).toBe(true);
+	});
+
+	it("retains an expired active native run during another synchronous native dispatch", async () => {
+		const active = fixture("timeout");
+		const started = await active.call({ ...active.params, async: true, timeoutMs: 10000 } as any);
+		expect(started.isError, started.content[0].text).not.toBe(true);
+		const runDir = path.join(active.artifacts, fs.readdirSync(active.artifacts)[0]);
+		try {
+			const old = new Date(Date.now() - 10 * 24 * 60 * 60_000); fs.utimesSync(runDir, old, old);
+			const sync = fixture();
+			let tool: any;
+			registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
+				{ artifactRoot: active.artifacts, nativePython: python });
+			const result = await tool.execute("native-prune", sync.params, undefined, undefined,
+				{ cwd: sync.source, hasUI: false });
+			expect(result.isError, result.content[0].text).not.toBe(true);
+			expect(fs.existsSync(path.join(runDir, "snapshot"))).toBe(true);
+			expect(fs.existsSync(path.join(runDir, "completed.json"))).toBe(false);
+		} finally {
+			await active.tool.execute("interrupt", { action: "interrupt", id: started.details.runId },
+				undefined, undefined, { cwd: active.source, hasUI: false });
+			await vi.waitFor(() => expect(fs.existsSync(path.join(runDir, "completed.json"))).toBe(true), { timeout: 5000 });
+		}
+	}, 15000);
+
+	it.each(["invalid-audit", "invalid-timeout", "invalid-ceiling", "pre-aborted", "cancel-preparation"])(
+		"does not prune retained evidence or launch after native %s rejection", async (kind) => {
+			const f = fixture(); const stale = path.join(f.artifacts, "verified"); fs.mkdirSync(stale);
+			fs.writeFileSync(path.join(stale, "run-meta.json"), JSON.stringify({ nativeAuditRequested: true }));
+			fs.writeFileSync(path.join(stale, "completed.json"), JSON.stringify({ exitCode: 0,
+				exitedAt: new Date().toISOString(), shutdown: "verified" }));
+			const old = new Date(Date.now() - 10 * 24 * 60 * 60_000); fs.utimesSync(stale, old, old);
+			const params = { ...f.params, ...(kind === "invalid-audit" ? { audit: { workers: 9 } } : {}),
+				...(kind === "invalid-timeout" ? { timeoutMs: 0 } : {}) };
+			const controller = new AbortController();
+			if (kind === "pre-aborted") controller.abort();
+			let tool = f.tool;
+			if (kind === "invalid-ceiling") registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
+				{ artifactRoot: f.artifacts, nativePython: python, nativeMaxTimeoutMs: 0 });
+			const launches = vi.mocked(spawn).mock.calls.length;
+			const pending = tool.execute("native-rejected", params, controller.signal, undefined,
+				{ cwd: f.source, hasUI: false });
+			if (kind === "cancel-preparation") queueMicrotask(() => controller.abort());
+			const result = await pending;
+			expect(result.isError, result.content[0].text).toBe(true);
+			expect(fs.readdirSync(f.artifacts)).toEqual(["verified"]);
+			expect(vi.mocked(spawn).mock.calls.slice(launches)).toEqual([]);
+		});
+
 	it.each(["completion", "both"])("persists disconnected wrapper %s failure independently of a real Pi origin lifetime", async (failure) => {
 		const f = fixture("disconnect-evidence");
 		const { result: started, pid } = await disconnectedOrigin(f, failure);
@@ -594,6 +678,37 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(launch.git).toBe(trusted);
 		expect(fs.existsSync(path.join(runDir, "runtime-bin"))).toBe(false);
 	});
+
+	it.each(["retarget", "replace"])("pins canonical nono for released wrapper lookup after startup entry %s", async (change) => {
+		const f = fixture("nono-lookup");
+		const entry = path.join(f.root, "bin", "nono");
+		const canonical = path.join(f.root, "installed-nono"); fs.renameSync(entry, canonical); fs.symlinkSync(canonical, entry);
+		const unverified = path.join(f.root, "unverified-nono");
+		fs.writeFileSync(unverified, "#!/bin/sh\necho 'unverified nono'\n", { mode: 0o755 });
+		const write = vi.mocked(fsPromises.writeFile).getMockImplementation()!;
+		let replaced = false;
+		const spy = vi.spyOn(fsPromises, "writeFile").mockImplementation(async (file, data, options) => {
+			await write(file, data, options);
+			if (String(file).endsWith(`${path.sep}snapshot${path.sep}swival.toml`)) {
+				fs.rmSync(entry);
+				if (change === "retarget") fs.symlinkSync(unverified, entry); else fs.copyFileSync(unverified, entry);
+				replaced = true;
+			}
+		});
+		try {
+			const result = await f.call();
+			expect(replaced).toBe(true);
+			expect(result.isError, result.content[0].text).not.toBe(true);
+			const runDir = result.details.results[0].artifactDir;
+			const lookup = JSON.parse(fs.readFileSync(path.join(runDir, "evidence", "nono-lookup.json"), "utf8"));
+			expect(lookup.executable).toBe(canonical);
+			expect(lookup.version).toBe("nono 0.4.1");
+			expect(lookup.wrapper[0]).toBe(path.join(runDir, "runtime-bin", "nono"));
+			expect(lookup.wrapper).toContain("--block-net");
+			expect(fs.readFileSync(canonical, "utf8")).toBe("#!/bin/sh\necho 'nono 0.4.1'\n");
+			expect(fs.existsSync(path.join(runDir, "runtime-bin"))).toBe(false);
+		} finally { spy.mockRestore(); }
+	}, 15000);
 
 	it.each(["before-ack", "handoff"])("cancels async native launch at %s and awaits cleanup", async (phase) => {
 		const f = fixture("timeout"); const controller = new AbortController();

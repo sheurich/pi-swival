@@ -1945,8 +1945,8 @@ export async function persistArtifacts(
 /**
  * Remove artifact directories in `artifactRoot` that are older than 7 days
  * (based on directory mtime). Best-effort: individual removal failures are
- * swallowed. Called fire-and-forget at the start of every tool invocation so
- * old artifacts from heavy audit sessions don't accumulate indefinitely.
+ * swallowed. Called fire-and-forget on validated native launches and ordinary
+ * tool invocations so old audit artifacts don't accumulate indefinitely.
  */
 export async function pruneOldArtifacts(
 	artifactRoot: string = ARTIFACT_ROOT,
@@ -3179,6 +3179,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						artifactDir, runId, nativeMaxTimeoutMs, signal);
 					const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 					asyncRuns.set(runId, entry);
+					// Validate preparation and register the live run before pruning.
+					void pruneOldArtifacts(artifactRoot);
 					let ownedChildPid: number | undefined;
 					let childOwnership: NativeOwnership | undefined;
 					let wrapperClosed = false;
