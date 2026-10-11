@@ -109,7 +109,7 @@ do, then decide whether to apply it.
 
 ## Demo 4 — native audit prompt template
 
-Use only a disposable synthetic Git repository for this probe. Start Pi from its root. Require Swival 1.0.46, Python 3.13+, Linux with AgentFS 0.6.4, nono, and explicit approval for the selected provider/profile. Darwin/macOS with AgentFS 0.6.4 is blocked because writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. Missing prerequisites block the probe; do not weaken network policy or substitute a sandbox.
+Use only a disposable synthetic Git repository for this probe. Start Pi from its root. Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, nono, and explicit approval for the selected provider/profile. Native startup uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. Missing prerequisites block the probe; do not weaken network policy or substitute a sandbox.
 
 ```text
 /swival-audit src/**/*.py

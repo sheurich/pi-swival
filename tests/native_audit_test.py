@@ -64,6 +64,7 @@ class NativeEntryTests(unittest.TestCase):
     def setUp(self):
         # These are API/transport tests, not an assertion of Darwin kernel isolation.
         self.enterContext(patch.object(sys, "platform", "linux"))
+        self.enterContext(patch.object(bridge, "check_boundary"))
         # unittest owns the context lifetime through enterContext.
         self.root = Path(self.enterContext(
             tempfile.TemporaryDirectory(prefix="offline-native-")  # pylint: disable=consider-using-with
@@ -73,7 +74,7 @@ class NativeEntryTests(unittest.TestCase):
         self.repo.mkdir()
         self.evidence.mkdir()
         self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"), "AGENTFS": "1"
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config")
         }))
         for name in ("socket", "create_connection", "getaddrinfo"):
             self.enterContext(patch.object(socket, name,
@@ -95,7 +96,10 @@ class NativeEntryTests(unittest.TestCase):
                    "evidence": str(self.evidence),
                    "routing": {"provider": "lmstudio", "model": "offline-model",
                                "reasoningEffort": "xhigh"},
-                   "agentfsVersion": "0.6.4",
+                   "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
+                   "bwrapIdentity": dict(bridge.BWRAP_IDENTITY),
+                   "unshareIdentity": dict(bridge.UNSHARE_IDENTITY),
+                   "sessionSandbox": "builtin",
                    "audit": {"paths": [], "all": True, "workers": 1, "patchMaxTurns": 5},
                    "expectedScope": audit._resolve_scope(str(self.repo), []).to_dict()}
         _, request["expectedRoute"] = bridge.resolve_native_config(request)
@@ -133,6 +137,29 @@ class NativeEntryTests(unittest.TestCase):
         self.assertEqual(route["options"]["max_output_tokens"], 32768)
         self.assertEqual(route["options"]["provider_timeout"], 900)
         self.assertEqual(settings["base_url"], "http://127.0.0.1:1234")
+
+    def test_clean_config_daybreak_override_reaches_released_transport(self):
+        request = self.request()
+        request["routing"] = {"provider": "chatgpt", "model": "gpt-daybreak-blue-latest",
+                              "reasoningEffort": "xhigh"}
+        clean_environment = {
+            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"),
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        }
+        with patch.dict(os.environ, clean_environment, clear=True), \
+             patch.object(agent, "resolve_provider",
+                          side_effect=AssertionError("preflight must not resolve providers")):
+            settings, route = bridge.resolve_native_config(request)
+            self.assertEqual(route["provider"], "chatgpt")
+            self.assertEqual(route["model"], "gpt-daybreak-blue-latest")
+            self.assertEqual(route["transportModel"], "chatgpt/gpt-daybreak-blue-latest")
+            self.assertEqual(route["reasoningEffort"], "xhigh")
+            self.assertIsNone(route["profile"])
+            self.assertEqual(route["destination"]["apiBase"],
+                             "https://chatgpt.com/backend-api/codex")
+            self.assertEqual(self.released_chatgpt_selection(settings, route),
+                             route["destination"]["apiBase"])
+        self.assertFalse((self.root / "config" / "swival" / "config.toml").exists())
 
     def test_sensitive_route_inputs_never_enter_binding_or_diagnostics(self):
         config_dir = self.root / "config" / "swival"
@@ -920,14 +947,22 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
         shutil.copytree(self.repo / "audit-findings", export / "evidence" / "audit-findings")
         (export / "manifest.json").write_text(json.dumps({
             "scope": state["scope"], "snapshotCommit": state["scope"]["commit"],
-            "audit": {"all": True}, "route": result["route"]
+            "audit": {"all": True}, "route": result["route"],
+            "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
+            "bwrapIdentity": bridge.BWRAP_IDENTITY,
+            "unshareIdentity": bridge.UNSHARE_IDENTITY, "sessionSandbox": "builtin"
         }))
-        (export / "request.json").write_text(json.dumps({"expectedRoute": result["route"]}))
+        (export / "request.json").write_text(json.dumps({
+            "expectedRoute": result["route"], "sandbox": "bubblewrap",
+            "bwrapVersion": "0.12.0", "bwrapIdentity": bridge.BWRAP_IDENTITY,
+            "unshareIdentity": bridge.UNSHARE_IDENTITY,
+            "sessionSandbox": "builtin",
+        }))
         (export / "completed.json").write_text(json.dumps({
             "exitCode": 0 if result["status"] == "completed" else 1,
             "exitedAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
                 "+00:00", "Z"),
-            "shutdown": "verified",
+            "shutdown": "verified", "boundary": "bubblewrap-pidfd",
         }))
         (export / "evidence" / "native-result.json").write_text(json.dumps(result))
 
@@ -1059,11 +1094,11 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
     def test_released_whitespace_report_is_written_but_not_substantive(self):
         self.released_finding(" \n\t")
 
-    def test_darwin_agentfs_is_blocked_before_session_or_provider(self):
+    def test_non_linux_bubblewrap_is_blocked_before_session_or_provider(self):
         with patch.object(sys, "platform", "darwin"), patch(
             "swival.session.Session",
             side_effect=AssertionError("unsupported platform must not spawn")
-        ), self.assertRaisesRegex(bridge.NativeAuditError, "blocked on Darwin"):
+        ), self.assertRaisesRegex(bridge.NativeAuditError, "bubblewrap/platform"):
             bridge.run_native(self.request())
 
     def test_unstubbed_socket_connection_and_dns_fail_closed(self):

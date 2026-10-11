@@ -2,13 +2,11 @@
 "use strict";
 
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { finalizeNativeAudit } = require("./native-audit-lifecycle.cjs");
 const runDir = process.argv[2];
 const request = JSON.parse(fs.readFileSync(path.join(runDir, "request.json"), "utf8"));
-const sessionDir = path.join(os.homedir(), ".agentfs", "run", request.session);
 const bridge = path.join(__dirname, "native_audit.py");
 const cap = 2 * 1024 * 1024;
 const fds = [];
@@ -17,7 +15,9 @@ let stopped;
 let deadline;
 let ownershipTimer;
 let ownershipAcknowledged = false;
-let sessionOwned = false;
+let commitAuthorized = false;
+let namespaceVerified = false;
+let proof = "";
 let child;
 let childClosed;
 let finalization;
@@ -51,9 +51,13 @@ function finish(code) {
 	if (finalization) return finalization;
 	clearTimeout(deadline);
 	clearTimeout(ownershipTimer);
+	if (child?.pid && !commitAuthorized && process.connected) {
+		process.send({ type: "native-not-started", pid: child.pid }, () => {});
+	}
 	finalization = finalizeNativeAudit({ runDir,
-		ownership: child?.pid ? { signal: (signal) => process.kill(-child.pid, signal) } : undefined,
-		sessionDir, sessionOwned, closeLogs, cancellationReason,
+		ownership: child?.pid ? { signal: (signal) => process.kill(-child.pid, signal),
+			verify: async () => namespaceVerified || !commitAuthorized } : undefined,
+		closeLogs, cancellationReason,
 	}, { exitCode: code, stopped }).then((terminal) => {
 		process.exitCode = terminal.exitCode;
 	}, () => {
@@ -84,13 +88,9 @@ function acknowledge(message) {
 	if (Buffer.byteLength(input) > 64 * 1024) { stop("Native request exceeded its bounded protocol."); return; }
 	child.stdin.end(input, () => {
 		if (cancellationReason()) { stop(cancellationReason()); return; }
+		commitAuthorized = true;
 		child.stdio[3].end("EXEC\n", () => {
-			if (cancellationReason()) { stop(cancellationReason()); return; }
-			// This is live launch readiness, not native completion. No disk PID
-			// or readiness marker can authorize a handoff.
-			process.send({ type: "native-started", pid: child.pid }, (error) => {
-				if (error) stop("Native launch readiness notification failed.");
-			});
+			if (cancellationReason()) stop(cancellationReason());
 		});
 	});
 }
@@ -100,12 +100,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, interrupted);
 process.on("disconnect", disconnected);
 process.on("message", acknowledge);
 try {
-	let collision = false;
-	try { fs.lstatSync(sessionDir); collision = true; }
-	catch (error) { if (error.code !== "ENOENT") throw error; }
-	if (collision) stop("Refusing to reuse an existing AgentFS session.");
-	else {
-		sessionOwned = true;
+	{
 		const env = { ...process.env, ...(request.runtimePath ? { PATH: request.runtimePath } : {}) };
 		for (const name of Object.keys(env)) {
 			if (name.startsWith("GIT_") || name.startsWith("PYTHON") ||
@@ -113,15 +108,34 @@ try {
 		}
 		Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_NO_LAZY_FETCH: "1",
 			GIT_TERMINAL_PROMPT: "0", GIT_NO_REPLACE_OBJECTS: "1", GIT_LFS_SKIP_SMUDGE: "1" });
-		// No external executable starts here. The isolated trusted Python waits
-		// for ownership ACK and commit, then replaces itself with fixed AgentFS.
+		// Trusted Python waits for ownership ACK/EXEC/EOF, then uses the pinned
+		// unshare-to-bubblewrap exec chain with init-pidfd proof outside the payload.
 		for (const name of ["stdout.txt", "stderr.txt"]) fds.push(fs.openSync(path.join(runDir, name), "w", 0o600));
-		child = spawn(request.python, ["-I", "-B", bridge, "--launch", request.agentfs,
-			request.snapshot, request.evidence, request.session], {
+		child = spawn(request.python, ["-I", "-B", bridge, "--launch", request.unshare,
+			request.bwrap, request.snapshot, request.evidence], {
 			cwd: path.join(runDir, "sandbox"), env, shell: false, detached: true,
-			stdio: ["pipe", "pipe", "pipe", "pipe"],
+			stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
 		});
 		childClosed = new Promise((resolve) => child.once("close", resolve));
+		let namespaceStarted = false;
+		child.stdio[4].on("data", (chunk) => {
+			proof += chunk.toString("ascii");
+			if (proof.length > 64) { stop("Native namespace proof exceeded its bounded protocol."); return; }
+			if (!namespaceStarted && proof.startsWith("STARTED\n")) {
+				namespaceStarted = true;
+				if (cancellationReason()) { stop(cancellationReason()); return; }
+				process.send({ type: "native-started", pid: child.pid }, (error) => {
+					if (error) stop("Native launch readiness notification failed.");
+				});
+			}
+		});
+		child.stdio[4].on("end", () => {
+			namespaceVerified = proof === "STARTED\nVERIFIED\n" || proof === "VERIFIED\n" ||
+				(!commitAuthorized && proof === "NOT_STARTED\n");
+			if (namespaceVerified && process.connected) {
+				process.send({ type: "native-namespace-stopped", pid: child.pid }, () => {});
+			}
+		});
 		function collect(fd, chunk) {
 			const remaining = Math.max(0, cap - bytes);
 			try {
@@ -138,7 +152,7 @@ try {
 		}
 		child.stdout.on("data", (chunk) => collect(fds[0], chunk));
 		child.stderr.on("data", (chunk) => collect(fds[1], chunk));
-		for (const stream of [child.stdin, child.stdout, child.stderr, child.stdio[3]]) stream.on("error", ioFailure);
+		for (const stream of [child.stdin, child.stdout, child.stderr, child.stdio[3], child.stdio[4]]) stream.on("error", ioFailure);
 		child.once("error", () => stop("Native sandbox failed to start."));
 		// A descendant can hold stdio open after leader exit. Finalization must
 		// establish group absence before awaiting log drain or copying evidence.

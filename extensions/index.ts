@@ -1991,7 +1991,8 @@ export async function pruneOldArtifacts(
 			}
 			if (native) {
 				const terminal = readNativeTerminal(fullPath);
-				if (!terminal || terminal.shutdown === "unverified") continue;
+				if (!terminal || terminal.shutdown === "unverified" ||
+					(terminal.shutdown === "verified" && terminal.boundary !== "bubblewrap-pidfd")) continue;
 			} else {
 				// Ordinary runs retain their existing completion-marker requirement.
 				try { await fs.promises.access(path.join(fullPath, "completed.json")); }
@@ -3149,7 +3150,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		description: [
 			"Delegate a task to a swival subprocess with its built-in reviewer loop.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution), or native audit (audit object).",
-			"Native audit isolates committed source and artifacts, uses AgentFS/provider-only, and rejects protected or unsupported routes without fallback.",
+			"Native mode uses Linux unshare and bubblewrap with builtin Session isolation and provider-only network access.",
+			"Ordinary delegation uses AgentFS. Native audit rejects protected or unsupported routes without fallback.",
 			"Bundled agents work out of the box; override or extend via ~/.pi/agent/swival-agents/ (user) or .pi/swival-agents/ (project).",
 			"Use this when you want the reviewer loop, test-as-contract, sandbox overlay, or secret encryption to wrap the subagent's work.",
 		].join(" "),
@@ -3159,9 +3161,9 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		// list entirely (see pi docs/extensions.md), so the model only sees the
 		// tool via its schema at invocation time.
 		promptSnippet:
-			"Delegate to swival with reviewer loop, AgentFS sandbox, test-as-contract, or secret encryption",
+			"Delegate to swival with reviewer loop, ordinary AgentFS sandbox, native audit, test-as-contract, or secret encryption",
 		promptGuidelines: [
-			"Use swival-subagent when a task benefits from swival's reviewer loop (retry until acceptance passes), a test-as-contract script, OS-enforced filesystem isolation via AgentFS, or format-preserving secret encryption — otherwise prefer simpler tools.",
+			"Use swival-subagent when a task benefits from swival's reviewer loop (retry until acceptance passes), a test-as-contract script, ordinary AgentFS isolation, native Linux unshare/bubblewrap isolation, or format-preserving secret encryption — otherwise prefer simpler tools.",
 		],
 		parameters: SwivalParams,
 
@@ -3183,6 +3185,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					void pruneOldArtifacts(artifactRoot);
 					let ownedChildPid: number | undefined;
 					let childOwnership: NativeOwnership | undefined;
+					let namespaceStopped = false;
 					let wrapperClosed = false;
 					let ready = false;
 					let lifecycleFailure: string | undefined;
@@ -3210,7 +3213,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						if (child.type === "native-child" && ownedChildPid === undefined) {
 							const pid = child.pid as number;
 							ownedChildPid = pid;
-							childOwnership = { signal: (name) => process.kill(-pid, name) };
+							childOwnership = { signal: (name) => process.kill(-pid, name),
+								verify: async () => namespaceStopped };
 							// Register ownership before ACK, and never authorize a cancelled run.
 							if (signal?.aborted || lifecycleFailure) { abort(); return; }
 							try {
@@ -3221,6 +3225,9 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						} else if (child.type === "native-started" && child.pid === ownedChildPid && !ready) {
 							if (signal?.aborted || lifecycleFailure) { abort(); return; }
 							ready = true; notifyReady();
+						} else if (["native-namespace-stopped", "native-not-started"].includes(String(child.type)) &&
+							child.pid === ownedChildPid) {
+							namespaceStopped = true;
 						} else stopWrapper("Native lifecycle message was invalid.");
 					};
 					proc.on("message", ownership);

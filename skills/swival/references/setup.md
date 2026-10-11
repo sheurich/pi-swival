@@ -66,12 +66,14 @@ Needs application default credentials (`gcloud auth application-default login`).
 
 ### ChatGPT subscription
 
+A named profile remains optional:
+
 ```toml
 provider = "chatgpt"
 model = "<configured-chatgpt-model>"
 ```
 
-For native audit on approved personal content, select the configured `chatgpt-daybreak-blue` profile with `xhigh`. For other approved routes, use `frontier` with `high` unless the operator chooses another route. Verify profile, provider, model, and effort with `swival --list-profiles`; do not silently fall back. Keep model IDs in configuration and follow provider/data boundaries. Native auxiliary calls omit requested effort, secret shielding, and request filtering. The Pi native audit mode rejects protected routes until upstream propagates those controls.
+Authorized Daybreak use does not require a named profile. Select it directly with `swival --provider chatgpt --model gpt-daybreak-blue-latest --reasoning-effort xhigh --repl`, or use the equivalent Pi native audit overrides. This exact route requires prior human ChatGPT login and account authorization. Selection does not log in, grant access, choose another account, or change stored configuration and host defaults. Do not silently fall back after an unavailable or rejected route. For other approved routes, verify configured profiles with `swival --list-profiles` and follow provider/data boundaries. Native auxiliary calls omit requested effort, secret shielding, and request filtering. The Pi native audit mode rejects protected routes until upstream propagates those controls.
 
 ### Local models
 
@@ -93,7 +95,7 @@ By default, Swival restricts file access to the base directory (auto-detected pr
 
 ## Native audit prerequisites
 
-Pi's native audit mode requires Swival 1.0.46, Python 3.13+, Linux with AgentFS 0.6.4, and nono. Darwin/macOS with AgentFS 0.6.4 is blocked because writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. There is no sandbox fallback. See the `auditing-with-swival` skill for the native contract.
+Pi's native audit mode requires Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and nono. It validates the pinned canonical `unshare` package and executable, then uses `unshare --user --map-current-user --mount --propagation private --` before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. There is no sandbox fallback. See the `auditing-with-swival` skill for the native contract.
 
 ## Verify
 

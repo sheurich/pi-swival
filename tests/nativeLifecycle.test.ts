@@ -8,6 +8,7 @@ import * as os from "node:os";
 import { ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import registerExtension from "../extensions/index.js";
 import { nativeTestPython as python } from "./nativePython.js";
+import { installOfflinePython } from "./nativeOfflinePython.js";
 
 vi.mock("node:fs", async (load) => {
 	const actual = await load<typeof import("node:fs")>();
@@ -41,6 +42,7 @@ afterEach(() => {
 
 function fixture(behavior = "complete") {
 	const root = scratch();
+	const offlinePython = installOfflinePython(root, python);
 	const source = path.join(root, "source");
 	const artifacts = path.join(root, "artifacts");
 	const bin = path.join(root, "bin");
@@ -52,10 +54,11 @@ function fixture(behavior = "complete") {
 		: "def answer(): return 42\n"); git("add", "."); git("commit", "-m", "fixture");
 	const before = git("show-ref");
 	fs.writeFileSync(path.join(bin, "nono"), "#!/bin/sh\necho 'nono 0.4.1'\n", { mode: 0o755 });
-	// This is an offline sandbox/transport stub, not proof of real AgentFS or a provider.
-	fs.writeFileSync(path.join(bin, "agentfs"), `#!${process.execPath}
+	fs.writeFileSync(path.join(bin, "unshare"), "#!/bin/sh\necho 'offline unshare fixture must not execute' >&2\nexit 97\n", { mode: 0o755 });
+	// This is an offline sandbox/transport stub, not proof of real unshare, bubblewrap, or a provider.
+	fs.writeFileSync(path.join(bin, "bwrap"), `#!${process.execPath}
 const fs = require('node:fs'); const path = require('node:path');
-if (process.argv.includes('--version')) { console.log('agentfs 0.6.4'); process.exit(0); }
+if (process.argv.includes('--version')) { console.log('bubblewrap 0.12.0'); process.exit(0); }
 let input=''; process.stdin.on('data', x=>input+=x); process.stdin.on('end', ()=> {
 const request = JSON.parse(input);
 if (${JSON.stringify(behavior)} === 'nono-lookup') {
@@ -81,27 +84,42 @@ if (${JSON.stringify(behavior)} === 'lost-expansion') {
 fs.writeFileSync(path.join(request.evidence, 'launch.json'), JSON.stringify({args:process.argv.slice(2), cwd:process.cwd(), pid:process.pid, path:process.env.PATH,
  git:fs.realpathSync(path.join(process.env.PATH.split(path.delimiter)[0],'git'))}));
 const stateDir = path.join(request.snapshot, '.swival', 'audit', 'abc12345'); fs.mkdirSync(stateDir, {recursive:true});
+const finding={title:'test',finding_type:'security',severity:'high',locations:['code.py:1'],preconditions:[],proof:['proof'],fix_outline:'fix',source_file:'code.py',triage_decision:null,threat_model:''};
+const second={title:'second',finding_type:'correctness',severity:'low',locations:['code.py:2'],preconditions:['p'],proof:['q'],fix_outline:'f',source_file:'code.py',triage_decision:null,threat_model:''};
+const verified=(value)=>({finding:value,correctness_reason:'reproduced',rebuttal_reason:'none',reproducer:null});
 const state = {scope:request.expectedScope, reviewed_files:request.expectedScope.mandatory_files,
  candidate_files:request.expectedScope.mandatory_files, deep_reviewed_files:request.expectedScope.mandatory_files,
  phase:'done', artifact_state:{}, verification_state:{}, verified_findings:[], proposed_findings:[], truncated_files:{}, metrics:{}};
 if (${JSON.stringify(behavior)} === 'partial') {state.phase='triage'; state.reviewed_files=[];}
 if (${JSON.stringify(behavior)} === 'truncate') state.truncated_files={'code.py':1};
 if (${JSON.stringify(behavior)} === 'missing-deep') { state.candidate_files=[]; state.deep_reviewed_files=[]; }
-if (['patch','empty-report','blank-report','kill-evidence','disconnect-evidence'].includes(${JSON.stringify(behavior)})) {
+if (${JSON.stringify(behavior)} === 'coverage-substituted') {state.proposed_findings=[finding];state.verification_state={'061f1d16aa25':{status:'discarded'}};}
+if (${JSON.stringify(behavior)} === 'coverage-missing') {state.proposed_findings=[finding,second];state.verification_state={'acbd6d629a17':{status:'discarded'},unrelated:{status:'discarded'}};}
+if (${JSON.stringify(behavior)} === 'coverage-duplicate') {state.proposed_findings=[finding,finding];state.verification_state={'acbd6d629a17':{status:'discarded'},unrelated:{status:'discarded'}};}
+if (${JSON.stringify(behavior)} === 'coverage-arrays') {state.verification_state=[];state.artifact_state=[];}
+if (${JSON.stringify(behavior)} === 'coverage-non-record') {state.verification_state=null;state.artifact_state=null;}
+if (${JSON.stringify(behavior)} === 'coverage-discarded') {state.proposed_findings=[finding];state.verification_state={'acbd6d629a17':{status:'discarded'}};}
+if (${JSON.stringify(behavior)} === 'coverage-adjudicated') {state.proposed_findings=[finding];state.verification_state={'acbd6d629a17':{status:'verified'}};state.adjudication_discarded=[{title:'test',severity:'high',source_file:'code.py',reason:'not kept'}];}
+if (['patch','empty-report','blank-report','kill-evidence','disconnect-evidence','coverage-artifact-substituted','coverage-artifact-missing','coverage-artifact-duplicate','coverage-nested-reproducer','coverage-verifier-rewrite'].includes(${JSON.stringify(behavior)})) {
  const findings=path.join(request.snapshot,'audit-findings'); fs.mkdirSync(findings);
  fs.writeFileSync(path.join(findings,'001-test.md'), ${JSON.stringify(behavior)} === 'empty-report' ? '' : ${JSON.stringify(behavior)} === 'blank-report' ? ' \\n\\t' : 'report'); fs.writeFileSync(path.join(findings,'001-test.patch'),'patch');
- state.artifact_state={'finding':{status:'written',report_filename:'001-test.md',patch_filename:'001-test.patch'}};
- state.verified_findings=[{finding:{title:'test'}}];
+ state.proposed_findings=[finding];state.verification_state={'acbd6d629a17':{status:'verified'}};state.verified_findings=[verified(finding)];
+ state.artifact_state={['coverage-artifact-substituted' === ${JSON.stringify(behavior)} ? '061f1d16aa25' : 'acbd6d629a17']:{status:'written',report_filename:'001-test.md',patch_filename:'001-test.patch'}};
+ if (${JSON.stringify(behavior)} === 'coverage-artifact-missing') {state.proposed_findings=[finding,second];state.verification_state={'acbd6d629a17':{status:'verified'},'061f1d16aa25':{status:'verified'}};state.verified_findings=[verified(finding),verified(second)];state.artifact_state={'acbd6d629a17':state.artifact_state['acbd6d629a17'],unrelated:state.artifact_state['acbd6d629a17']};}
+ if (${JSON.stringify(behavior)} === 'coverage-artifact-duplicate') {state.verified_findings=[verified(finding),verified(finding)];state.artifact_state={...state.artifact_state,unrelated:state.artifact_state['acbd6d629a17']};}
+ if (${JSON.stringify(behavior)} === 'coverage-nested-reproducer') state.verified_findings[0].reproducer={exit_code:0,evidence:{lines:[1,2],ratio:0.5}};
+ if (${JSON.stringify(behavior)} === 'coverage-verifier-rewrite') {state.verified_findings=[verified(second)];state.artifact_state={'061f1d16aa25':state.artifact_state['acbd6d629a17']};}
 }
 fs.writeFileSync(path.join(stateDir,'state.json'),JSON.stringify(state));
 fs.writeFileSync(path.join(request.evidence,'native-result.json'), JSON.stringify({status:'completed', answer:'Native audit result',
- sandbox:{agentfs:true,agentfsVersion:'0.6.4'}, network:'provider-only', scope:request.expectedScope,
+ sandbox:{external:'bubblewrap',bwrapVersion:'0.12.0',bwrapIdentity:request.bwrapIdentity,startup:{executable:'unshare',identity:request.unshareIdentity},session:'builtin'}, network:'provider-only', scope:request.expectedScope,
  route:request.expectedRoute,provider:request.expectedRoute.provider,model:request.expectedRoute.model,
  requestedEffort:request.expectedRoute.reasoningEffort}));
 if (${JSON.stringify(behavior)} === 'ordinary') fs.rmSync(stateDir,{recursive:true});
 if (${JSON.stringify(behavior)} === 'missing-patch') {
- state.artifact_state={'finding':{status:'written',report_filename:'001-test.md',patch_filename:'001-test.patch'}};
- state.verified_findings=[{finding:{title:'test'}}];
+ state.proposed_findings=[finding]; state.verification_state={'acbd6d629a17':{status:'verified'}};
+ state.artifact_state={'acbd6d629a17':{status:'written',report_filename:'001-test.md',patch_filename:'001-test.patch'}};
+ state.verified_findings=[verified(finding)];
  fs.writeFileSync(path.join(stateDir,'state.json'),JSON.stringify(state));
 }
 if (${JSON.stringify(behavior)} === 'symlink-state') {
@@ -131,10 +149,10 @@ process.exit(0);
 	process.env.PATH = `${bin}:${trustedPath}`;
 	let tool: any;
 	registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
-		{ artifactRoot: artifacts, nativePython: python, nativeMaxTimeoutMs: 10_000 } as any);
+		{ artifactRoot: artifacts, nativePython: offlinePython, nativeMaxTimeoutMs: 10_000 } as any);
 	const params = { audit: { all: true, workers: 1 }, modelOverride: "offline-model", providerOverride: "lmstudio", timeoutMs: 5000 };
 	const call = (input = params, signal?: AbortSignal) => tool.execute("native", input, signal, undefined, { cwd: source, hasUI: false });
-	return { root, source, artifacts, tool, params, call, git, before };
+	return { root, source, artifacts, tool, params, call, git, before, python: offlinePython };
 }
 
 function recover(f: ReturnType<typeof fixture>, runId: string, artifactRoot = f.artifacts): any[] {
@@ -192,7 +210,7 @@ async function disconnectedOrigin(f: ReturnType<typeof fixture>, failure: string
 	const pi = fs.realpathSync(path.join(ROOT, "tests", "node_modules", "@earendil-works", "pi-coding-agent"));
 	const adapter = path.join(f.root, "origin-extension.ts");
 	fs.writeFileSync(adapter, `import register from ${JSON.stringify(path.join(ROOT, "extensions", "index.ts"))};
-export default (pi) => register(pi, {artifactRoot:${JSON.stringify(f.artifacts)},nativePython:${JSON.stringify(python)},nativeMaxTimeoutMs:10000});`);
+export default (pi) => register(pi, {artifactRoot:${JSON.stringify(f.artifacts)},nativePython:${JSON.stringify(f.python)},nativeMaxTimeoutMs:10000});`);
 	const preload = path.join(f.root, "origin-fault.cjs");
 	fs.writeFileSync(preload, `const cp=require('node:child_process'), fs=require('node:fs');
 if(process.argv.some(arg=>arg.endsWith('native-audit-runner.cjs'))) {
@@ -208,7 +226,7 @@ if(process.argv.some(arg=>arg.endsWith('native-audit-runner.cjs'))) {
 	const origin = path.join(f.root, "origin.mjs");
 	fs.writeFileSync(origin, `import fs from 'node:fs';
 import {DefaultResourceLoader, SettingsManager} from ${JSON.stringify(pathToFileURL(path.join(pi, "dist", "index.js")).href)};
-// Offline dispatch only: the fixed local AgentFS transport does not test Linux isolation.
+// Offline dispatch only: the fixed local bubblewrap transport does not test Linux isolation.
 Object.defineProperty(process,'platform',{value:'linux'});
 try {
  const loader=new DefaultResourceLoader({cwd:${JSON.stringify(f.root)},agentDir:process.env.PI_CODING_AGENT_DIR,
@@ -255,7 +273,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 			fs.writeFileSync(path.join(runDir, "run-meta.json"), JSON.stringify({ nativeAuditRequested: kind !== "ordinary" }));
 			if (kind !== "missing") fs.writeFileSync(path.join(runDir,
 				kind === "verified-fallback" ? "spawn-error.txt" : "completed.json"), kind === "malformed" ? "{" :
-				JSON.stringify({ exitCode: 1, exitedAt: new Date().toISOString(),
+				JSON.stringify({ exitCode: 1, exitedAt: new Date().toISOString(), boundary: "bubblewrap-pidfd",
 					...(kind !== "ordinary" ? { shutdown: kind === "unverified" ? "unverified" :
 						kind === "not-started" ? "not-started" : "verified" } : {}) }));
 			if (kind !== "recent") {
@@ -280,7 +298,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 			const sync = fixture();
 			let tool: any;
 			registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
-				{ artifactRoot: active.artifacts, nativePython: python });
+				{ artifactRoot: active.artifacts, nativePython: sync.python });
 			const result = await tool.execute("native-prune", sync.params, undefined, undefined,
 				{ cwd: sync.source, hasUI: false });
 			expect(result.isError, result.content[0].text).not.toBe(true);
@@ -306,7 +324,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 			if (kind === "pre-aborted") controller.abort();
 			let tool = f.tool;
 			if (kind === "invalid-ceiling") registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
-				{ artifactRoot: f.artifacts, nativePython: python, nativeMaxTimeoutMs: 0 });
+				{ artifactRoot: f.artifacts, nativePython: f.python, nativeMaxTimeoutMs: 0 });
 			const launches = vi.mocked(spawn).mock.calls.length;
 			const pending = tool.execute("native-rejected", params, controller.signal, undefined,
 				{ cwd: f.source, hasUI: false });
@@ -396,6 +414,20 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
 	});
 
+	it.each(["manifest", "request", "result"])("rejects changed bubblewrap identity in %s completion evidence", async (field) => {
+		const f = fixture(); const initial = await f.call();
+		expect(initial.isError, initial.content[0].text).not.toBe(true);
+		const runDir = initial.details.results[0].artifactDir;
+		const target = path.join(runDir, field === "manifest" ? "manifest.json" :
+			field === "request" ? "request.json" : "evidence/native-result.json");
+		const record = JSON.parse(fs.readFileSync(target, "utf8"));
+		const identity = field === "result" ? record.sandbox.bwrapIdentity : record.bwrapIdentity;
+		identity.sha256 = "0".repeat(64);
+		fs.writeFileSync(target, JSON.stringify(record));
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+	});
+
 	it("writes native metadata once and preserves its original bytes for fresh recovery", async () => {
 		const f = fixture();
 		const write = vi.mocked(fsPromises.writeFile).getMockImplementation()!;
@@ -441,7 +473,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 			}
 		}, 20000,
 	);
-	it("preserves real native state/report/patch writes after killing the wrapper, then recovers failure fresh", async () => {
+	it("preserves native state/report/patch after wrapper death with explicit offline proof, then recovers failure fresh", async () => {
 		const f = fixture("kill-evidence");
 		const actualSpawn = vi.mocked(spawn).getMockImplementation()!;
 		let wrapper: ChildProcess | undefined; let childPid: number | undefined;
@@ -463,7 +495,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 				await new Promise((resolve) => setTimeout(resolve, 20));
 			}
 			const original = sourceFiles.map((file) => fs.readFileSync(path.join(runDir, "snapshot", file)));
-			wrapper!.kill("SIGKILL");
+			wrapper!.removeAllListeners("message"); wrapper!.kill("SIGKILL");
 			let status: any;
 			for (let tries = 0; tries < 200; tries++) {
 				status = await f.tool.execute("status", { action: "status", id: started.details.runId }, undefined,
@@ -568,9 +600,10 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 			expect(result.isError, `${failure}: ${result.content[0].text}`).toBe(true);
 			expect(result.content[0].text).not.toContain("started.");
 			const runDir = path.join(f.artifacts, fs.readdirSync(f.artifacts)[0]);
-			expect(fs.existsSync(path.join(runDir, "snapshot")), failure).toBe(false);
-			expect(fs.existsSync(path.join(runDir, "runtime-bin")), failure).toBe(false);
-			expect(fs.existsSync(path.join(runDir, "sandbox")), failure).toBe(false);
+			const uncertain = ["before-notify", "awaiting-ack", "after-ack"].includes(failure);
+			expect(fs.existsSync(path.join(runDir, "snapshot")), failure).toBe(uncertain);
+			expect(fs.existsSync(path.join(runDir, "runtime-bin")), failure).toBe(uncertain);
+			expect(fs.existsSync(path.join(runDir, "sandbox")), failure).toBe(uncertain);
 			expect(fs.existsSync(path.join(runDir, "evidence", "launch.json")), failure).toBe(false);
 			if (!["completion-io", "evidence-io"].includes(failure)) {
 				const completed = JSON.parse(fs.readFileSync(path.join(runDir, "completed.json"), "utf8"));
@@ -617,7 +650,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 			process.env.PATH = `${entry}:${trustedPath}`;
 			let tool: any;
 			registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
-				{ artifactRoot: f.artifacts, nativePython: python });
+				{ artifactRoot: f.artifacts, nativePython: f.python });
 			const result = await tool.execute("git-boundary", f.params, undefined, undefined,
 				{ cwd: f.source, hasUI: false });
 			expect(result.isError).toBe(true);
@@ -626,20 +659,25 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		},
 	);
 
-	it("pins the external virtualenv entry under -I and the canonical AgentFS executable", async () => {
+	it("pins the external virtualenv entry and binds the sandbox identity protocol", async () => {
 		const f = fixture();
-		const pythonDir = path.join(f.root, "python-install"); fs.symlinkSync(path.dirname(python), pythonDir);
-		const agentfsEntry = path.join(f.root, "bin", "agentfs");
-		const agentfsTarget = path.join(f.root, "installed-agentfs"); fs.renameSync(agentfsEntry, agentfsTarget);
-		fs.symlinkSync(agentfsTarget, agentfsEntry);
+		const pythonDir = path.join(f.root, "python-install"); fs.symlinkSync(path.dirname(f.python), pythonDir);
+		const bwrapEntry = path.join(f.root, "bin", "bwrap");
+		const bwrapTarget = path.join(f.root, "installed-bwrap"); fs.renameSync(bwrapEntry, bwrapTarget);
+		fs.symlinkSync(bwrapTarget, bwrapEntry);
 		let tool: any;
 		registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
 			{ artifactRoot: f.artifacts, nativePython: path.join(pythonDir, "python") });
 		const result = await tool.execute("runtime-pin", f.params, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(result.isError, result.content[0].text).not.toBe(true);
 		const request = JSON.parse(fs.readFileSync(path.join(result.details.results[0].artifactDir, "request.json"), "utf8"));
-		expect(request.python).toBe(path.join(fs.realpathSync(path.dirname(python)), path.basename(python)));
-		expect(request.agentfs).toBe(agentfsTarget);
+		expect(request.python).toBe(f.python);
+		expect(request.bwrap).toBe(bwrapTarget);
+		expect(request.bwrapIdentity).toEqual({
+			path: "/usr/bin/bwrap", version: "bubblewrap 0.12.0", package: "bubblewrap",
+			packageVersion: "0.12.0-1~deb13u1", architecture: "arm64",
+			sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
+		});
 		const imported = execFileSync(request.python, ["-I", "-B", "-c", "import importlib.metadata; print(importlib.metadata.version('swival'))"],
 			{ timeout: 5000, maxBuffer: 16384, env: { ...process.env, PYTHONPATH: f.source } }).toString().trim();
 		expect(imported).toBe("1.0.46");
@@ -663,13 +701,36 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		},
 	);
 
+	it("rejects unshare replacement after preparation without executing it", async () => {
+		const f = fixture();
+		const marker = path.join(f.root, "replaced-unshare-executed");
+		const write = vi.mocked(fsPromises.writeFile).getMockImplementation()!;
+		let replaced = false;
+		const spy = vi.spyOn(fsPromises, "writeFile").mockImplementation(async (file, data, options) => {
+			const result = await write(file, data, options);
+			if (!replaced && String(file).endsWith(`${path.sep}request.json`)) {
+				replaced = true;
+				fs.writeFileSync(path.join(f.root, "bin", "unshare"),
+					`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'executed');\n`,
+					{ mode: 0o755 });
+			}
+			return result;
+		});
+		try {
+			const result = await f.call();
+			expect(replaced).toBe(true);
+			expect(result.isError).toBe(true);
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally { spy.mockRestore(); }
+	}, 15000);
+
 	it("pins a trusted external installation symlink for upstream Git calls", async () => {
 		const f = fixture();
 		const trusted = fs.realpathSync(execFileSync("/usr/bin/which", ["git"], { timeout: 5000 }).toString().trim());
 		fs.symlinkSync(trusted, path.join(f.root, "bin", "git"));
 		let tool: any;
 		registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
-			{ artifactRoot: f.artifacts, nativePython: python });
+			{ artifactRoot: f.artifacts, nativePython: f.python });
 		const result = await tool.execute("git-pin", f.params, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(result.isError, result.content[0].text).not.toBe(true);
 		const runDir = result.details.results[0].artifactDir;
@@ -748,7 +809,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		const link = path.join(f.root, "artifact-link"); fs.symlinkSync(f.artifacts, link);
 		let tool: any;
 		registerExtension({ registerTool: (value: any) => { tool = value; } } as any,
-			{ artifactRoot: link, nativePython: python });
+			{ artifactRoot: link, nativePython: f.python });
 		const finished = await tool.execute("finish", f.params, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(finished.isError, finished.content[0].text).not.toBe(true);
 		const results = recover(f, finished.details.runId, link);
@@ -761,7 +822,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(results[0].content[0].text).toContain("completed");
 		expect(results[1].content[0].text).toContain("Native audit result");
 	});
-	it.each(["complete", "patch"])("persists validated native %s evidence without changing source or Git refs", async (behavior) => {
+	it.each(["complete", "patch", "coverage-nested-reproducer"])("persists validated native %s evidence without changing source or Git refs", async (behavior) => {
 		const f = fixture(behavior);
 		const result = await f.call();
 		expect(result.isError, result.content[0].text).not.toBe(true);
@@ -772,11 +833,29 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(f.git("show-ref")).toBe(f.before);
 		expect(f.git("status", "--porcelain")).toBe("");
 		const launch = JSON.parse(fs.readFileSync(path.join(run.artifactDir, "evidence", "launch.json"), "utf8"));
-		expect(launch.args).toContain("--no-default-allows");
-		expect(launch.args).not.toContain(f.source);
+		expect(launch.args).toContain("--ro-bind");
+		expect(launch.args).toContain("--disable-userns");
+		expect(launch.args).toContain(f.source);
+		expect(launch.args.slice(launch.args.indexOf("--bind"), launch.args.indexOf("--bind") + 3)).toEqual(["--bind", path.join(run.artifactDir, "snapshot"), path.join(run.artifactDir, "snapshot")]);
 		expect(launch.cwd).toBe(path.join(run.artifactDir, "sandbox"));
 		if (behavior === "patch") expect(fs.existsSync(path.join(run.artifactDir, "evidence", "audit-findings", "001-test.patch"))).toBe(true);
 	});
+	it.each(["coverage-substituted", "coverage-missing", "coverage-duplicate", "coverage-verifier-rewrite",
+		"coverage-artifact-substituted", "coverage-artifact-missing", "coverage-artifact-duplicate",
+		"coverage-arrays", "coverage-non-record"])(
+		"rejects mismatched finding coverage identity: %s", async (behavior) => {
+			const f = fixture(behavior); const result = await f.call();
+			expect(result.isError).toBe(true);
+			expect(result.details.results[0].nativeAudit.status).not.toBe("completed");
+		}, 15000);
+
+	it.each(["coverage-discarded", "coverage-adjudicated"])(
+		"accepts a legitimate finding removal without artifact coverage: %s", async (behavior) => {
+		const f = fixture(behavior); const result = await f.call();
+		expect(result.isError, result.content[0].text).not.toBe(true);
+		expect(result.details.results[0].nativeAudit.status).toBe("completed");
+	});
+
 	it.each([false, true])("rejects unrecovered released finding expansion through dispatch (async=%s)", async (async) => {
 		const f = fixture("lost-expansion");
 		let result = await f.call({ ...f.params, timeoutMs: 10000, reasoningEffortOverride: "xhigh", async } as any);
@@ -820,7 +899,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(fs.statSync(path.join(run.artifactDir, "stdout.txt")).size).toBeLessThanOrEqual(2 * 1024 * 1024);
 		expect(fs.existsSync(path.join(run.artifactDir, "snapshot"))).toBe(false);
 	}, 15000);
-	it.each([false, true])("blocks Darwin/AgentFS 0.6.4 before source materialization (resolved links=%s)", async (links) => {
+	it.each([false, true])("blocks Darwin before source materialization before source materialization (resolved links=%s)", async (links) => {
 		const f = fixture();
 		Object.defineProperty(process, "platform", { value: "darwin" });
 		let cwd = f.source;
@@ -833,23 +912,22 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		}
 		let tool: any;
 		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
-			{ artifactRoot, nativePython: python } as any);
+			{ artifactRoot, nativePython: f.python } as any);
 		const result = await tool.execute("native", f.params, undefined, undefined, { cwd, hasUI: false });
 		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/Darwin.*0\.6\.4|macOS.*0\.6\.4/);
-		expect(result.content[0].text).toMatch(/temporary.*writ|writ.*temporary/);
+		expect(result.content[0].text).toMatch(/Linux.*bubblewrap/);
 		expect(fs.readdirSync(f.artifacts)).toEqual([]);
 		expect(f.git("status", "--porcelain")).toBe("");
 		expect(f.git("show-ref")).toBe(f.before);
 	});
 
-	it("does not assume newer AgentFS versions provide safe native isolation", async () => {
+	it("does not assume unsupported bubblewrap versions provide safe native isolation", async () => {
 		const f = fixture();
-		const bin = path.join(f.root, "bin", "agentfs");
-		fs.writeFileSync(bin, fs.readFileSync(bin, "utf8").replace("agentfs 0.6.4", "agentfs 0.6.5"));
+		const bin = path.join(f.root, "bin", "bwrap");
+		fs.writeFileSync(bin, fs.readFileSync(bin, "utf8").replace("bubblewrap 0.12.0", "bubblewrap 0.13.0"));
 		const result = await f.call();
 		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/unverified AgentFS|native isolation canary/i);
+		expect(result.content[0].text).toMatch(/pinned.*bubblewrap|bubblewrap.*identity/i);
 		expect(fs.readdirSync(f.artifacts)).toEqual([]);
 	});
 
@@ -894,10 +972,26 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		process.env.PATH = path.join(f.root, "bin");
 		let tool: any;
 		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
-			{ artifactRoot: f.artifacts, nativePython: python } as any);
+			{ artifactRoot: f.artifacts, nativePython: f.python } as any);
 		const result = await tool.execute("native", f.params, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toMatch(/nono.*provider-only|provider-only.*nono/);
+		expect(fs.readdirSync(f.artifacts)).toEqual([]);
+	});
+
+	it("fails before artifacts when pinned unshare is unavailable; never falls back", async () => {
+		const f = fixture();
+		fs.rmSync(path.join(f.root, "bin", "unshare"));
+		fs.symlinkSync(execFileSync("/usr/bin/which", ["git"], { timeout: 5000,
+			maxBuffer: 16384 }).toString().trim(), path.join(f.root, "bin", "git"));
+		process.env.PATH = path.join(f.root, "bin");
+		let tool: any;
+		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
+			{ artifactRoot: f.artifacts, nativePython: f.python } as any);
+		const result = await tool.execute("native", f.params, undefined, undefined,
+			{ cwd: f.source, hasUI: false });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/unshare.*bubblewrap.*nono/i);
 		expect(fs.readdirSync(f.artifacts)).toEqual([]);
 	});
 
@@ -926,7 +1020,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		const link = path.join(f.root, "linked-artifacts"); fs.symlinkSync(destination, link);
 		let tool: any;
 		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
-			{ artifactRoot: link, nativePython: python } as any);
+			{ artifactRoot: link, nativePython: f.python } as any);
 		const result = await tool.execute("native", f.params, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toMatch(/outside source checkout/);
@@ -948,7 +1042,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(resumed.isError, resumed.content[0].text).not.toBe(true);
 		expect(resumed.content[0].text).toContain("Native audit result");
 		let reloaded: any;
-		registerExtension({ registerTool: (registered: any) => { reloaded = registered; } } as any, { artifactRoot: f.artifacts, nativePython: python } as any);
+		registerExtension({ registerTool: (registered: any) => { reloaded = registered; } } as any, { artifactRoot: f.artifacts, nativePython: f.python } as any);
 		const status = await reloaded.execute("status", { action: "status", id: runId }, undefined, undefined, { cwd: f.source, hasUI: false });
 		expect(status.isError, status.content[0].text).not.toBe(true);
 		expect(status.content[0].text).toContain("completed");

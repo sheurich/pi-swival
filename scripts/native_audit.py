@@ -9,14 +9,21 @@ non-secret route metadata leaves memory; diagnostics never include configuration
 
 import argparse
 import contextlib
+import ctypes
+import errno
+import hashlib
 import importlib.metadata
 import io
 import json
 import math
+import operator
 import os
 from pathlib import Path
 import re
 import select
+import signal
+import stat
+import subprocess
 import sys
 import threading
 import time
@@ -50,6 +57,22 @@ EXECUTION_DEFAULTS = {
     "retries": 5, "prompt_cache": True, "sanitize_thinking": None, "show_thinking": None,
 }
 RUNTIME_VERSIONS = {"swival": "1.0.46", "litellm": "1.103.3"}
+UNSHARE_IDENTITY = {
+    "path": "/usr/bin/unshare",
+    "version": "unshare from util-linux 2.41.5",
+    "package": "util-linux",
+    "packageVersion": "2.41.5-0+deb13u1",
+    "architecture": "arm64",
+    "sha256": "285119fd3989039d50f8904b619b2abb8b795cb56753eb0235c8c031eb880a21",
+}
+BWRAP_IDENTITY = {
+    "path": "/usr/bin/bwrap",
+    "version": "bubblewrap 0.12.0",
+    "package": "bubblewrap",
+    "packageVersion": "0.12.0-1~deb13u1",
+    "architecture": "arm64",
+    "sha256": "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
+}
 _VERTEX_SELECTOR = None
 _VERTEX_SELECTOR_LOCK = threading.Lock()
 CREDENTIAL_PATTERN = re.compile(
@@ -305,13 +328,75 @@ def _bound_transport(route):
     agent._call_huggingface_text_generation = no_hf_fallback  # pylint: disable=protected-access
     try:
         check_vertex_route()  # Before Session construction, and again on every call.
-        yield
+        with _read_only_chatgpt_auth(route, reject):
+            yield
         if violated.is_set():
             raise NativeAuditError("Native transport route guard failed; no fallback.")
     finally:
         litellm.completion = completion
         agent._list_server_models = model_listing  # pylint: disable=protected-access
         agent._call_huggingface_text_generation = hf_fallback  # pylint: disable=protected-access
+
+
+@contextlib.contextmanager
+def _read_only_chatgpt_auth(route, reject):
+    """Allow an existing valid token, never automatic login, refresh or auth writes."""
+    if route["provider"] != "chatgpt":
+        yield
+        return
+    from litellm.llms.chatgpt.authenticator import Authenticator
+
+    def unavailable(*_args, **_kwargs):
+        reject("Native ChatGPT requires prior human login and a valid token; no automatic auth.")
+
+    def auth_record(auth):
+        try:
+            file = Path(auth.auth_file)
+            if not file.is_file() or file.is_symlink() or file.stat().st_size > 64 * 1024:
+                raise ValueError("unsupported auth file")
+            data = json.loads(file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("unsupported auth record")
+            return data
+        except (OSError, ValueError, UnicodeError):
+            unavailable()
+        return None
+
+    def access_token(auth):
+        data = auth_record(auth)
+        token = data.get("access_token")
+        expiry = data.get("expires_at")
+        if not isinstance(expiry, (int, float)) or isinstance(expiry, bool):
+            expiry = auth._get_expires_at(token) if isinstance(token, str) else None  # pylint: disable=protected-access
+        if (not isinstance(token, str) or not token or not isinstance(expiry, (int, float))
+                or not math.isfinite(expiry) or time.time() >= expiry - 60):
+            unavailable()
+        return token
+
+    def account_id(auth):
+        access_token(auth)
+        data = auth_record(auth)
+        stored = data.get("account_id")
+        if isinstance(stored, str) and stored:
+            return stored
+        token = data.get("id_token") or data.get("access_token")
+        return auth._extract_account_id(token if isinstance(token, str) else None)  # pylint: disable=protected-access
+
+    def ensure_dir(auth):
+        if not Path(auth.token_dir).is_dir():
+            unavailable()
+
+    replacements = {"get_access_token": access_token, "get_account_id": account_id,
+                    "_ensure_token_dir": ensure_dir, "_write_auth_file": unavailable,
+                    "_login_device_code": unavailable, "_refresh_tokens": unavailable}
+    original = {name: getattr(Authenticator, name) for name in replacements}
+    try:
+        for name, method in replacements.items():
+            setattr(Authenticator, name, method)
+        yield
+    finally:
+        for name, method in original.items():
+            setattr(Authenticator, name, method)
 
 
 def _protected(config):
@@ -352,6 +437,13 @@ def _read_config(filename, *, project=False):
         raise NativeAuditError("Unknown native configuration requirements.")
     if project and (set(raw) & (ROUTING_KEYS | {"profiles", "active_profile"})):
         raise NativeAuditError("Unsupported project-supplied native provider routing.")
+    def incompatible(value):
+        return (value.get("sandbox") == "agentfs" or value.get("sandbox_auto_session") is True
+                or bool(value.get("sandbox_session"))
+                or any(incompatible(item) for item in value.values() if isinstance(item, dict)))
+
+    if incompatible(raw):
+        raise NativeAuditError("Unsupported explicit native AgentFS backend/session requirement.")
     if raw.get("files") == "none" or raw.get("network") == "none" or raw.get("sandbox") == "nono":
         raise NativeAuditError("Unsupported restrictive native filesystem/network configuration.")
     if (raw.get("sandbox_strict_read") or raw.get("lifecycle_fail_closed")
@@ -476,14 +568,97 @@ def _expansion_failures(max_files):
         audit._ui_warning = warning  # pylint: disable=protected-access
 
 
+def _trusted_root_executable(executable, label="launcher"):
+    """Require one canonical, root-owned executable without privilege bits."""
+    path = Path(executable)
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.stat()
+    except OSError as exc:
+        raise NativeAuditError(f"Native {label} identity is unavailable.") from exc
+    if (str(path) != str(resolved) or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0 or metadata.st_gid != 0
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+        raise NativeAuditError(f"Native {label} identity is not trusted.")
+    return resolved, metadata
+
+
+def _launcher_command(argv, label):
+    """Run one already-trusted identity query with fixed limits and environment."""
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    try:
+        result = subprocess.run(argv, cwd="/", env=environment, shell=False,
+                                stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NativeAuditError(f"Native {label} package identity is unavailable.") from exc
+    if (result.returncode or len(result.stdout) > 16 * 1024
+            or len(result.stderr) > 16 * 1024):
+        raise NativeAuditError(f"Native {label} package identity is unavailable.")
+    try:
+        return result.stdout.decode("utf-8").strip()
+    except UnicodeError as exc:
+        raise NativeAuditError(f"Native {label} package identity is unavailable.") from exc
+
+
+def _validate_launcher_identity(executable, identity, label):
+    """Validate one reviewed Debian launcher before executing the launcher itself."""
+    resolved, metadata = _trusted_root_executable(executable, label)
+    if str(resolved) != identity["path"] or metadata.st_size > 1024 * 1024:
+        raise NativeAuditError(f"Native {label} identity is unsupported.")
+    getxattr = getattr(os, "getxattr", None)
+    if not callable(getxattr):
+        raise NativeAuditError(f"Native {label} file capabilities are unverifiable.")
+    try:
+        capability = operator.call(
+            getxattr, resolved, "security.capability", follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno != errno.ENODATA:
+            raise NativeAuditError(
+                f"Native {label} file capabilities are unverifiable.") from exc
+    else:
+        if capability:
+            raise NativeAuditError(f"Native {label} file capabilities are unsupported.")
+    digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    if digest != identity["sha256"]:
+        raise NativeAuditError(f"Native {label} executable hash is unsupported.")
+    query, _ = _trusted_root_executable("/usr/bin/dpkg-query", "dpkg-query")
+    query_format = "-f=${Package}\\t${Version}\\t${Architecture}\\t${db:Status-Status}\\n"
+    package = _launcher_command(
+        [str(query), "-W", query_format, identity["package"]], label).split("\t")
+    if package != [identity["package"], identity["packageVersion"],
+                    identity["architecture"], "installed"]:
+        raise NativeAuditError(f"Native {label} package identity is unsupported.")
+    expected_owner = f'{identity["package"]}: {identity["path"]}'
+    if _launcher_command([str(query), "-S", str(resolved)], label) != expected_owner:
+        raise NativeAuditError(f"Native {label} package ownership is unsupported.")
+    if _launcher_command([str(resolved), "--version"], label) != identity["version"]:
+        raise NativeAuditError(f"Native {label} version is unsupported.")
+    return dict(identity)
+
+
+def validate_unshare_identity(executable):
+    """Validate the reviewed util-linux executable and Debian package identity."""
+    return _validate_launcher_identity(executable, UNSHARE_IDENTITY, "unshare")
+
+
+def validate_bwrap_identity(executable):
+    """Validate the reviewed bubblewrap executable and Debian package identity."""
+    return _validate_launcher_identity(executable, BWRAP_IDENTITY, "bubblewrap")
+
+
 def run_native(request):
     """Dispatch exactly one /audit with fixed, restrictive Session policies."""
-    if sys.platform == "darwin" and request.get("agentfsVersion") == "0.6.4":
-        raise NativeAuditError(
-            "Native audit is blocked on Darwin/macOS with AgentFS 0.6.4: writable temporary roots."
-        )
-    if sys.platform != "linux" or request.get("agentfsVersion") != "0.6.4":
-        raise NativeAuditError("Unverified native AgentFS/platform isolation; no fallback.")
+    platform_verified = all((
+        sys.platform == "linux", request.get("sandbox") == "bubblewrap",
+        request.get("bwrapVersion") == "0.12.0",
+        request.get("bwrapIdentity") == BWRAP_IDENTITY,
+        request.get("unshareIdentity") == UNSHARE_IDENTITY,
+        request.get("sessionSandbox") == "builtin",
+    ))
+    if not platform_verified:
+        raise NativeAuditError("Unverified native bubblewrap/platform isolation; no fallback.")
+    check_boundary()
     settings, public = resolve_native_config(request)
     if request.get("expectedRoute") != public:
         raise NativeAuditError("Native route changed after preflight; no fallback.")
@@ -493,8 +668,6 @@ def run_native(request):
                 "scope": scope}
     if request.get("expectedScope") != scope:
         raise NativeAuditError("Native committed scope changed after preflight.")
-    if os.environ.get("AGENTFS") != "1":
-        raise NativeAuditError("Native audit requires an external AgentFS sandbox; no fallback.")
     from swival.session import Session
 
     options = request["audit"]
@@ -505,7 +678,7 @@ def run_native(request):
     with (_bound_transport(public),
           _expansion_failures(len(scope["mandatory_files"])) as failures,
           Session(**settings, base_dir=request["snapshot"], files="some", commands="none",
-                  sandbox="agentfs", sandbox_auto_session=False, network="provider-only",
+                  sandbox="builtin", sandbox_auto_session=False, network="provider-only",
                   no_instructions=True, no_skills=True, metaskills="off", memory=False,
                   history=False, continue_here=False, subagents=False, lifecycle_enabled=False,
                   mcp_servers=None, a2a_servers=None, trace_dir=None, read_guard=True) as session):
@@ -515,17 +688,214 @@ def run_native(request):
             "scope": scope, "route": public,
             "provider": public["provider"], "model": public["model"],
             "requestedEffort": public["reasoningEffort"], "network": "provider-only",
-            "sandbox": {"agentfs": True, "agentfsVersion": request.get("agentfsVersion")},
+            "sandbox": {"external": "bubblewrap", "bwrapVersion": request.get("bwrapVersion"),
+                        "bwrapIdentity": request.get("bwrapIdentity"),
+                        "startup": {"executable": "unshare",
+                                    "identity": request.get("unshareIdentity")},
+                        "session": "builtin"},
             "verification": "Native verifier judgment; project commands and PoCs cannot execute."}
 
 
+def _validate_private_mountinfo(text):
+    """Mountinfo optional fields describe live propagation edges, not path policy.
+
+    No shared/master/propagate_from edge means subsequent ordinary host mounts
+    cannot enter this captured namespace. A privileged host can still change files
+    or enter namespaces directly; that is outside this boundary.
+    """
+    if not isinstance(text, str) or len(text) > 1024 * 1024:
+        raise NativeAuditError("Native mount layout is oversized or unavailable.")
+    lines = text.splitlines()
+    if not lines or len(lines) > 4096:
+        raise NativeAuditError("Native mount layout is unsupported.")
+    roots = []
+    for line in lines:
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            identity_valid = (fields[0].isdigit() and fields[1].isdigit()
+                              and re.fullmatch(r"[0-9]+:[0-9]+", fields[2]))
+            paths_valid = fields[3].startswith("/") and fields[4].startswith("/")
+            if separator < 6 or len(fields) != separator + 4 or not (
+                    identity_valid and paths_valid):
+                raise ValueError("unsupported mountinfo")
+            if any(field != "unbindable" for field in fields[6:separator]):
+                raise NativeAuditError(
+                    "Native isolation refuses shared/slave or unknown mount propagation. "
+                    "Use an approved propagation-free Linux environment; no provider started."
+                )
+            if fields[4] == "/":
+                roots.append(fields[5].split(","))
+        except ValueError as exc:
+            raise NativeAuditError("Native mount layout is unsupported.") from exc
+    if len(roots) != 1 or "ro" not in roots[0] or "rw" in roots[0]:
+        raise NativeAuditError("Native original root is not exclusively read-only.")
+
+
+def _validate_status_boundary(fields):
+    """Require NoNewPrivs and zero inheritable, ambient, bounding, and task caps."""
+    try:
+        valid = (fields.get("NoNewPrivs", "").strip() == "1"
+                 and all(int(fields.get(key, "1").strip(), 16) == 0
+                         for key in ("CapEff", "CapPrm", "CapInh", "CapAmb", "CapBnd")))
+    except ValueError as exc:
+        raise NativeAuditError("Native capability boundary is unsupported.") from exc
+    if not valid:
+        raise NativeAuditError("Native capability boundary is unsupported.")
+
+
+def check_boundary():
+    """Reached kernel checks; builtin Session policies are not OS enforcement."""
+    if sys.platform != "linux" or os.getpid() != 2 or os.getppid() != 1:
+        raise NativeAuditError("Native payload did not reach its private PID namespace.")
+    status = Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
+    fields = dict(line.split(":", 1) for line in status if ":" in line)
+    _validate_status_boundary(fields)
+    if "AGENTFS" in os.environ:
+        raise NativeAuditError("Native environment boundary is unsupported.")
+    with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+        _validate_private_mountinfo(stream.read(1024 * 1024 + 1))
+    try:
+        os.unshare(os.CLONE_NEWUSER)  # pylint: disable=no-member
+    except OSError:
+        return
+    raise NativeAuditError("Native nested user namespaces were not disabled.")
+
+
+def bubblewrap_argv(request, payload):
+    """Recursive RO root, private mounts, explicit visibility, then only S/E writes."""
+    argv = [request["bwrap"], "--unshare-user", "--disable-userns", "--unshare-pid",
+            "--unshare-ipc", "--die-with-parent", "--cap-drop", "ALL", "--ro-bind", "/", "/",
+            "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--dev", "/dev", "--proc", "/proc"]
+    roots = request.get("readOnlyPaths", [])
+    if (not isinstance(roots, list) or len(roots) > 64
+            or any(not isinstance(root, str) or not os.path.isabs(root) for root in roots)):
+        raise NativeAuditError("Unsupported native read-only visibility.")
+    for root in sorted(set(roots), key=lambda value: (len(Path(value).parts), value)):
+        if os.path.normpath(root) in {"/", "/tmp", "/var/tmp", "/dev", "/proc", "/dev/shm"}:
+            raise NativeAuditError("Native visibility cannot replace a private mount root.")
+        argv.extend(["--ro-bind", root, root])
+    for key in ("snapshot", "evidence"):
+        if key in request:
+            argv.extend(["--bind", request[key], request[key]])
+    argv.extend(["--chdir", request.get("snapshot", "/"), "--", *payload])
+    return argv
+
+
+def sandbox_argv(request, payload, status_fd, block_fd):
+    """Build the exact reviewed unshare prefix around controlled bubblewrap argv."""
+    bwrap = bubblewrap_argv(request, payload)
+    separator = bwrap.index("--")
+    bwrap[separator:separator] = ["--info-fd", str(status_fd),
+                                  "--block-fd", str(block_fd)]
+    return [request["unshare"], "--user", "--map-current-user", "--mount",
+            "--propagation", "private", "--", *bwrap]
+
+
+# Keep the live namespace ownership, commit pipes and bounded teardown in one scope.
+# pylint: disable-next=too-many-locals,too-many-branches,too-many-statements
+def supervise_bubblewrap(request, payload, input_bytes=None):
+    """Pin init while bwrap blocks; pidfd readability proves namespace teardown.
+
+    The status/block pipes and pidfd remain outside the payload. bwrap 0.12 closes
+    the control descriptors before exec. Its monitor exit alone is not proof.
+    """
+    status_r, status_w = os.pipe()
+    block_r, block_w = os.pipe()
+    proc = None
+    init = None
+    stopped = []
+    previous = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, lambda *_args: stopped.append(True))
+    # Bind this trusted supervisor to its live wrapper without privilege changes.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() == 1:
+        raise NativeAuditError("Native parent-loss control unavailable.")
+    verified = False
+    launched = False
+    try:
+        argv = sandbox_argv(request, payload, status_w, block_r)
+        proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            argv, cwd=request.get("snapshot", "/"), shell=False, close_fds=True,
+            pass_fds=(status_w, block_r), stdin=subprocess.PIPE)
+        launched = True
+        os.close(status_w)
+        status_w = None
+        os.close(block_r)
+        block_r = None
+        if not select.select([status_r], [], [], 5)[0]:
+            raise NativeAuditError("Native namespace ownership setup timed out.")
+        info = json.loads(os.read(status_r, 4096))
+        pid = info.get("child-pid")
+        if type(pid) is not int or pid <= 1:  # pylint: disable=unidiomatic-typecheck
+            raise NativeAuditError("Native namespace ownership status invalid.")
+        init = os.pidfd_open(pid)  # pylint: disable=no-member
+        fields = dict(line.split(":", 1) for line in
+                      Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines()
+                      if ":" in line)
+        if int(fields["PPid"].strip()) != proc.pid:
+            raise NativeAuditError("Native namespace init is not live-owned.")
+        if not stopped:
+            if request.get("controlProof"):
+                os.write(4, b"STARTED\n")
+            os.write(block_w, b"1")
+            proc.stdin.write(input_bytes or b"")
+            proc.stdin.close()
+        end = time.monotonic() + request.get("timeoutMs", 10000) / 1000
+        while proc.poll() is None and not stopped and time.monotonic() < end:
+            time.sleep(0.02)
+        if proc.poll() is None:
+            proc.terminate()
+        try:
+            code = proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = proc.wait(timeout=1)
+        if not select.select([init], [], [], 1)[0]:
+            signal.pidfd_send_signal(init, signal.SIGKILL)  # pylint: disable=no-member
+        verified = bool(select.select([init], [], [], 1)[0])
+        if not verified:
+            raise NativeAuditError("Native namespace init death was not verified.")
+        return code if not stopped else 143
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=1)
+            if init is not None and not verified:
+                try:
+                    signal.pidfd_send_signal(init, signal.SIGKILL)  # pylint: disable=no-member
+                    verified = bool(select.select([init], [], [], 1)[0])
+                except OSError:
+                    pass
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        for fd in (status_r, status_w, block_r, block_w, init):
+            if fd is not None:
+                os.close(fd)
+        signal.signal(signal.SIGTERM, previous)
+        if request.get("controlProof"):
+            try:
+                os.write(4, b"VERIFIED\n" if verified else
+                         b"NOT_STARTED\n" if not launched else b"UNVERIFIED\n")
+            except OSError:
+                pass  # Lost live control never becomes persisted signalling authority.
+
+
+def _revalidate_launchers(request):
+    """Bind both prepared identities to their executables immediately before launch."""
+    if validate_unshare_identity(request.get("unshare")) != request.get("unshareIdentity"):
+        raise NativeAuditError("Native unshare identity changed before execution.")
+    if validate_bwrap_identity(request.get("bwrap")) != request.get("bwrapIdentity"):
+        raise NativeAuditError("Native bubblewrap identity changed before execution.")
+
+
 def launch_native():
-    """Wait for live ownership and a bounded commit before executing AgentFS."""
+    """Wait for live ownership and bounded EXEC/EOF before unshare and bubblewrap."""
     if len(sys.argv) != 6:
         raise NativeAuditError("Unsupported native launcher arguments.")
-    agentfs, snapshot, evidence, session = sys.argv[2:]
-    if (not all(os.path.isabs(value) for value in (agentfs, snapshot, evidence))
-            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session)):
+    unshare, bwrap, snapshot, evidence = sys.argv[2:]
+    if not all(os.path.isabs(value) for value in (unshare, bwrap, snapshot, evidence)):
         raise NativeAuditError("Unsupported fixed native launcher scope.")
     deadline = time.monotonic() + 5
     token = b""
@@ -541,13 +911,21 @@ def launch_native():
         token += chunk
         if len(token) >= 6 or not b"EXEC\n".startswith(token):
             raise NativeAuditError("Native ownership commit was invalid.")
-    # Keep only the native request stream and bounded output streams. execve
-    # replaces this owned PID/group; no bootstrap process remains.
-    os.closerange(3, os.sysconf("SC_OPEN_MAX"))
-    argv = [agentfs, "run", "--no-default-allows", "--allow", snapshot,
-            "--allow", evidence, "--session", session, "--", sys.executable,
-            "-I", "-B", str(Path(__file__).resolve()), "--run"]
-    os.execve(agentfs, argv, dict(os.environ))
+    os.close(3)
+    os.closerange(5, os.sysconf("SC_OPEN_MAX"))
+    request_bytes = sys.stdin.buffer.read(64 * 1024 + 1)
+    if len(request_bytes) > 64 * 1024:
+        raise NativeAuditError("Native request exceeded its bounded protocol.")
+    request = json.loads(request_bytes)
+    if any(request.get(key) != value for key, value in
+           (("unshare", unshare), ("bwrap", bwrap),
+            ("snapshot", snapshot), ("evidence", evidence))):
+        raise NativeAuditError("Native launcher scope changed.")
+    _revalidate_launchers(request)
+    request["controlProof"] = True
+    code = supervise_bubblewrap(request, [request["python"], "-I", "-B",
+                               str(Path(__file__).resolve()), "--run"], request_bytes)
+    sys.exit(code)
 
 
 def main():
@@ -555,8 +933,22 @@ def main():
     if sys.argv[1:2] == ["--launch"]:
         launch_native()
         return
+    if sys.argv[1:] == ["--boundary-check"]:
+        check_boundary()
+        print("Native kernel boundary reached.")
+        return
     request = json.loads(sys.stdin.read(64 * 1024))
-    if sys.argv[1:] == ["--preflight"]:
+    if sys.argv[1:] == ["--validate-unshare"]:
+        print(json.dumps(validate_unshare_identity(request.get("unshare"))))
+    elif sys.argv[1:] == ["--validate-bwrap"]:
+        print(json.dumps(validate_bwrap_identity(request.get("bwrap"))))
+    elif sys.argv[1:] == ["--probe"]:
+        _revalidate_launchers(request)
+        code = supervise_bubblewrap(request, [request["python"], "-I", "-B",
+                                   str(Path(__file__).resolve()), "--boundary-check"])
+        if code:
+            raise NativeAuditError("Native bubblewrap runtime capability check failed.")
+    elif sys.argv[1:] == ["--preflight"]:
         _, public = resolve_native_config(request)
         if "snapshot" in request:
             public["scope"] = native_scope(request)

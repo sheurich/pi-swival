@@ -48,6 +48,11 @@ describe("native audit dispatch boundary", () => {
 		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
 			{ artifactRoot: root, nativePython: python } as any);
 	});
+	it("describes native and ordinary isolation without conflating them", () => {
+		expect(tool.description).toContain("Native mode uses Linux unshare and bubblewrap with builtin Session isolation");
+		expect(tool.description).toContain("Ordinary delegation uses AgentFS");
+	});
+
 	it.each([
 		{ paths: ["src\n/!rm"] }, { paths: ["../escape"] }, { paths: ["/etc"] },
 		{ paths: ["--debug"] }, { paths: ["src with space"] }, { paths: ["src\\..\\out"] },
@@ -79,6 +84,10 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		["global", 'encrypt_secrets_key = "synthetic-never-log-this"'],
 		["project", 'unrecognized_shield = true'], ["global", 'nono_audit_integrity = true'],
 		["global", 'nono_rollback = true'], ["project", 'lifecycle_fail_closed = true'], ["global", '[profiles.protected]\nprovider="lmstudio"\nllm_filter="required"'],
+		...["global", "project"].flatMap((where) => [
+			[where, 'sandbox="agentfs"'], [where, 'sandbox_auto_session=true'],
+			[where, 'sandbox_session="required"'],
+		]),
 	])("rejects protected or unknown %s configuration before native launch", async (where, config) => {
 		const dir = repository();
 		const home = scratch();
@@ -91,6 +100,7 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 	});
 	it.each(Object.entries({
 		network: '"none"', files: '"none"', sandbox: '"nono"', sandbox_strict_read: "true",
+		sandbox_session: '"required"', sandbox_auto_session: "true",
 		lifecycle_fail_closed: "true", nono_profile: '"required-profile"', nono_rollback: "true",
 		nono_block_net: "true", nono_allow_domain: '["offline.invalid"]',
 		nono_network_profile: '"required-profile"', nono_credential: '["required-reference"]',

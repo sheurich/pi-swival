@@ -58,7 +58,8 @@ function validTerminal(value, fallback) {
 		typeof value.exitedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value.exitedAt) ||
 		!Number.isFinite(Date.parse(value.exitedAt)) ||
 		!["not-started", "verified", "unverified"].includes(value.shutdown)) return false;
-	const keys = new Set(["exitCode", "exitedAt", "shutdown", "retainedResources", ...diagnostics]);
+	if (value.boundary !== undefined && value.boundary !== "bubblewrap-pidfd") return false;
+	const keys = new Set(["exitCode", "exitedAt", "shutdown", "boundary", "retainedResources", ...diagnostics]);
 	if (Object.keys(value).some((key) => !keys.has(key))) return false;
 	if (diagnostics.some((key) => value[key] !== undefined &&
 		(typeof value[key] !== "string" || !value[key] || value[key].length > 8192))) return false;
@@ -225,7 +226,7 @@ function atomicTerminal(runDir, name, record) {
 }
 
 async function finalizeNativeAudit(options, outcome) {
-	const { runDir, ownership, closeLogs, sessionDir, sessionOwned, startupBarrier, cancellationReason } = options;
+	const { runDir, ownership, closeLogs, startupBarrier, cancellationReason } = options;
 	const existing = readNativeTerminal(runDir);
 	if (existing && (existing.shutdown !== "unverified" || !ownership)) return existing;
 	const record = { exitCode: outcome.exitCode ?? 1, exitedAt: new Date().toISOString(),
@@ -245,29 +246,31 @@ async function finalizeNativeAudit(options, outcome) {
 		try { await closeLogs(record.shutdown); }
 		catch { record.cleanupFailure = [record.cleanupFailure, "Native runner log I/O failed."].filter(Boolean).join(" "); }
 	}
+	let namespaceRequired = !!ownership?.verify;
+	try {
+		namespaceRequired ||= JSON.parse(regularBytes(runDir, path.join(runDir, "request.json"), terminalLimit)).sandbox === "bubblewrap";
+	} catch { /* Legacy records gain no new live namespace authority. */ }
+	if (ownership && namespaceRequired) {
+		let verified = false;
+		try { verified = await ownership.verify?.() === true; } catch { /* Retain on lost proof. */ }
+		if (!verified) record.shutdown = "unverified";
+		else if (record.shutdown === "verified") record.boundary = "bubblewrap-pidfd";
+	}
 	const retained = [];
 	const snapshot = path.join(runDir, "snapshot");
 	if (record.shutdown === "unverified") {
-		record.shutdownFailure = "Native process-group cleanup could not be verified.";
+		record.shutdownFailure = "Native namespace/process shutdown could not be verified.";
 		for (const name of ["snapshot", "runtime-bin", "sandbox"]) retained.push(path.join(runDir, name));
-		if (sessionOwned && sessionDir) retained.push(sessionDir);
 	} else {
 		try { preserveEvidence(runDir); }
 		catch { record.preservationFailure = "Native evidence preservation failed or exceeded resource limits."; }
 		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "sandbox")];
 		if (record.preservationFailure) retained.push(snapshot);
 		else removable.unshift(snapshot);
-		if (sessionOwned && sessionDir) removable.push(sessionDir);
 		for (const target of removable) {
 			try {
-				// rm may remove a leaf symlink, but it must never traverse an unsafe
-				// ancestor. Sessions use a separately fixed startup path.
-				if (target === sessionDir) {
-					try {
-						fs.lstatSync(target);
-						checkedPath(path.parse(target).root, path.dirname(target));
-					} catch (error) { if (error.code !== "ENOENT") throw error; }
-				} else if (fs.existsSync(target)) checkedPath(runDir, path.dirname(target));
+				// Remove only run-scoped resources, never legacy AgentFS sessions.
+				if (fs.existsSync(target)) checkedPath(runDir, path.dirname(target));
 				fs.rmSync(target, { recursive: true, force: true });
 			} catch {
 				record.cleanupFailure = [record.cleanupFailure, "Owned native temporary-resource cleanup failed."].filter(Boolean).join(" ");

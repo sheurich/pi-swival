@@ -191,19 +191,22 @@ describe("native audit documentation and routing handoff", () => {
 		"skills/swival/references/setup.md",
 	])("%s states the native platform restriction and required isolation canary", (file) => {
 		const doc = read(join(PACKAGE_ROOT, file));
-		expect(doc).toMatch(/Linux[^\n]{0,80}AgentFS 0\.6\.4/);
-		expect(doc).toMatch(/Darwin\/macOS[^\n]{0,80}blocked/);
+		expect(doc).toMatch(/Linux[^\n]{0,80}bubblewrap 0\.12\.0/);
+		expect(doc).toMatch(/Darwin\/macOS[^\n]{0,80}unsupported/);
 		expect(doc).toMatch(/unverified[^\n]{0,100}fail closed/i);
 		expect(doc).toMatch(/native[^\n]{0,80}canary/i);
 	});
 	it.each([
 		["skill", AUDIT_SKILL], ["prompt", join(PACKAGE_ROOT, "prompts", "swival-audit.md")],
-	])("%s resolves approved audit routing without fallback", (_label, file) => {
+	])("%s documents profile-free Daybreak routing without fallback", (_label, file) => {
 		const doc = read(file);
-		for (const required of ["chatgpt-daybreak-blue", "xhigh", "frontier", "high",
-			"swival --list-profiles", "provider and data boundaries", '"<audit-profile>"', '"<audit-effort>"', '"audit"']) {
+		for (const required of ["gpt-daybreak-blue-latest", '"providerOverride": "chatgpt"',
+			'"modelOverride": "gpt-daybreak-blue-latest"', "xhigh", "frontier", "high",
+			"swival --list-profiles", "provider and data boundaries", '"audit"']) {
 			expect(doc).toContain(required);
 		}
+		expect(doc).not.toContain("chatgpt-daybreak-blue");
+		expect(doc).toMatch(/does not require[^\n]{0,80}(named )?profile/i);
 		expect(doc).toMatch(/no.*fallback|do not.*fall back|never.*fall back/i);
 		expect(doc).toMatch(/not guaranteed/);
 	});

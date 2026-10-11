@@ -412,25 +412,22 @@ Configuration constraints: `bedrock` and `vertexai` both reject `api_key`, and a
 
 ## Interactive REPL
 
-For direct terminal use (outside Pi), select an approved audit profile:
+For authorized Daybreak use outside Pi, start the REPL with `swival --provider chatgpt --model gpt-daybreak-blue-latest --reasoning-effort xhigh --repl`. This exact selection requires prior human ChatGPT login and account authorization, but it does not require a named profile. For other approved routes, verify the configured profile with `swival --list-profiles`; use `frontier` with `high` unless the operator selects another route. Preserve provider and data boundaries. A route selection is not permission to use its provider. In the REPL, `/audit <paths-or-globs>` takes paths, not bucket prose. It can generate patches and edit-capable worktrees. Native auxiliary calls omit effort, shielding, and filtering; requested effort is not guaranteed for every phase. Do not fall back after an unavailable or rejected route.
 
-```bash
-swival --profile <audit-profile> --repl
-```
-
-For approved personal content, verify `chatgpt-daybreak-blue` with `xhigh` using `swival --list-profiles`. For other approved routes, use `frontier` with `high` unless the operator selects another route. Preserve provider and data boundaries; a configured profile is not permission to use its provider. In the REPL, `/audit <paths-or-globs>` takes paths, not bucket prose. It can generate patches and edit-capable worktrees. Native auxiliary calls omit effort, shielding, and filtering; requested effort is not guaranteed for every phase.
-
-For delegated native audit, start Pi at the target Git root and use:
+For delegated native Daybreak audit, start Pi at the target Git root and use:
 
 ```json
 {
   "audit": { "paths": ["src/**/*.py"], "all": true },
-  "profileOverride": "<audit-profile>",
-  "reasoningEffortOverride": "<audit-effort>"
+  "providerOverride": "chatgpt",
+  "modelOverride": "gpt-daybreak-blue-latest",
+  "reasoningEffortOverride": "xhigh"
 }
 ```
 
-This mode requires Swival 1.0.46, Python 3.13+, Linux with AgentFS 0.6.4, and nono. Darwin/macOS with AgentFS 0.6.4 is blocked because writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. It isolates committed contents and preserves state/reports/patches outside the source checkout. It rejects protected or unsupported routes without fallback. See `auditing-with-swival` for scope limits and verification caveats. Ordinary plain-language delegation remains separate.
+Direct overrides apply only to that call. They do not change stored configuration, host defaults, or ordinary delegation. For another approved route, use its verified profile and effort overrides.
+
+This mode requires Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and nono. It uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline tests do not prove OS isolation. It isolates committed contents and preserves state/reports/patches outside the source checkout. It rejects protected or unsupported routes without fallback. See `auditing-with-swival` for scope limits and verification caveats. Ordinary plain-language delegation remains separate.
 
 | Command | Effect |
 |---------|--------|

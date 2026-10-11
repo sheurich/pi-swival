@@ -19,9 +19,19 @@ it("executes released Session.ask native phases and inherited isolation with den
 			});
 	});
 	expect(result.code, result.diagnostics).toBe(0);
-	expect(result.output).toContain("Ran 36 tests");
+	expect(result.output).toContain("Ran 37 tests");
 	expect(result.output).toMatch(/\bOK\b/);
 }, 65_000);
+
+it("checks bubblewrap mount ordering and read-only ChatGPT auth without HTTP", async () => {
+	const result = await new Promise<{ code: number; output: string }>((resolve) => {
+		execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_bubblewrap_test.py")],
+			{ timeout: 15000, maxBuffer: 64 * 1024 },
+			(error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+	});
+	expect(result.code, result.output).toBe(0);
+	expect(result.output).toContain("Ran 13 tests");
+});
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(
 	"validates released finding/verification/patch/%s-report evidence without provider transport", async (report) => {

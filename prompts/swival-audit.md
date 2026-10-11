@@ -9,11 +9,12 @@ Read the `auditing-with-swival` skill. Resolve scope and routing with the operat
 
 ## Routing
 
-Follow the operator's provider and data boundaries. Verify profiles with `swival --list-profiles` before dispatch:
+Follow the operator's provider and data boundaries.
 
-- For approved personal content, select `chatgpt-daybreak-blue` with `xhigh` when configured.
-- For other approved routes, use `frontier` with `high` unless the operator selects another route.
-- Halt if the selected profile is missing. Do not silently fall back. Keep model IDs in Swival configuration.
+- For authorized Daybreak use, select provider `chatgpt`, model `gpt-daybreak-blue-latest`, and effort `xhigh` directly. This does not require a named profile.
+- Daybreak requires prior human ChatGPT login and account authorization for the exact model. Selection does not grant access or choose another account.
+- For other approved routes, use the configured `frontier` profile with `high` unless the operator selects another route. Verify configured profiles with `swival --list-profiles`.
+- Halt if the selected route is unavailable or rejected. Do not silently fall back. Direct overrides do not change stored configuration, host defaults, or ordinary delegation.
 
 Requested effort is not guaranteed for every native phase. Swival 1.0.46 omits effort on auxiliary calls. A prior prompt-only probe does not prove native execution or per-phase effort.
 
@@ -21,11 +22,11 @@ Requested effort is not guaranteed for every native phase. Swival 1.0.46 omits e
 
 Translate only confirmed relative path/glob tokens into the `audit.paths` array. Do not interpolate arguments into a shell command or send them as executable slash-script text. Ask about unsupported prose, exclusions, or threat-model requirements before proceeding.
 
-Require Swival 1.0.46 on Python 3.13+, Linux with AgentFS 0.6.4, and nono. Darwin/macOS with AgentFS 0.6.4 is blocked: writable temporary roots expose source files and Git metadata. All other unverified platform/version combinations fail closed. Require a passing real native-layout isolation canary on Linux before use; offline transport tests do not prove OS isolation. There is no sandbox fallback.
+Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and nono. Native startup uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline transport tests do not prove OS isolation. There is no sandbox fallback.
 
 Stop on protected encryption/filtering requirements or any unknown isolation requirement. Do not disable controls, install prerequisites, or use unrestricted network to make launch succeed.
 
-Use exactly one structured invocation, with verified route placeholders:
+For an authorized Daybreak audit, use exactly one structured invocation with the exact supported route:
 
 ```json
 {
@@ -35,11 +36,14 @@ Use exactly one structured invocation, with verified route placeholders:
     "workers": 4,
     "patchMaxTurns": 50
   },
-  "profileOverride": "<audit-profile>",
-  "reasoningEffortOverride": "<audit-effort>",
+  "providerOverride": "chatgpt",
+  "modelOverride": "gpt-daybreak-blue-latest",
+  "reasoningEffortOverride": "xhigh",
   "timeoutMs": 900000
 }
 ```
+
+For another approved route, replace the three direct route overrides with its verified `profileOverride` and `reasoningEffortOverride`.
 
 Do not add `agent`, `task`, `cwd`, reviewer/self-review options, permission overrides, or arbitrary arguments. Omit `paths` for the full auditable committed scope. Native worker count does not enable autonomous subagents.
 

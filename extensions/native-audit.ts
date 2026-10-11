@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
@@ -168,13 +169,30 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 }
 
 export interface NativeRuntime {
-	python?: string; agentfs?: string; nono?: string; git?: string; searchPath?: string;
+	python?: string; unshare?: string; bwrap?: string; nono?: string; git?: string; searchPath?: string;
 }
+const PINNED_UNSHARE_IDENTITY = Object.freeze({
+	path: "/usr/bin/unshare",
+	version: "unshare from util-linux 2.41.5",
+	package: "util-linux",
+	packageVersion: "2.41.5-0+deb13u1",
+	architecture: "arm64",
+	sha256: "285119fd3989039d50f8904b619b2abb8b795cb56753eb0235c8c031eb880a21",
+});
+const PINNED_BWRAP_IDENTITY = Object.freeze({
+	path: "/usr/bin/bwrap",
+	version: "bubblewrap 0.12.0",
+	package: "bubblewrap",
+	packageVersion: "0.12.0-1~deb13u1",
+	architecture: "arm64",
+	sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
+});
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scripts");
 export interface NativeTerminal {
 	exitCode: number;
 	exitedAt: string;
 	shutdown: "not-started" | "verified" | "unverified";
+	boundary?: "bubblewrap-pidfd";
 	stopped?: string;
 	shutdownFailure?: string;
 	preservationFailure?: string;
@@ -185,12 +203,12 @@ export interface NativeTerminal {
 export interface NativeOwnership {
 	/** Authority from a live ChildProcess or its inherited IPC channel, never disk. */
 	signal: (signal: NodeJS.Signals | 0) => unknown;
+	/** Live trusted supervisor proof, never a persisted PID or payload report. */
+	verify?: () => Promise<boolean>;
 }
 interface NativeFinalizationOptions {
 	runDir: string;
 	ownership?: NativeOwnership;
-	sessionDir?: string;
-	sessionOwned?: boolean;
 	startupBarrier?: () => Promise<void>;
 	closeLogs?: (shutdown: NativeTerminal["shutdown"]) => Promise<void> | void;
 }
@@ -222,7 +240,10 @@ export function captureNativeRuntime(configuredPython?: string): NativeRuntime {
 		}
 	}
 	if (!python || !path.isAbsolute(python) || !/^python(?:\d+(?:\.\d+)*)?$/.test(path.basename(python))) python = undefined;
-	return { python, agentfs: executable("agentfs"), nono: executable("nono"),
+	const unshareEntry = executable("unshare");
+	let unshare: string | undefined;
+	try { if (unshareEntry) unshare = fsSync.realpathSync(unshareEntry); } catch { /* unavailable installation */ }
+	return { python, unshare, bwrap: executable("bwrap"), nono: executable("nono"),
 		git: executable("git"), searchPath: process.env.PATH };
 }
 
@@ -313,7 +334,8 @@ export async function prepareNativeAudit(
 		return virtualenv ? entry : target;
 	};
 	const python = (await pinRuntime(runtime.python, true))!;
-	const agentfs = await pinRuntime(runtime.agentfs);
+	const unshare = await pinRuntime(runtime.unshare);
+	const bwrap = await pinRuntime(runtime.bwrap);
 	const nono = await pinRuntime(runtime.nono);
 	const runDir = await canonicalFuturePath(artifactDir);
 	for (const source of [identity.sourceRoot, identity.sourceGitDir]) {
@@ -329,8 +351,8 @@ export async function prepareNativeAudit(
 	for (const field of NATIVE_FIELDS) {
 		if (field.endsWith("Override") && params[field] !== undefined) routing[field.slice(0, -8)] = params[field];
 	}
-	const request: Record<string, any> = { source: identity.sourceRoot, routing, audit, timeoutMs,
-		python, agentfs, session: `native-audit-${runId}` };
+	const request: Record<string, any> = { source: identity.sourceRoot, sourceGitDir: identity.sourceGitDir,
+		routing, audit, timeoutMs, python, unshare, bwrap, sandbox: "bubblewrap", sessionSandbox: "builtin" };
 	const preflight = async () => JSON.parse((await boundedExec(python, ["-I", "-B",
 		path.join(scriptRoot, "native_audit.py"), "--preflight"], identity.sourceRoot, JSON.stringify(request),
 		{ ...trustedGit.env, PATH: request.runtimePath ?? trustedGit.env.PATH },
@@ -342,17 +364,51 @@ export async function prepareNativeAudit(
 	catch { throw new Error("Native audit configuration preflight failed: protected, unknown, or unsupported requirements. No native worker/provider was started."); }
 	request.expectedRoute = route;
 	checkCancelled();
-	if (!agentfs || !nono) throw new Error("Native audit requires AgentFS and nono for provider-only network policy; no fallback.");
-	const version = (await boundedExec(agentfs, ["--version"], cwd, undefined, trustedGit.env, 5000, 16384)).toString();
-	request.agentfsVersion = /\d+\.\d+\.\d+/.exec(version)?.[0];
-	if (!request.agentfsVersion) throw new Error("Native audit cannot verify the AgentFS installation.");
-	if (process.platform === "darwin" && request.agentfsVersion === "0.6.4") {
-		throw new Error("Native audit is blocked on Darwin/macOS with AgentFS 0.6.4: writable temporary roots expose source and Git metadata. Ordinary delegation remains available; no sandbox fallback.");
+	if (!unshare || !bwrap || !nono) throw new Error("Native audit requires pinned util-linux unshare, bubblewrap, and nono for provider-only policy; ordinary delegation remains available. No fallback.");
+	if (process.platform !== "linux") throw new Error("Native audit requires verified Linux unshare and bubblewrap isolation; ordinary delegation remains available. No fallback.");
+	let unshareIdentity: Record<string, unknown>;
+	try {
+		unshareIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
+			path.join(scriptRoot, "native_audit.py"), "--validate-unshare"], cwd,
+			JSON.stringify({ unshare }), trustedGit.env, 10_000, 16 * 1024)).toString());
+	} catch {
+		throw new Error("Native audit requires the pinned root-owned util-linux unshare package and executable identity; no fallback.");
 	}
-	if (process.platform !== "linux" || request.agentfsVersion !== "0.6.4") {
-		throw new Error("Native audit is blocked for this unverified AgentFS/platform combination. Require a reviewed native isolation canary before enabling it; no fallback.");
+	if (!isDeepStrictEqual(unshareIdentity, PINNED_UNSHARE_IDENTITY)) {
+		throw new Error("Native audit unshare identity did not match the reviewed installation; no fallback.");
 	}
+	request.unshareIdentity = unshareIdentity;
+	let bwrapIdentity: Record<string, unknown>;
+	try {
+		bwrapIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
+			path.join(scriptRoot, "native_audit.py"), "--validate-bwrap"], cwd,
+			JSON.stringify({ bwrap }), trustedGit.env, 10_000, 16 * 1024)).toString());
+	} catch {
+		throw new Error("Native audit requires the pinned root-owned bubblewrap package and executable identity; no fallback.");
+	}
+	if (!isDeepStrictEqual(bwrapIdentity, PINNED_BWRAP_IDENTITY)) {
+		throw new Error("Native audit bubblewrap identity did not match the reviewed installation; no fallback.");
+	}
+	request.bwrapIdentity = bwrapIdentity;
+	request.bwrapVersion = "0.12.0";
 	await boundedExec(nono, ["--version"], cwd, undefined, trustedGit.env, 5000, 16384);
+	const visible = [identity.sourceRoot, identity.sourceGitDir, scriptRoot,
+		path.dirname(path.dirname(python)), path.dirname(path.dirname(await fs.realpath(python))),
+		path.dirname(trustedGit.executable), path.dirname(nono)];
+	for (const target of [path.join(os.homedir(), ".config", "swival"),
+		path.join(os.homedir(), ".config", "nono", "packages", "jedisct1", "swival"),
+		process.env.CHATGPT_TOKEN_DIR ?? path.join(os.homedir(), ".config", "litellm", "chatgpt")]) {
+		try { visible.push(await fs.realpath(target)); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	}
+	request.readOnlyPaths = [...new Set(await Promise.all(visible.map((target) => fs.realpath(target))))]
+		.sort((a, b) => a.split(path.sep).length - b.split(path.sep).length || a.localeCompare(b));
+	try {
+		await boundedExec(python, ["-I", "-B", path.join(scriptRoot, "native_audit.py"), "--probe"], cwd,
+			JSON.stringify(request), trustedGit.env, 10_000, 64 * 1024);
+	} catch {
+		throw new Error("Native bubblewrap capability check failed. Require a propagation-free Linux environment (no shared/slave mounts), PID namespaces, pidfds, and disabled nested user namespaces. No provider started.");
+	}
 	checkCancelled();
 	await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
 	request.snapshot = path.join(runDir, "snapshot");
@@ -375,7 +431,12 @@ export async function prepareNativeAudit(
 		request.expectedScope = scope;
 		await fs.mkdir(request.evidence, { mode: 0o700 });
 		await fs.mkdir(path.join(runDir, "sandbox"), { mode: 0o700 });
-		await fs.writeFile(path.join(runDir, "manifest.json"), JSON.stringify({ ...manifest, scope: scoped.scope, audit, route }, null, 2), { mode: 0o600 });
+		request.readOnlyPaths.push(runtimeBin);
+		await fs.writeFile(path.join(runDir, "manifest.json"), JSON.stringify({ ...manifest,
+			sandbox: "bubblewrap", bwrapVersion: request.bwrapVersion,
+			bwrapIdentity: request.bwrapIdentity, unshareIdentity: request.unshareIdentity,
+			sessionSandbox: "builtin",
+			scope: scoped.scope, audit, route }, null, 2), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "request.json"), JSON.stringify(request), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
 		checkCancelled();
@@ -400,9 +461,7 @@ export async function prepareNativeAudit(
 /** Called only after wrapper exit, with authority retained from its live channel. */
 export function recordNativeAuditFailure(meta: RunMeta, stopped: string, ownership?: NativeOwnership,
 	startupBarrier?: () => Promise<void>): Promise<NativeTerminal> {
-	return finalizeNativeAudit({ runDir: meta.artifactDir, ownership, startupBarrier,
-		sessionDir: path.join(os.homedir(), ".agentfs", "run", `native-audit-${meta.runId}`),
-		sessionOwned: ownership !== undefined }, { exitCode: 1, stopped });
+	return finalizeNativeAudit({ runDir: meta.artifactDir, ownership, startupBarrier }, { exitCode: 1, stopped });
 }
 
 export interface NativeAuditResult {
@@ -425,13 +484,187 @@ async function regularJson(file: string, root: string): Promise<Record<string, a
 	return JSON.parse(await fs.readFile(file, "utf8"));
 }
 
+type ReleasedFindingRecord = {
+	title: string; finding_type: string; severity: string; locations: string[];
+	preconditions: string[]; proof: string[]; fix_outline: string; source_file: string;
+	triage_decision: string | null; threat_model: string;
+};
+const findingFields = new Set(["title", "finding_type", "severity", "locations", "preconditions",
+	"proof", "fix_outline", "source_file", "triage_decision", "threat_model"]);
+const isPlainRecord = (value: unknown): value is Record<string, any> => value !== null &&
+	typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+const hasOnlyFields = (value: Record<string, any>, fields: Set<string>) =>
+	Object.keys(value).every((key) => fields.has(key));
+const stringList = (value: unknown): value is string[] => Array.isArray(value) &&
+	value.every((item) => typeof item === "string");
+
+function releasedFinding(value: unknown): ReleasedFindingRecord | undefined {
+	if (!isPlainRecord(value) || !hasOnlyFields(value, findingFields)) return undefined;
+	const triage = Object.hasOwn(value, "triage_decision") ? value.triage_decision : null;
+	const threat = Object.hasOwn(value, "threat_model") ? value.threat_model : "";
+	if (!["title", "finding_type", "severity", "fix_outline", "source_file"].every(
+		(key) => typeof value[key] === "string") || !stringList(value.locations) ||
+		!stringList(value.preconditions) || !stringList(value.proof) ||
+		!(triage === null || typeof triage === "string") || typeof threat !== "string") return undefined;
+	return { title: value.title, finding_type: value.finding_type, severity: value.severity,
+		locations: value.locations, preconditions: value.preconditions, proof: value.proof,
+		fix_outline: value.fix_outline, source_file: value.source_file,
+		triage_decision: triage, threat_model: threat };
+}
+
+const pythonAsciiString = (value: string) => JSON.stringify(value).replace(/[\u0080-\uffff]/g,
+	(character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+const pythonStringList = (value: string[]) => `[${value.map(pythonAsciiString).join(", ")}]`;
+
+/** Match Swival 1.0.46 `_finding_key` for the released FindingRecord schema only. */
+export function nativeFindingKey(value: unknown): string | undefined {
+	const finding = releasedFinding(value);
+	if (!finding) return undefined;
+	const fields: [string, string][] = [
+		["finding_type", pythonAsciiString(finding.finding_type)],
+		["fix_outline", pythonAsciiString(finding.fix_outline)],
+		["locations", pythonStringList(finding.locations)],
+		["preconditions", pythonStringList(finding.preconditions)],
+		["proof", pythonStringList(finding.proof)],
+		["severity", pythonAsciiString(finding.severity)],
+		["source_file", pythonAsciiString(finding.source_file)],
+		["threat_model", pythonAsciiString(finding.threat_model)],
+		["title", pythonAsciiString(finding.title)],
+		["triage_decision", finding.triage_decision === null ? "null" : pythonAsciiString(finding.triage_decision)],
+	];
+	const serialized = `{${fields.map(([key, encoded]) => `${pythonAsciiString(key)}: ${encoded}`).join(", ")}}`;
+	return createHash("sha256").update(serialized, "utf8").digest("hex").slice(0, 12);
+}
+
+type ReleasedAdjudicationDrop = { title: string; severity: string; source_file: string; reason: string };
+const adjudicationDropFields = new Set(["title", "severity", "source_file", "reason"]);
+const MAX_VERIFIED_LINEAGE_FINDINGS = 512;
+const MAX_LINEAGE_RESIDUAL_EDGE_VISITS = 1_000_000;
+
+function releasedAdjudicationDrops(value: unknown): ReleasedAdjudicationDrop[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const drops: ReleasedAdjudicationDrop[] = [];
+	for (const item of value) {
+		if (!isPlainRecord(item) || !hasOnlyFields(item, adjudicationDropFields) ||
+			![...adjudicationDropFields].every((field) => Object.hasOwn(item, field) && typeof item[field] === "string")) {
+			return undefined;
+		}
+		drops.push({ title: item.title, severity: item.severity, source_file: item.source_file, reason: item.reason });
+	}
+	return drops;
+}
+
+const survivorProjection = (finding: ReleasedFindingRecord) => JSON.stringify([
+	finding.locations, finding.proof, finding.source_file, finding.triage_decision,
+]);
+const dropProjection = (finding: ReleasedFindingRecord | ReleasedAdjudicationDrop) => JSON.stringify([
+	finding.title, finding.severity, finding.source_file,
+]);
+
+type ResidualEdge = { to: number; reverse: number; capacity: number };
+
+/** Check existence of a one-to-one released Phase 4.5 lineage without claiming a unique historical assignment. */
+function hasFeasibleFindingLineage(verifiedProposals: ReleasedFindingRecord[], survivors: ReleasedFindingRecord[],
+	drops: ReleasedAdjudicationDrop[]): boolean {
+	if (verifiedProposals.length > MAX_VERIFIED_LINEAGE_FINDINGS ||
+		verifiedProposals.length !== survivors.length + drops.length) return false;
+	const cells = new Map<string, Map<string, number>>();
+	const survivorDemand = new Map<string, number>();
+	const dropDemand = new Map<string, number>();
+	const dropCapacity = new Map<string, number>();
+	for (const proposal of verifiedProposals) {
+		const survivor = survivorProjection(proposal);
+		const drop = dropProjection(proposal);
+		const row = cells.get(survivor) ?? new Map<string, number>();
+		row.set(drop, (row.get(drop) ?? 0) + 1);
+		cells.set(survivor, row);
+		dropCapacity.set(drop, (dropCapacity.get(drop) ?? 0) + 1);
+	}
+	for (const survivor of survivors) {
+		const projection = survivorProjection(survivor);
+		survivorDemand.set(projection, (survivorDemand.get(projection) ?? 0) + 1);
+	}
+	for (const drop of drops) {
+		const projection = dropProjection(drop);
+		dropDemand.set(projection, (dropDemand.get(projection) ?? 0) + 1);
+	}
+	const survivorColumns = new Map<string, number>();
+	for (const projection of new Set([...dropCapacity.keys(), ...dropDemand.keys()])) {
+		const demand = dropDemand.get(projection) ?? 0;
+		const capacity = dropCapacity.get(projection) ?? 0;
+		if (demand > capacity) return false;
+		survivorColumns.set(projection, capacity - demand);
+	}
+	if ([...survivorColumns.values()].reduce((sum, value) => sum + value, 0) !== survivors.length) return false;
+
+	const survivorRows = [...new Set([...cells.keys(), ...survivorDemand.keys()])];
+	const dropColumns = [...survivorColumns.keys()];
+	const source = 0;
+	const rowStart = 1;
+	const columnStart = rowStart + survivorRows.length;
+	const sink = columnStart + dropColumns.length;
+	const graph: ResidualEdge[][] = Array.from({ length: sink + 1 }, () => []);
+	const addEdge = (from: number, to: number, capacity: number) => {
+		const forward = { to, reverse: graph[to].length, capacity };
+		const reverse = { to: from, reverse: graph[from].length, capacity: 0 };
+		graph[from].push(forward);
+		graph[to].push(reverse);
+	};
+	const rowNodes = new Map(survivorRows.map((projection, index) => [projection, rowStart + index]));
+	const columnNodes = new Map(dropColumns.map((projection, index) => [projection, columnStart + index]));
+	for (const projection of survivorRows) addEdge(source, rowNodes.get(projection)!, survivorDemand.get(projection) ?? 0);
+	for (const [survivor, row] of cells) {
+		for (const [drop, capacity] of row) addEdge(rowNodes.get(survivor)!, columnNodes.get(drop)!, capacity);
+	}
+	for (const [projection, demand] of survivorColumns) addEdge(columnNodes.get(projection)!, sink, demand);
+
+	let edgeVisits = 0;
+	let flow = 0;
+	while (flow < survivors.length) {
+		const levels = Array<number>(graph.length).fill(-1);
+		const queue = [source];
+		levels[source] = 0;
+		for (let index = 0; index < queue.length; index++) {
+			const node = queue[index];
+			for (const edge of graph[node]) {
+				if (++edgeVisits > MAX_LINEAGE_RESIDUAL_EDGE_VISITS) return false;
+				if (edge.capacity > 0 && levels[edge.to] < 0) {
+					levels[edge.to] = levels[node] + 1;
+					queue.push(edge.to);
+				}
+			}
+		}
+		if (levels[sink] < 0) return false;
+		const next = Array<number>(graph.length).fill(0);
+		const send = (node: number, available: number): number => {
+			if (node === sink) return available;
+			for (; next[node] < graph[node].length; next[node]++) {
+				const edge = graph[node][next[node]];
+				if (++edgeVisits > MAX_LINEAGE_RESIDUAL_EDGE_VISITS) return 0;
+				if (edge.capacity <= 0 || levels[edge.to] !== levels[node] + 1) continue;
+				const sent = send(edge.to, Math.min(available, edge.capacity));
+				if (sent > 0) {
+					edge.capacity -= sent;
+					graph[edge.to][edge.reverse].capacity += sent;
+					return sent;
+				}
+			}
+			return 0;
+		};
+		for (let sent = send(source, survivors.length - flow); sent > 0;
+			sent = send(source, survivors.length - flow)) flow += sent;
+		if (edgeVisits > MAX_LINEAGE_RESIDUAL_EDGE_VISITS) return false;
+	}
+	return true;
+}
+
 export async function inspectNativeAudit(artifactDir: string, exitCode: number): Promise<NativeAuditResult> {
 	try {
 		const completed = readNativeTerminal(artifactDir);
 		if (!completed) return { status: "failed", error: "Native audit state is unknown: no valid terminal evidence." };
 		const failures = [completed.stopped, completed.shutdownFailure, completed.preservationFailure,
 			completed.cleanupFailure, completed.persistenceFailure].filter(Boolean);
-		if (failures.length || completed.shutdown !== "verified") {
+		if (failures.length || completed.shutdown !== "verified" || completed.boundary !== "bubblewrap-pidfd") {
 			return { status: "failed", error: [...failures,
 				...(completed.retainedResources?.length ? [`Retained resources: ${completed.retainedResources.join(", ")}.`] : [])]
 				.join(" ") || "Native shutdown was not verified." };
@@ -443,12 +676,24 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 		if ((exitCode !== 0 || completed.exitCode !== 0) && !(result.status === "partial" && expansionLoss)) {
 			return { status: "failed", error: "Native pipeline exited unsuccessfully." };
 		}
-		if (!["completed", "partial"].includes(result.status) || result.sandbox?.agentfs !== true || !result.sandbox?.agentfsVersion || result.network !== "provider-only") {
+		if (!["completed", "partial"].includes(result.status) || result.sandbox?.external !== "bubblewrap" ||
+			result.sandbox?.bwrapVersion !== "0.12.0" ||
+			!isDeepStrictEqual(result.sandbox?.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
+			result.sandbox?.session !== "builtin" || result.network !== "provider-only") {
 			return { status: "failed", error: "Native runtime/sandbox completion evidence is missing." };
 		}
 		const manifest = await regularJson(path.join(artifactDir, "manifest.json"), artifactDir);
 		const request = await regularJson(path.join(artifactDir, "request.json"), artifactDir);
-		if (manifest.route?.version !== 1 || !isDeepStrictEqual(manifest.route, request.expectedRoute) ||
+		if (manifest.sandbox !== "bubblewrap" || manifest.bwrapVersion !== "0.12.0" ||
+			manifest.sessionSandbox !== "builtin" || request.sandbox !== "bubblewrap" ||
+			request.bwrapVersion !== "0.12.0" || request.sessionSandbox !== "builtin" ||
+			!isDeepStrictEqual(manifest.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
+			!isDeepStrictEqual(request.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
+			!isDeepStrictEqual(manifest.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
+			!isDeepStrictEqual(request.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
+			!isDeepStrictEqual(result.sandbox?.startup,
+				{ executable: "unshare", identity: PINNED_UNSHARE_IDENTITY }) ||
+			manifest.route?.version !== 1 || !isDeepStrictEqual(manifest.route, request.expectedRoute) ||
 			!isDeepStrictEqual(manifest.route, result.route) || result.provider !== manifest.route.provider ||
 			result.model !== manifest.route.model || result.requestedEffort !== manifest.route.reasoningEffort) {
 			return { status: "failed", error: "Native route completion evidence does not match preflight." };
@@ -476,13 +721,47 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 			Object.keys(state.truncated_files ?? {}).length || (state.metrics?.phase1_profile_failures ?? 0) > 0) {
 			return { status: "partial", error: "Native audit has incomplete or truncated coverage.", statePath };
 		}
-		if (!state.verification_state || !state.artifact_state || !Array.isArray(state.verified_findings) ||
-			!Array.isArray(state.proposed_findings) || Object.keys(state.verification_state).length < state.proposed_findings.length ||
-			Object.values(state.verification_state).some((entry: any) => !["verified", "discarded"].includes(entry.status)) ||
-			Object.keys(state.artifact_state).length !== state.verified_findings.length) {
-			return { status: "partial", error: "Native verification/artifact coverage is incomplete.", statePath };
+		const incomplete = () => ({ status: "partial" as const,
+			error: "Native verification/artifact coverage is incomplete.", statePath });
+		if (!Array.isArray(state.proposed_findings) || !Array.isArray(state.verified_findings) ||
+			!isPlainRecord(state.verification_state) || !isPlainRecord(state.artifact_state)) return incomplete();
+		const proposedFindings = state.proposed_findings.map(releasedFinding);
+		const proposedKeys = state.proposed_findings.map(nativeFindingKey);
+		if (proposedFindings.some((finding: ReleasedFindingRecord | undefined) => finding === undefined) ||
+			proposedKeys.some((key: string | undefined) => key === undefined) ||
+			new Set(proposedKeys).size !== proposedKeys.length) return incomplete();
+		const expectedProposalKeys = proposedKeys as string[];
+		if (Object.keys(state.verification_state).length !== expectedProposalKeys.length ||
+			expectedProposalKeys.some((key) => !Object.hasOwn(state.verification_state, key))) return incomplete();
+		const verifiedProposals: ReleasedFindingRecord[] = [];
+		for (let index = 0; index < expectedProposalKeys.length; index++) {
+			const entry = state.verification_state[expectedProposalKeys[index]];
+			if (!isPlainRecord(entry) || !["verified", "discarded"].includes(entry.status)) return incomplete();
+			if (entry.status === "verified") verifiedProposals.push(proposedFindings[index]!);
 		}
-		for (const entry of Object.values(state.artifact_state) as Record<string, any>[]) {
+		const verifiedFields = new Set(["finding", "correctness_reason", "rebuttal_reason", "reproducer"]);
+		const verifiedKeys: string[] = [];
+		const survivorFindings: ReleasedFindingRecord[] = [];
+		for (const verified of state.verified_findings) {
+			if (!isPlainRecord(verified) || !hasOnlyFields(verified, verifiedFields) ||
+				typeof verified.correctness_reason !== "string" || typeof verified.rebuttal_reason !== "string" ||
+				!(verified.reproducer == null || isPlainRecord(verified.reproducer))) return incomplete();
+			const finding = releasedFinding(verified.finding);
+			const key = nativeFindingKey(verified.finding);
+			if (!finding || !key) return incomplete();
+			survivorFindings.push(finding);
+			verifiedKeys.push(key);
+		}
+		const discardedValue = Object.hasOwn(state, "adjudication_discarded") ? state.adjudication_discarded : [];
+		const adjudicationDrops = releasedAdjudicationDrops(discardedValue);
+		if (!adjudicationDrops || !hasFeasibleFindingLineage(verifiedProposals, survivorFindings,
+			adjudicationDrops)) return incomplete();
+		if (new Set(verifiedKeys).size !== verifiedKeys.length ||
+			Object.keys(state.artifact_state).length !== verifiedKeys.length ||
+			verifiedKeys.some((key) => !Object.hasOwn(state.artifact_state, key))) return incomplete();
+		for (const key of verifiedKeys) {
+			const entry = state.artifact_state[key];
+			if (!isPlainRecord(entry)) return incomplete();
 			if (entry.status !== "written") return { status: "partial", error: "Native findings have unfinished artifacts.", statePath };
 			for (const [field, extension] of [["report_filename", "md"], ["patch_filename", "patch"]]) {
 				const name = entry[field];

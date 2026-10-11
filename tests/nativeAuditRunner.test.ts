@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { nativeTestPython as python } from "./nativePython.js";
+import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineUnshareIdentity,
+	recordOfflineUnshareIdentity } from "./nativeOfflinePython.js";
 import { readNativeTerminal } from "../extensions/native-audit.js";
 
 const runner = path.resolve(import.meta.dirname, "../scripts/native-audit-runner.cjs");
@@ -21,10 +23,14 @@ function fixture(failure: string, logOutput?: { stdout: Buffer; stderr: Buffer }
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-runner-"))); roots.push(root);
 	for (const name of ["snapshot", "runtime-bin", "evidence", "sandbox"]) fs.mkdirSync(path.join(root, name));
 	const session = `native-io-${path.basename(root)}`;
-	const sessionDir = path.join(root, ".agentfs", "run", session);
+	const sessionDir = path.join(root, ".bwrap", "run", session);
 	const marker = path.join(root, "external-executed");
 	const requestFile = path.join(root, "request-received");
-	const worker = path.join(root, "agentfs");
+	const worker = path.join(root, "bwrap");
+	const unshare = path.join(root, "unshare");
+	fs.writeFileSync(unshare, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
+	const offlinePython = installOfflinePython(root, python);
+	recordOfflineUnshareIdentity(root, unshare);
 	if (logOutput) for (const [name, bytes] of Object.entries(logOutput)) {
 		fs.writeFileSync(path.join(root, `expected-${name}.bin`), bytes);
 	}
@@ -32,7 +38,6 @@ function fixture(failure: string, logOutput?: { stdout: Buffer; stderr: Buffer }
 	// unauthorized external execution. No provider or OS isolation is used.
 	fs.writeFileSync(worker, `#!${process.execPath}
 const fs=require('node:fs'), path=require('node:path'), logOutput=${JSON.stringify(!!logOutput)};
-fs.mkdirSync(${JSON.stringify(sessionDir)},{recursive:true});
 fs.writeFileSync(${JSON.stringify(marker)},'external execution');
 process.on('SIGTERM',()=>{}); if(!logOutput)process.stdout.write('output');
 let input=''; process.stdin.on('data',chunk=>input+=chunk);
@@ -70,7 +75,9 @@ process.stdin.on('end',()=>{
 	// Keep ownership, cancellation, and deadline fixtures on their original budget.
 	const timeoutMs = logOutput ? 2000 : 1000;
 	fs.writeFileSync(path.join(root, "request.json"), JSON.stringify({ snapshot: path.join(root, "snapshot"),
-		evidence: path.join(root, "evidence"), session, agentfs: worker, python, timeoutMs }));
+		evidence: path.join(root, "evidence"), sandbox: "bubblewrap", unshare, bwrap: worker,
+		bwrapIdentity: nativeOfflineBwrapIdentity, unshareIdentity: nativeOfflineUnshareIdentity,
+		python: offlinePython, timeoutMs }));
 	if (failure.endsWith("-open")) fs.mkdirSync(path.join(root, failure === "stdout-open" ? "stdout.txt" : "stderr.txt"));
 	if (failure === "completion") fs.mkdirSync(path.join(root, "completed.json"));
 	if (failure === "both-terminal") for (const name of ["completed.json", "spawn-error.txt"]) fs.mkdirSync(path.join(root, name));
@@ -150,7 +157,7 @@ async function execute(f: ReturnType<typeof fixture>, failure: string) {
 }
 
 // Real wrappers, trusted Python bootstrap, live IPC, and real process groups.
-// Fixed transport executables are not proof of AgentFS isolation or providers.
+// Fixed transport executables are not proof of bubblewrap isolation or providers.
 describe("native-audit-runner short log writes", () => {
 	const expected = {
 		stdout: Buffer.from("stdout: \0雪🙂\n".repeat(40)),
@@ -223,7 +230,7 @@ describe("native-audit-runner short log writes", () => {
 });
 
 describe("native-audit-runner ownership and disconnected finalization", () => {
-	it("cannot execute AgentFS if the real wrapper dies before ownership notification", async () => {
+	it("cannot execute bubblewrap if the real wrapper dies before ownership notification", async () => {
 		const f = fixture("crash-before-notify"); const result = await execute(f, "crash-before-notify");
 		await wait(200);
 		expect(result.launcherPid).toBeGreaterThan(1);
@@ -237,12 +244,12 @@ describe("native-audit-runner ownership and disconnected finalization", () => {
 
 	it.each(["stdout-open", "stderr-open", "output", "output-close", "completion", "both-terminal",
 		"missing-ack", "invalid-ack", "disconnect-before-ack", "disconnect-after-ack", "disconnect-commit",
-		"disconnect-running", "disconnect-finalizing", "leader-exit", "no-ipc", "session-collision"])(
+		"disconnect-running", "disconnect-finalizing", "leader-exit", "no-ipc"])(
 		"establishes shutdown and terminal failure after %s without disk-derived signalling", async (failure) => {
 			const f = fixture(failure); const result = await execute(f, failure);
 			expect(result.code, result.output).not.toBe(0);
 			if (result.launcherPid) expect(() => process.kill(-result.launcherPid!, 0)).toThrow();
-			for (const name of ["snapshot", "runtime-bin", "sandbox"]) expect(fs.existsSync(path.join(f.root, name))).toBe(false);
+			for (const name of ["snapshot", "runtime-bin", "sandbox"]) expect(fs.existsSync(path.join(f.root, name))).toBe(failure === "disconnect-commit");
 			if (failure === "session-collision") expect(fs.readFileSync(path.join(f.sessionDir, "keep"), "utf8")).toBe("existing");
 			else expect(fs.existsSync(f.sessionDir)).toBe(false);
 			const term = readNativeTerminal(f.root);
@@ -250,9 +257,9 @@ describe("native-audit-runner ownership and disconnected finalization", () => {
 				expect(term).toBeUndefined(); expect(result.output).toMatch(/terminal.*could not be persisted/i);
 			} else {
 				expect(term, result.output).toBeDefined(); expect(term!.exitCode).not.toBe(0);
-				expect(term!.shutdown).toBe(result.launcherPid || failure === "no-ipc" ? "verified" : "not-started");
+				expect(term!.shutdown).toBe(failure === "disconnect-commit" ? "unverified" : result.launcherPid || failure === "no-ipc" ? "verified" : "not-started");
 			}
-			if (["missing-ack", "invalid-ack", "disconnect-before-ack", "disconnect-after-ack", "no-ipc", "session-collision"].includes(failure)) {
+			if (["missing-ack", "invalid-ack", "disconnect-before-ack", "disconnect-after-ack", "no-ipc"].includes(failure)) {
 				expect(result.ready).toBe(false); expect(fs.existsSync(f.marker)).toBe(false); expect(fs.existsSync(f.requestFile)).toBe(false);
 			}
 			if (["disconnect-running", "disconnect-finalizing", "completion", "both-terminal", "leader-exit"].includes(failure)) {
@@ -265,4 +272,10 @@ describe("native-audit-runner ownership and disconnected finalization", () => {
 			if (failure === "completion") expect(term!.persistenceFailure).toMatch(/completion/);
 		}, 12000,
 	);
+});
+
+it("leaves a colliding legacy AgentFS session untouched in bubblewrap mode", async () => {
+ const f = fixture("session-collision"); const result = await execute(f, "session-collision");
+ expect(result.code).not.toBe(0);
+ expect(fs.readFileSync(path.join(f.sessionDir,"keep"),"utf8")).toBe("existing");
 });

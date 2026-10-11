@@ -38,6 +38,25 @@ afterEach(() => {
 });
 
 describe("native-audit-lifecycle shared finalization", () => {
+	it("retains bubblewrap resources when group ESRCH lacks live namespace-init death proof", async () => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		fs.writeFileSync(path.join(f.runDir, "request.json"), JSON.stringify({ sandbox: "bubblewrap" }));
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
+		expect(term.shutdown).toBe("unverified"); expect(term.exitCode).toBe(1);
+		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(true);
+		expect(fs.existsSync(path.join(f.runDir, "evidence", "native-state"))).toBe(false);
+	});
+
+	it("exports bubblewrap evidence only after live namespace-init death proof", async () => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		fs.writeFileSync(path.join(f.runDir, "request.json"), JSON.stringify({ sandbox: "bubblewrap" }));
+		let checked = false;
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: { ...absent,
+			verify: async () => { expect(fs.existsSync(path.join(f.runDir, "evidence", "native-state"))).toBe(false); checked = true; return true; },
+		} }, { exitCode: 0 });
+		expect(checked).toBe(true); expect(term.shutdown).toBe("verified");
+		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
+	});
 	it("preserves byte-identical stopped evidence before removing all owned temporary resources", async () => {
 		const f = fixture();
 		const { finalizeNativeAudit, readNativeTerminal } = lifecycle();
@@ -225,6 +244,14 @@ describe("native-audit-lifecycle shared finalization", () => {
 		expect(term.shutdownFailure).toBeUndefined(); expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
 	});
 
+	it("never deletes a legacy AgentFS session from native finalization options", async () => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const sessionDir = path.join(f.runDir, "legacy-session"); fs.mkdirSync(sessionDir);
+		fs.writeFileSync(path.join(sessionDir, "keep"), "unchanged");
+		await finalizeNativeAudit({ runDir: f.runDir, ownership: absent, sessionDir, sessionOwned: true }, { exitCode: 1 });
+		expect(fs.readFileSync(path.join(sessionDir, "keep"), "utf8")).toBe("unchanged");
+	});
+
 	it("preserves pre-existing sessions rather than claiming cleanup ownership", async () => {
 		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
 		const sessionDir = path.join(f.runDir, "existing-session"); fs.mkdirSync(sessionDir);
@@ -241,7 +268,8 @@ describe("native-audit-lifecycle shared finalization", () => {
 		const link = path.join(f.runDir, "linked-session-root"); fs.symlinkSync(external, link);
 		const sessionDir = path.join(link, "fresh-session");
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent, sessionDir, sessionOwned: true }, { exitCode: 1 });
-		expect(term.cleanupFailure).toBeTruthy(); expect(term.retainedResources).toContain(sessionDir);
+		expect(term.cleanupFailure).toBeUndefined();
+		expect(fs.existsSync(sessionDir)).toBe(true);
 		expect(fs.readFileSync(path.join(actualSession, "keep"), "utf8")).toBe("unchanged");
 	});
 
@@ -257,13 +285,24 @@ describe("native-audit-lifecycle shared finalization", () => {
 		},
 	);
 
+	it("retains legacy group-only verified native records rather than claiming namespace proof", async () => {
+		const f = fixture(); const root = path.join(f.runDir, "runs"); const runDir = path.join(root, "legacy-native");
+		fs.mkdirSync(runDir, { recursive: true });
+		fs.writeFileSync(path.join(runDir, "run-meta.json"), JSON.stringify({ nativeAuditRequested: true }));
+		fs.writeFileSync(path.join(runDir, "completed.json"), JSON.stringify({ exitCode: 0,
+			exitedAt: new Date().toISOString(), shutdown: "verified" }));
+		const old = new Date(Date.now() - 10 * 24 * 60 * 60_000); fs.utimesSync(runDir, old, old);
+		await pruneOldArtifacts(root);
+		expect(fs.existsSync(runDir)).toBe(true);
+	});
+
 	it.each(["missing", "malformed", "unverified", "verified", "verified-fallback"])(
 		"prunes native resources only with valid shutdown evidence: %s", async (kind) => {
 			const f = fixture(); const root = path.join(f.runDir, "runs"); const runDir = path.join(root, "native");
 			fs.mkdirSync(runDir, { recursive: true });
 			fs.writeFileSync(path.join(runDir, "run-meta.json"), JSON.stringify({ nativeAuditRequested: true }));
 			if (kind !== "missing") fs.writeFileSync(path.join(runDir, kind === "verified-fallback" ? "spawn-error.txt" : "completed.json"),
-				kind === "malformed" ? "{" : JSON.stringify({ exitCode: 1, exitedAt: new Date().toISOString(),
+				kind === "malformed" ? "{" : JSON.stringify({ exitCode: 1, exitedAt: new Date().toISOString(), boundary: "bubblewrap-pidfd",
 					shutdown: kind === "unverified" ? "unverified" : "verified" }));
 			const old = new Date(Date.now() - 10 * 24 * 60 * 60_000); fs.utimesSync(runDir, old, old);
 			await pruneOldArtifacts(root);

@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
+import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineUnshareIdentity,
+	recordOfflineUnshareIdentity } from "./nativeOfflinePython.js";
 import { nativeTestPython as python } from "./nativePython.js";
 
 const bridge = path.resolve(import.meta.dirname, "../scripts/native_audit.py");
@@ -17,7 +19,7 @@ afterEach(() => {
 });
 function fixture() {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-launch-"))); roots.push(root);
-	const marker = path.join(root, "agentfs-marker");
+	const marker = path.join(root, "bwrap-marker");
 	fs.writeFileSync(marker, `#!${python}
 import json, os, sys
 try:
@@ -27,15 +29,22 @@ except OSError:
     control_closed = True
 print(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp(),'controlClosed':control_closed,'args':sys.argv[1:]}), flush=True)
 `, { mode: 0o755 });
-	const child = spawn(python, ["-I", "-B", bridge, "--launch", marker, root, root, "native-test"],
-		{ detached: true, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe"] }); children.push(child);
+	const unshare = path.join(root, "unshare");
+	fs.writeFileSync(unshare, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
+	const selected = installOfflinePython(root, python);
+	recordOfflineUnshareIdentity(root, unshare);
+	const request = { unshare, bwrap: marker, bwrapIdentity: nativeOfflineBwrapIdentity,
+		unshareIdentity: nativeOfflineUnshareIdentity,
+		snapshot: root, evidence: root, python: selected };
+	const child = spawn(selected, ["-I", "-B", bridge, "--launch", unshare, marker, root, root],
+		{ detached: true, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] }); children.push(child);
 	const control = child.stdio[3] as Writable;
 	let output = ""; let errors = "";
 	child.stdout!.on("data", (chunk) => { output += chunk; });
 	child.stderr!.on("data", (chunk) => { errors += chunk; });
 	control.on("error", () => {}); child.stdin!.on("error", () => {});
 	const exit = new Promise<number | null>((resolve) => child.once("close", (code) => resolve(code)));
-	return { child, control, exit, output: () => output, errors: () => errors, root, marker };
+	return { child, control, exit, output: () => output, errors: () => errors, root, marker, request };
 }
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -43,7 +52,7 @@ describe("native_audit.py trusted executable commit gate", () => {
 	it("does not execute a marker before commit, then replaces PID/PGID and closes control descriptors", async () => {
 		const f = fixture();
 		await wait(100); expect(f.output(), f.errors()).toBe("");
-		f.child.stdin!.end('{"request":"delivered before commit"}');
+		f.child.stdin!.end(JSON.stringify(f.request));
 		f.control.write("EXEC\n");
 		await wait(100); expect(f.output(), "A token without EOF must not commit").toBe("");
 		f.control.end();
@@ -51,12 +60,24 @@ describe("native_audit.py trusted executable commit gate", () => {
 		const marker = JSON.parse(f.output());
 		expect(marker.pid).toBe(f.child.pid); expect(marker.pgid).toBe(f.child.pid);
 		expect(marker.controlClosed).toBe(true);
-		expect(marker.args).toEqual(["run", "--no-default-allows", "--allow", f.root, "--allow", f.root,
-			"--session", "native-test", "--", python, "-I", "-B", bridge, "--run"]);
+		expect(marker.args).toEqual(["--unshare-user", "--disable-userns", "--unshare-pid",
+			"--unshare-ipc", "--die-with-parent", "--cap-drop", "ALL", "--ro-bind", "/", "/",
+			"--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--dev", "/dev", "--proc", "/proc",
+			"--bind", f.root, f.root, "--bind", f.root, f.root, "--chdir", f.root,
+			"--", f.request.python, "-I", "-B", bridge, "--run"]);
 	}, 5000);
 
+	it("rejects unshare launcher-scope drift before external execution", async () => {
+		const f = fixture();
+		f.request.unshare = path.join(f.root, "alternate-unshare");
+		f.child.stdin!.end(JSON.stringify(f.request));
+		f.control.end("EXEC\n");
+		expect(await f.exit, f.errors()).not.toBe(0);
+		expect(f.output()).toBe("");
+	});
+
 	it.each(["eof", "partial", "malformed", "oversize", "timeout", "cancel-before-token", "cancel-before-eof"])(
-		"does not execute AgentFS after pre-commit %s", async (failure) => {
+		"does not execute bubblewrap after pre-commit %s", async (failure) => {
 			const f = fixture();
 			if (failure === "eof") f.control.end();
 			if (failure === "partial") f.control.end("EXE");

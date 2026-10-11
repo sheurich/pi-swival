@@ -99,8 +99,8 @@ fi
 
 echo "PASS: AGENTFS=1 observed, real fixture filesystem untouched, overlay diff present."
 
-# Native audit uses an empty sandbox cwd and explicit write-through exceptions.
-# Verify those flags with synthetic source/Git-metadata sentinels, no provider.
+# Retain the legacy AgentFS explicit-write layout canary for compatibility.
+# Current native audits use bubblewrap; this does not prove native containment.
 if [[ -e "$native_run_dir" ]]; then
   echo "FAIL: refusing to reuse a pre-existing native canary session." >&2
   exit 1
@@ -145,11 +145,12 @@ with subprocess.Popen(argv, cwd=sandbox, start_new_session=True,
     try:
         code = child.wait(timeout=30)
     finally:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    assert code == 0, "native-layout AgentFS child failed"
+        if child.returncode is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    assert code == 0, "legacy-layout AgentFS child failed"
 assert (snapshot / "code.py").read_text() == "snapshot-changed"
 assert (evidence / "result.txt").read_text() == "preserved"
 source_unchanged = (source / "code.py").read_text() == "source-original"
@@ -160,13 +161,13 @@ if sys.platform == "darwin":
     print("BLOCKED: native Darwin isolation is unsupported; "
           f"source_unchanged={source_unchanged}, metadata_unchanged={metadata_unchanged}.")
 else:
-    assert source_unchanged, "native-layout source write reached host"
-    assert metadata_unchanged, "native-layout Git-metadata write reached host"
-    print("PASS: native-layout write exceptions persist; source and Git metadata stay unchanged.")
+    assert source_unchanged, "legacy-layout source write reached host"
+    assert metadata_unchanged, "legacy-layout Git-metadata write reached host"
+    print("PASS: legacy-layout write exceptions persist; source and Git metadata stay unchanged.")
 PY
 then
   [[ -e "$native_run_dir" ]] && owns_native_run_dir=true
-  echo "FAIL: native-layout AgentFS isolation canary failed." >&2
+  echo "FAIL: legacy-layout AgentFS isolation canary failed." >&2
   exit 1
 fi
 [[ -e "$native_run_dir" ]] && owns_native_run_dir=true
