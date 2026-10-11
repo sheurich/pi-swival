@@ -8,7 +8,7 @@ import * as os from "node:os";
 import { ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import registerExtension from "../extensions/index.js";
 import { nativeTestPython as python } from "./nativePython.js";
-import { installOfflinePython } from "./nativeOfflinePython.js";
+import { installOfflinePython, recordOfflineNonoIdentity } from "./nativeOfflinePython.js";
 
 vi.mock("node:fs", async (load) => {
 	const actual = await load<typeof import("node:fs")>();
@@ -47,13 +47,20 @@ function fixture(behavior = "complete") {
 	const artifacts = path.join(root, "artifacts");
 	const bin = path.join(root, "bin");
 	fs.mkdirSync(source); fs.mkdirSync(artifacts); fs.mkdirSync(bin);
+	const profilePack = path.join(root, ".config", "nono", "packages", "jedisct1", "swival");
+	fs.mkdirSync(path.join(profilePack, "profiles"), { recursive: true });
+	fs.writeFileSync(path.join(profilePack, "package.json"), JSON.stringify({ schema_version: 1, name: "swival",
+		artifacts: [{ type: "profile", path: "policy.json", install_as: "swival" }] }));
+	fs.writeFileSync(path.join(profilePack, "profiles", "swival.json"),
+		JSON.stringify({ extends: "default", meta: { name: "swival" } }));
 	const git = (...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: source, timeout: 5000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 	git("init", "--template="); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid");
 	fs.writeFileSync(path.join(source, "code.py"), behavior === "lost-expansion"
 		? 'def authorize(role):\n    """Role access-control decision: allow only admin."""\n    return True\n'
 		: "def answer(): return 42\n"); git("add", "."); git("commit", "-m", "fixture");
 	const before = git("show-ref");
-	fs.writeFileSync(path.join(bin, "nono"), "#!/bin/sh\necho 'nono 0.4.1'\n", { mode: 0o755 });
+	fs.writeFileSync(path.join(bin, "nono"), "#!/bin/sh\necho 'nono 0.79.0'\n", { mode: 0o755 });
+	recordOfflineNonoIdentity(root, path.join(bin, "nono"));
 	fs.writeFileSync(path.join(bin, "unshare"), "#!/bin/sh\necho 'offline unshare fixture must not execute' >&2\nexit 97\n", { mode: 0o755 });
 	// This is an offline sandbox/transport stub, not proof of real unshare, bubblewrap, or a provider.
 	fs.writeFileSync(path.join(bin, "bwrap"), `#!${process.execPath}
@@ -112,7 +119,7 @@ if (['patch','empty-report','blank-report','kill-evidence','disconnect-evidence'
 }
 fs.writeFileSync(path.join(stateDir,'state.json'),JSON.stringify(state));
 fs.writeFileSync(path.join(request.evidence,'native-result.json'), JSON.stringify({status:'completed', answer:'Native audit result',
- sandbox:{external:'bubblewrap',bwrapVersion:'0.12.0',bwrapIdentity:request.bwrapIdentity,startup:{executable:'unshare',identity:request.unshareIdentity},session:'builtin'}, network:'provider-only', scope:request.expectedScope,
+ sandbox:{external:'bubblewrap',bwrapVersion:'0.12.0',bwrapIdentity:request.bwrapIdentity,nonoIdentity:request.nonoIdentity,nonoProfileIdentity:request.nonoProfileIdentity,startup:{executable:'unshare',identity:request.unshareIdentity},session:'builtin'}, network:'provider-only', scope:request.expectedScope,
  route:request.expectedRoute,provider:request.expectedRoute.provider,model:request.expectedRoute.model,
  requestedEffort:request.expectedRoute.reasoningEffort}));
 if (${JSON.stringify(behavior)} === 'ordinary') fs.rmSync(stateDir,{recursive:true});
@@ -145,7 +152,7 @@ process.exit(0);
 });
 `, { mode: 0o755 });
 	process.env.HOME = root;
-	process.env.XDG_CONFIG_HOME = path.join(root, "config");
+	process.env.XDG_CONFIG_HOME = path.join(root, ".config");
 	process.env.PATH = `${bin}:${trustedPath}`;
 	let tool: any;
 	registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
@@ -191,7 +198,7 @@ try {
   process.exitCode = 1;
 }
 `);
-	const env: NodeJS.ProcessEnv = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: path.join(f.root, "config"),
+	const env: NodeJS.ProcessEnv = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: path.join(f.root, ".config"),
 		PI_CODING_AGENT_DIR: path.join(f.root, "agent"), PI_OFFLINE: "1" };
 	delete env.NODE_PATH;
 	for (const key of Object.keys(env)) if (key.startsWith("JITI_")) delete env[key];
@@ -243,7 +250,7 @@ try {
  process.send({type:'result',result},()=>process.exit(0));
 } catch(error){console.error(String(error).slice(0,8192));process.exit(1);}
 `);
-	const env: NodeJS.ProcessEnv = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: path.join(f.root, "config"),
+	const env: NodeJS.ProcessEnv = { ...process.env, HOME: f.root, XDG_CONFIG_HOME: path.join(f.root, ".config"),
 		PI_CODING_AGENT_DIR: path.join(f.root, "agent"), PI_OFFLINE: "1", NODE_OPTIONS: `--require=${preload}` };
 	delete env.NODE_PATH;
 	const proc = spawn(process.execPath, [origin], { cwd: f.root, env, shell: false, stdio: ["ignore", "pipe", "pipe", "ipc"] });
@@ -369,7 +376,7 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 
 	it.each(["model", "endpoint", "options"])("rejects %s route drift between preflights without launching", async (field) => {
 		const f = fixture();
-		const configDir = path.join(f.root, "config", "swival"); fs.mkdirSync(configDir, { recursive: true });
+		const configDir = path.join(f.root, ".config", "swival"); fs.mkdirSync(configDir, { recursive: true });
 		const config = path.join(configDir, "config.toml");
 		fs.writeFileSync(config, '[profiles.test]\nprovider="lmstudio"\nmodel="offline-A"\nbase_url="http://route-a.invalid"\n');
 		const params: any = { ...f.params, profileOverride: "test" }; delete params.modelOverride;
@@ -426,6 +433,36 @@ describe("native audit durable lifecycle (offline transport stub)", () => {
 		fs.writeFileSync(target, JSON.stringify(record));
 		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
 		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+	});
+
+	it.each(["manifest", "request", "result"])("rejects changed nono identity in %s completion evidence", async (field) => {
+		const f = fixture(); const initial = await f.call();
+		expect(initial.isError, initial.content[0].text).not.toBe(true);
+		const runDir = initial.details.results[0].artifactDir;
+		const target = path.join(runDir, field === "manifest" ? "manifest.json" :
+			field === "request" ? "request.json" : "evidence/native-result.json");
+		const record = JSON.parse(fs.readFileSync(target, "utf8"));
+		const identity = field === "result" ? record.sandbox.nonoIdentity : record.nonoIdentity;
+		identity.sha256 = "0".repeat(64);
+		fs.writeFileSync(target, JSON.stringify(record));
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+	});
+
+	it("rejects a missing or non-string nono request path", async () => {
+		const f = fixture(); const initial = await f.call();
+		expect(initial.isError, initial.content[0].text).not.toBe(true);
+		const runDir = initial.details.results[0].artifactDir;
+		const target = path.join(runDir, "request.json");
+		const original = JSON.parse(fs.readFileSync(target, "utf8"));
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		for (const value of [undefined, 7]) {
+			const request = structuredClone(original);
+			if (value === undefined) delete request.nono;
+			else request.nono = value;
+			fs.writeFileSync(target, JSON.stringify(request));
+			expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+		}
 	});
 
 	it("writes native metadata once and preserves its original bytes for fresh recovery", async () => {
@@ -659,6 +696,17 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		},
 	);
 
+	it("rejects a non-default XDG profile store before creating artifacts", async () => {
+		const f = fixture();
+		const alternate = path.join(f.root, "alternate-config");
+		fs.mkdirSync(alternate);
+		fs.cpSync(path.join(f.root, ".config", "nono"), path.join(alternate, "nono"), { recursive: true });
+		process.env.XDG_CONFIG_HOME = alternate;
+		const result = await f.call();
+		expect(result.isError).toBe(true);
+		expect(fs.readdirSync(f.artifacts)).toEqual([]);
+	});
+
 	it("pins the external virtualenv entry and binds the sandbox identity protocol", async () => {
 		const f = fixture();
 		const pythonDir = path.join(f.root, "python-install"); fs.symlinkSync(path.dirname(f.python), pythonDir);
@@ -678,6 +726,9 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 			packageVersion: "0.12.0-1~deb13u1", architecture: "arm64",
 			sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
 		});
+		expect(request.nonoIdentity).toEqual({ path: request.nono, version: "0.79.0",
+			architecture: "aarch64-unknown-linux-gnu", bytes: 26141064,
+			sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b" });
 		const imported = execFileSync(request.python, ["-I", "-B", "-c", "import importlib.metadata; print(importlib.metadata.version('swival'))"],
 			{ timeout: 5000, maxBuffer: 16384, env: { ...process.env, PYTHONPATH: f.source } }).toString().trim();
 		expect(imported).toBe("1.0.46");
@@ -711,6 +762,29 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 			if (!replaced && String(file).endsWith(`${path.sep}request.json`)) {
 				replaced = true;
 				fs.writeFileSync(path.join(f.root, "bin", "unshare"),
+					`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'executed');\n`,
+					{ mode: 0o755 });
+			}
+			return result;
+		});
+		try {
+			const result = await f.call();
+			expect(replaced).toBe(true);
+			expect(result.isError).toBe(true);
+			expect(fs.existsSync(marker)).toBe(false);
+		} finally { spy.mockRestore(); }
+	}, 15000);
+
+	it("rejects nono replacement after preparation without executing it", async () => {
+		const f = fixture();
+		const marker = path.join(f.root, "replaced-nono-executed");
+		const write = vi.mocked(fsPromises.writeFile).getMockImplementation()!;
+		let replaced = false;
+		const spy = vi.spyOn(fsPromises, "writeFile").mockImplementation(async (file, data, options) => {
+			const result = await write(file, data, options);
+			if (!replaced && String(file).endsWith(`${path.sep}request.json`)) {
+				replaced = true;
+				fs.writeFileSync(path.join(f.root, "bin", "nono"),
 					`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)},'executed');\n`,
 					{ mode: 0o755 });
 			}
@@ -763,10 +837,10 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 			const runDir = result.details.results[0].artifactDir;
 			const lookup = JSON.parse(fs.readFileSync(path.join(runDir, "evidence", "nono-lookup.json"), "utf8"));
 			expect(lookup.executable).toBe(canonical);
-			expect(lookup.version).toBe("nono 0.4.1");
+			expect(lookup.version).toBe("nono 0.79.0");
 			expect(lookup.wrapper[0]).toBe(path.join(runDir, "runtime-bin", "nono"));
 			expect(lookup.wrapper).toContain("--block-net");
-			expect(fs.readFileSync(canonical, "utf8")).toBe("#!/bin/sh\necho 'nono 0.4.1'\n");
+			expect(fs.readFileSync(canonical, "utf8")).toBe("#!/bin/sh\necho 'nono 0.79.0'\n");
 			expect(fs.existsSync(path.join(runDir, "runtime-bin"))).toBe(false);
 		} finally { spy.mockRestore(); }
 	}, 15000);
@@ -965,6 +1039,18 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 		expect(f.git("show-ref")).toBe(f.before);
 	}, 15000);
 
+	it("rejects an external fake nono before executing it or creating artifacts", async () => {
+		const f = fixture();
+		const marker = path.join(f.root, "fake-nono-executed");
+		fs.writeFileSync(path.join(f.root, "bin", "nono"),
+			`#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed');\nprocess.exit(0);\n`,
+			{ mode: 0o755 });
+		const result = await f.call();
+		expect(result.isError).toBe(true);
+		expect(fs.existsSync(marker)).toBe(false);
+		expect(fs.readdirSync(f.artifacts)).toEqual([]);
+	});
+
 	it("fails before artifacts when nono is unavailable; never falls back to unrestricted network", async () => {
 		const f = fixture();
 		fs.rmSync(path.join(f.root, "bin", "nono"));
@@ -1051,7 +1137,7 @@ if (${JSON.stringify(failure)}==='invalid-ownership') {
 
 it("runs released native entry-point regressions with stubbed LLM calls and a socket denial", () => {
 	// Match nativeEntry.test.ts: this whole suite includes five cold subprocesses.
-	const output = execFileSync(python, ["-I", path.join(ROOT, "tests", "native_audit_test.py")], {
+	const output = execFileSync(python, ["-I", "-B", path.join(ROOT, "tests", "native_audit_test.py")], {
 		cwd: ROOT, timeout: 60_000, maxBuffer: 256 * 1024, stdio: ["ignore", "pipe", "pipe"],
 	});
 	expect(output.toString()).not.toContain("provider/network forbidden");

@@ -15,6 +15,9 @@ const bwrapIdentity = { path: "/usr/bin/bwrap", version: "bubblewrap 0.12.0", pa
 const unshareIdentity = { path: "/usr/bin/unshare", version: "unshare from util-linux 2.41.5", package: "util-linux",
 	packageVersion: "2.41.5-0+deb13u1", architecture: "arm64",
 	sha256: "285119fd3989039d50f8904b619b2abb8b795cb56753eb0235c8c031eb880a21" };
+const nono = "/trusted/nono";
+const nonoIdentity = { path: nono, version: "0.79.0", architecture: "aarch64-unknown-linux-gnu",
+	bytes: 26141064, sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b" };
 
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -27,6 +30,10 @@ const producerOutput = (scenario: string, home: string) => JSON.parse(execFileSy
 function lineage(scenario: string) {
 	const artifactRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-lineage-"))); roots.push(artifactRoot);
 	const runId = `lineage-${scenario}`; const root = path.join(artifactRoot, runId); fs.mkdirSync(root);
+	const profilePack = path.join(root, "nono", "packages", "jedisct1", "swival");
+	const nonoProfileIdentity = { config: root, pack: profilePack,
+		manifest: { path: path.join(profilePack, "package.json"), bytes: 1, sha256: "2".repeat(64) },
+		profile: { path: path.join(profilePack, "profiles", "swival.json"), bytes: 1, sha256: "3".repeat(64) } };
 	const generated = producerOutput(scenario, root);
 	const expectedDecisions: Record<string, string[]> = { keep: ["keep"], rewrite: ["keep_with_changes"], drop: ["drop"],
 		mixed: ["keep_with_changes", "drop"], "projection-collision": ["keep_with_changes", "drop"] };
@@ -70,11 +77,13 @@ function lineage(scenario: string) {
 	fs.writeFileSync(path.join(root, "completed.json"), JSON.stringify({ exitCode: 0, exitedAt: new Date().toISOString(),
 		shutdown: "verified", boundary: "bubblewrap-pidfd" }));
 	fs.writeFileSync(path.join(root, "manifest.json"), JSON.stringify({ sandbox: "bubblewrap", bwrapVersion: "0.12.0",
-		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, route, scope, snapshotCommit: commit, audit: { all: true } }));
+		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, nono, nonoIdentity, nonoProfileIdentity,
+		route, scope, snapshotCommit: commit, audit: { all: true } }));
 	fs.writeFileSync(path.join(root, "request.json"), JSON.stringify({ sandbox: "bubblewrap", bwrapVersion: "0.12.0",
-		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, expectedRoute: route }));
+		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, nono, nonoIdentity, nonoProfileIdentity,
+		expectedRoute: route }));
 	fs.writeFileSync(path.join(evidence, "native-result.json"), JSON.stringify({ status: "completed", answer: "lineage corpus",
-		sandbox: { external: "bubblewrap", bwrapVersion: "0.12.0", bwrapIdentity,
+		sandbox: { external: "bubblewrap", bwrapVersion: "0.12.0", bwrapIdentity, nonoIdentity, nonoProfileIdentity,
 			startup: { executable: "unshare", identity: unshareIdentity }, session: "builtin" },
 		network: "provider-only", scope, route, provider: route.provider, model: route.model, requestedEffort: route.reasoningEffort }));
 	let tool: any;

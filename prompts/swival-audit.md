@@ -22,7 +22,7 @@ Requested effort is not guaranteed for every native phase. Swival 1.0.46 omits e
 
 Translate only confirmed relative path/glob tokens into the `audit.paths` array. Do not interpolate arguments into a shell command or send them as executable slash-script text. Ask about unsupported prose, exclusions, or threat-model requirements before proceeding.
 
-Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and nono. Native startup uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline transport tests do not prove OS isolation. There is no sandbox fallback.
+Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and the reviewed nono 0.79.0 ARM64 GNU artifact identity. Native startup uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline transport tests do not prove OS isolation. There is no sandbox fallback.
 
 Stop on protected encryption/filtering requirements or any unknown isolation requirement. Do not disable controls, install prerequisites, or use unrestricted network to make launch succeed.
 

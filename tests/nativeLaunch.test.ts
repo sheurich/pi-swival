@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Writable } from "node:stream";
-import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineUnshareIdentity,
+import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineNonoIdentity,
+	nativeOfflineUnshareIdentity, recordOfflineNonoIdentity,
 	recordOfflineUnshareIdentity } from "./nativeOfflinePython.js";
 import { nativeTestPython as python } from "./nativePython.js";
 
@@ -31,13 +32,17 @@ print(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp(),'controlClosed':control_
 `, { mode: 0o755 });
 	const unshare = path.join(root, "unshare");
 	fs.writeFileSync(unshare, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
+	const nono = path.join(root, "nono");
+	fs.writeFileSync(nono, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
 	const selected = installOfflinePython(root, python);
 	recordOfflineUnshareIdentity(root, unshare);
+	recordOfflineNonoIdentity(root, nono);
 	const request = { unshare, bwrap: marker, bwrapIdentity: nativeOfflineBwrapIdentity,
-		unshareIdentity: nativeOfflineUnshareIdentity,
+		unshareIdentity: nativeOfflineUnshareIdentity, nono, nonoIdentity: nativeOfflineNonoIdentity(nono),
 		snapshot: root, evidence: root, python: selected };
 	const child = spawn(selected, ["-I", "-B", bridge, "--launch", unshare, marker, root, root],
-		{ detached: true, shell: false, stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] }); children.push(child);
+		{ detached: true, shell: false, env: { ...process.env, PATH: `${root}:${process.env.PATH ?? ""}` },
+			stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] }); children.push(child);
 	const control = child.stdio[3] as Writable;
 	let output = ""; let errors = "";
 	child.stdout!.on("data", (chunk) => { output += chunk; });

@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { nativeTestPython as python } from "./nativePython.js";
-import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineUnshareIdentity,
+import { installOfflinePython, nativeOfflineBwrapIdentity, nativeOfflineNonoIdentity,
+	nativeOfflineUnshareIdentity, recordOfflineNonoIdentity,
 	recordOfflineUnshareIdentity } from "./nativeOfflinePython.js";
 import { readNativeTerminal } from "../extensions/native-audit.js";
 
@@ -29,8 +30,12 @@ function fixture(failure: string, logOutput?: { stdout: Buffer; stderr: Buffer }
 	const worker = path.join(root, "bwrap");
 	const unshare = path.join(root, "unshare");
 	fs.writeFileSync(unshare, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
+	const nono = path.join(root, "nono");
+	fs.writeFileSync(nono, "#!/bin/sh\nexit 97\n", { mode: 0o755 });
+	fs.symlinkSync(nono, path.join(root, "runtime-bin", "nono"));
 	const offlinePython = installOfflinePython(root, python);
 	recordOfflineUnshareIdentity(root, unshare);
+	recordOfflineNonoIdentity(root, nono);
 	if (logOutput) for (const [name, bytes] of Object.entries(logOutput)) {
 		fs.writeFileSync(path.join(root, `expected-${name}.bin`), bytes);
 	}
@@ -75,8 +80,10 @@ process.stdin.on('end',()=>{
 	// Keep ownership, cancellation, and deadline fixtures on their original budget.
 	const timeoutMs = logOutput ? 2000 : 1000;
 	fs.writeFileSync(path.join(root, "request.json"), JSON.stringify({ snapshot: path.join(root, "snapshot"),
-		evidence: path.join(root, "evidence"), sandbox: "bubblewrap", unshare, bwrap: worker,
+		evidence: path.join(root, "evidence"), sandbox: "bubblewrap", unshare, bwrap: worker, nono,
 		bwrapIdentity: nativeOfflineBwrapIdentity, unshareIdentity: nativeOfflineUnshareIdentity,
+		nonoIdentity: nativeOfflineNonoIdentity(nono),
+		runtimePath: [path.join(root, "runtime-bin"), process.env.PATH].join(path.delimiter),
 		python: offlinePython, timeoutMs }));
 	if (failure.endsWith("-open")) fs.mkdirSync(path.join(root, failure === "stdout-open" ? "stdout.txt" : "stderr.txt"));
 	if (failure === "completion") fs.mkdirSync(path.join(root, "completed.json"));

@@ -2,17 +2,19 @@
 # pylint: disable=import-outside-toplevel,protected-access,missing-function-docstring
 import contextlib
 import errno
+import hashlib
 import importlib.util
 import io
 import json
 import operator
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 os.environ['LITELLM_LOCAL_MODEL_COST_MAP'] = 'True'
 SPEC = importlib.util.spec_from_file_location(
@@ -21,8 +23,302 @@ bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
 
+def synthetic_profile_identity(config="/trusted/config"):
+    pack = f"{config}/nono/packages/jedisct1/swival"
+    return {"config": config, "pack": pack,
+            "manifest": {"path": f"{pack}/package.json", "bytes": 1,
+                         "sha256": "2" * 64},
+            "profile": {"path": f"{pack}/profiles/swival.json", "bytes": 1,
+                        "sha256": "3" * 64}}
+
+
+def write_local_profile_pack(home, *, include_manifest=True, include_profile=True):
+    """Create only the loader inputs, without a parent package lockfile."""
+    pack = home / ".config" / "nono" / "packages" / "jedisct1" / "swival"
+    profiles = pack / "profiles"
+    profiles.mkdir(parents=True)
+    if include_manifest:
+        (pack / "package.json").write_text(json.dumps({
+            "schema_version": 1, "name": "swival",
+            "artifacts": [{"type": "profile", "path": "policy.json",
+                           "install_as": "swival"}],
+        }), encoding="utf-8")
+    if include_profile:
+        (profiles / "swival.json").write_text(
+            json.dumps({"extends": "default", "meta": {"name": "swival"}}),
+            encoding="utf-8")
+    return pack
+
+
+# Identity, boundary, and auth controls share one release-pinned fixture.
+# pylint: disable-next=too-many-public-methods
 class NativeBubblewrapTests(unittest.TestCase):
     """Named controls use fixed synthetic inputs, no credentials or HTTP."""
+
+    @staticmethod
+    def synthetic_nono(root, machine=183):
+        """Build inert ELF-shaped bytes; this fixture is not a live artifact proof."""
+        executable = Path(root).resolve() / "nono"
+        content = bytearray(96)
+        content[:7] = b"\x7fELF\x02\x01\x01"
+        content[16:18] = (2).to_bytes(2, "little")
+        content[18:20] = machine.to_bytes(2, "little")
+        executable.write_bytes(content)
+        executable.chmod(0o755)
+        identity = {**bridge.NONO_ARTIFACT_IDENTITY, "bytes": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest()}
+        return executable, identity
+
+    def test_safe_authenticated_nono_identity_uses_version_only_after_bytes(self):
+        validate = getattr(bridge, "validate_nono_identity", None)
+        self.assertTrue(callable(validate), "nono needs pre-execution artifact authentication")
+        with tempfile.TemporaryDirectory() as root:
+            executable, identity = self.synthetic_nono(root)
+            missing = OSError(errno.ENODATA, "no capabilities")
+            with patch.object(bridge, "NONO_ARTIFACT_IDENTITY", identity), \
+                 patch.object(bridge.os, "getxattr", side_effect=missing, create=True), \
+                 patch.object(bridge.os, "uname",
+                              return_value=SimpleNamespace(machine="arm64")), \
+                 patch.object(bridge, "_nono_version",
+                              return_value="nono 0.79.0") as version:
+                actual = bridge.validate_nono_identity(str(executable))
+            self.assertEqual(actual, {"path": str(executable), **identity})
+            version.assert_called_once_with(executable)
+
+    def test_nono_rejects_unknown_hash_architecture_and_version(self):
+        for failure in ("hash", "architecture", "version"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                executable, identity = self.synthetic_nono(
+                    root, machine=62 if failure == "architecture" else 183)
+                if failure == "hash":
+                    identity["sha256"] = "0" * 64
+                missing = OSError(errno.ENODATA, "no capabilities")
+                version_value = "nono 9.9.9" if failure == "version" else "nono 0.79.0"
+                with patch.object(bridge, "NONO_ARTIFACT_IDENTITY", identity), \
+                     patch.object(bridge.os, "getxattr", side_effect=missing, create=True), \
+                     patch.object(bridge.os, "uname",
+                                  return_value=SimpleNamespace(machine="arm64")), \
+                     patch.object(bridge, "_nono_version",
+                                  return_value=version_value) as version, \
+                     self.assertRaisesRegex(bridge.NativeAuditError, failure):
+                    bridge.validate_nono_identity(str(executable))
+                if failure == "version":
+                    version.assert_called_once_with(executable)
+                else:
+                    version.assert_not_called()
+
+    def test_nono_rejects_unsafe_owner_mode_ancestry_and_noncanonical_entry(self):
+        for failure in ("owner", "group-write", "privilege", "ancestor", "symlink"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                executable, identity = self.synthetic_nono(root)
+                selected = executable
+                uid = os.getuid()
+                if failure == "owner":
+                    uid += 10000
+                elif failure == "group-write":
+                    executable.chmod(0o775)
+                elif failure == "privilege":
+                    executable.chmod(0o4755)
+                elif failure == "ancestor":
+                    Path(root).chmod(0o777)
+                elif failure == "symlink":
+                    selected = Path(root) / "nono-entry"
+                    selected.symlink_to(executable)
+                with patch.object(bridge, "NONO_ARTIFACT_IDENTITY", identity), \
+                     patch.object(bridge.os, "getuid", return_value=uid), \
+                     patch.object(bridge, "_nono_version") as version, \
+                     self.assertRaises(bridge.NativeAuditError):
+                    bridge.validate_nono_identity(str(selected))
+                version.assert_not_called()
+
+    def test_nono_capability_inspection_has_no_fallback(self):
+        cases = (
+            ("absent-api", None),
+            ("present", b""),
+            ("unverifiable", OSError(errno.EOPNOTSUPP, "unsupported")),
+        )
+        for name, outcome in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                executable, identity = self.synthetic_nono(root)
+                capability = (patch.object(bridge.os, "getxattr", None, create=True)
+                              if outcome is None else
+                              patch.object(bridge.os, "getxattr",
+                                           side_effect=outcome if isinstance(outcome, OSError)
+                                           else None, return_value=outcome, create=True))
+                with patch.object(bridge, "NONO_ARTIFACT_IDENTITY", identity), capability, \
+                     patch.object(bridge, "_nono_version") as version, \
+                     self.assertRaisesRegex(bridge.NativeAuditError, "capabilit"):
+                    bridge.validate_nono_identity(str(executable))
+                version.assert_not_called()
+
+    def test_identity_process_stop_never_signals_an_already_reaped_process(self):
+        process = SimpleNamespace(returncode=0, pid=123, kill=Mock(), wait=Mock())
+        with patch.object(bridge.os, "killpg") as kill_group:
+            bridge._stop_identity_process(process)
+        kill_group.assert_not_called()
+        process.kill.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_nono_version_query_has_fixed_argv_timeout_and_output_cap(self):
+        """Exercise only the inert command helper, not artifact authentication."""
+        with tempfile.TemporaryDirectory() as root:
+            executable = Path(root).resolve() / "nono"
+            executable.write_text(
+                f"#!{sys.executable}\nimport os, sys\n"
+                "assert sys.argv[1:] == ['--version']\n"
+                "assert os.environ.get('NONO_NO_UPDATE_CHECK') == '1'\n"
+                "print('nono 0.79.0')\n")
+            executable.chmod(0o755)
+            self.assertEqual(bridge._nono_version(executable), "nono 0.79.0")
+            executable.write_text(
+                f"#!{sys.executable}\nprint('x' * {bridge._NONO_OUTPUT_LIMIT + 1})\n")
+            with self.assertRaises(bridge.NativeAuditError):
+                bridge._nono_version(executable)
+            executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(1)\n")
+            with patch.object(bridge, "_NONO_COMMAND_TIMEOUT", 0.05), \
+                 self.assertRaises(bridge.NativeAuditError):
+                bridge._nono_version(executable)
+
+    def test_local_profile_uses_default_store_without_lockfile(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home)
+            for target in (pack / "package.json", pack / "profiles" / "swival.json"):
+                target.chmod(0o444)
+            for target in (pack / "profiles", pack):
+                target.chmod(0o555)
+            try:
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    identity = bridge.validate_nono_profile_identity()
+                    self.assertEqual(identity["pack"], str(pack))
+                    self.assertFalse((pack.parent.parent / "lockfile.json").exists())
+                    with patch.dict(os.environ,
+                                    {"XDG_CONFIG_HOME": str(home / ".config")}, clear=False):
+                        self.assertEqual(bridge.validate_nono_profile_identity(), identity)
+            finally:
+                pack.chmod(0o755)
+                (pack / "profiles").chmod(0o755)
+
+    def test_local_profile_rejects_stale_lockfile_missing_and_unsafe_inputs(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home, include_manifest=False)
+            (pack.parent.parent / "lockfile.json").write_text(
+                json.dumps({"packages": {"jedisct1/swival": {}}}), encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                with self.assertRaises(bridge.NativeAuditError):
+                    bridge.validate_nono_profile_identity()
+                (pack / "package.json").write_text(json.dumps({
+                    "schema_version": 1, "name": "swival",
+                    "artifacts": [{"type": "profile", "path": "policy.json",
+                                   "install_as": "swival"}],
+                }), encoding="utf-8")
+                (pack / "profiles" / "swival.json").unlink()
+                with self.assertRaises(bridge.NativeAuditError):
+                    bridge.validate_nono_profile_identity()
+                outside = home / "outside-profile.json"
+                outside.write_text("{}", encoding="utf-8")
+                (pack / "profiles" / "swival.json").symlink_to(outside)
+                with self.assertRaises(bridge.NativeAuditError):
+                    bridge.validate_nono_profile_identity()
+
+    def test_local_profile_rejects_ambiguous_profile_artifacts(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home)
+            (pack / "profiles" / "other.json").write_text("{}", encoding="utf-8")
+            (pack / "package.json").write_text(json.dumps({
+                "schema_version": 1, "name": "swival",
+                "artifacts": [
+                    {"type": "profile", "path": "other.json", "install_as": "other"},
+                    {"type": "profile", "path": "policy.json", "install_as": "swival"},
+                ],
+            }), encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                with self.assertRaises(bridge.NativeAuditError):
+                    bridge.validate_nono_profile_identity()
+
+    def test_nondefault_xdg_rejects_before_executable_or_provider_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root).resolve()
+            home = root_path / "home"
+            alternate_home = root_path / "alternate-home"
+            home.mkdir()
+            alternate_home.mkdir()
+            write_local_profile_pack(home)
+            write_local_profile_pack(alternate_home)
+            xdg = alternate_home / ".config"
+            route = Mock(return_value=({}, {}))
+            executable = Mock(side_effect=AssertionError("nono executable activity"))
+            with patch.dict(os.environ, {"HOME": str(home),
+                                         "XDG_CONFIG_HOME": str(xdg)}, clear=False), \
+                 patch.object(bridge, "resolve_native_config", route), \
+                 patch.object(bridge, "_nono_version", executable), \
+                 patch.object(bridge.sys, "argv", ["native_audit.py", "--preflight"]), \
+                 patch.object(bridge.sys, "stdin", io.StringIO("{}")), \
+                 self.assertRaises(bridge.NativeAuditError):
+                bridge.main()
+            route.assert_called_once_with({})
+            executable.assert_not_called()
+
+    def test_bound_nono_sdk_suppresses_the_released_unbounded_package_query(self):
+        from swival import sandbox_nono
+
+        with tempfile.TemporaryDirectory() as root:
+            executable = Path(root).resolve() / "reviewed-nono"
+            executable.write_bytes(b"reviewed")
+            identity = {"path": str(executable), **bridge.NONO_ARTIFACT_IDENTITY}
+            request = {"nono": str(executable), "nonoIdentity": identity,
+                       "nonoProfileIdentity": {"pack": "/trusted/profile"}}
+            with patch.object(bridge, "_revalidate_nono", return_value=identity), \
+                 patch.object(bridge, "_revalidate_nono_profile") as local_profile, \
+                 patch.object(sandbox_nono, "profile_pack_installed",
+                              side_effect=AssertionError("unbounded SDK query")) as released:
+                with self.assertRaisesRegex(RuntimeError, "session setup"):
+                    with bridge._bound_nono_sdk(request):
+                        self.assertTrue(sandbox_nono.profile_pack_installed(
+                            str(executable), sandbox_nono.WRAPPER_PROFILE))
+                        with self.assertRaises(bridge.NativeAuditError):
+                            sandbox_nono.profile_pack_installed(str(executable), "other/profile")
+                        with patch.object(Path, "resolve",
+                                          side_effect=RuntimeError("resolution failure")), \
+                             self.assertRaisesRegex(RuntimeError, "resolution failure"):
+                            sandbox_nono.profile_pack_installed(
+                                str(executable), sandbox_nono.WRAPPER_PROFILE)
+                        raise RuntimeError("session setup")
+                self.assertIs(sandbox_nono.profile_pack_installed, released)
+                local_profile.side_effect = RuntimeError("profile failure")
+                with self.assertRaisesRegex(RuntimeError, "profile failure"):
+                    with bridge._bound_nono_sdk(request):
+                        self.fail("unexpected profile failure was swallowed")
+                self.assertIs(sandbox_nono.profile_pack_installed, released)
+            self.assertEqual(local_profile.call_args_list,
+                             [call(request, host_path=False),
+                              call(request, host_path=False)])
+            released.assert_not_called()
+
+    def test_sdk_nono_resolution_accepts_only_the_bound_canonical_target(self):
+        from swival import sandbox_nono
+
+        with tempfile.TemporaryDirectory() as root:
+            canonical_root = Path(root).resolve()
+            expected = canonical_root / "reviewed-nono"
+            alternate = canonical_root / "alternate-nono"
+            expected.write_bytes(b"reviewed")
+            alternate.write_bytes(b"alternate")
+            entry = canonical_root / "nono"
+            entry.symlink_to(expected)
+            with patch.object(sandbox_nono, "_find_nono", return_value=str(entry)):
+                bridge._verify_sdk_nono_resolution(str(expected))
+            with patch.object(sandbox_nono, "_find_nono", return_value=str(alternate)), \
+                 self.assertRaisesRegex(bridge.NativeAuditError, "changed"):
+                bridge._verify_sdk_nono_resolution(str(expected))
 
     def test_final_mountinfo_rejects_propagation_and_unknown_optional_fields(self):
         validate = getattr(bridge, '_validate_private_mountinfo', None)
@@ -42,6 +338,10 @@ class NativeBubblewrapTests(unittest.TestCase):
         request = {'sandbox': 'bubblewrap', 'bwrapVersion': '0.12.0',
                    'bwrapIdentity': dict(bridge.BWRAP_IDENTITY),
                    'unshareIdentity': dict(bridge.UNSHARE_IDENTITY),
+                   'nono': '/trusted/nono',
+                   'nonoIdentity': {'path': '/trusted/nono',
+                                    **bridge.NONO_ARTIFACT_IDENTITY},
+                   'nonoProfileIdentity': synthetic_profile_identity(),
                    'sessionSandbox': 'builtin'}
         rejection = bridge.NativeAuditError('synthetic final propagation rejection')
         with patch.object(bridge.sys, 'platform', 'linux'), \
@@ -106,7 +406,7 @@ class NativeBubblewrapTests(unittest.TestCase):
             operator.call(validate, str(executable), bridge.BWRAP_IDENTITY, 'bubblewrap')
         command.assert_not_called()
 
-    def test_probe_revalidates_both_launchers_before_supervisor(self):
+    def test_probe_revalidates_all_launchers_before_supervisor(self):
         request = {'unshare': '/usr/bin/unshare', 'bwrap': '/usr/bin/bwrap',
                    'python': '/usr/bin/python3'}
         reached = []
@@ -127,6 +427,26 @@ class NativeBubblewrapTests(unittest.TestCase):
              patch.object(bridge, 'supervise_bubblewrap', side_effect=supervise):
             bridge.main()
         self.assertEqual(reached, ['identities', 'supervisor'])
+
+    def test_launcher_revalidation_includes_bound_nono_identity(self):
+        request = {"unshare": "/usr/bin/unshare", "bwrap": "/usr/bin/bwrap",
+                   "nono": "/trusted/nono",
+                   "unshareIdentity": dict(bridge.UNSHARE_IDENTITY),
+                   "bwrapIdentity": dict(bridge.BWRAP_IDENTITY),
+                   "nonoIdentity": {"path": "/trusted/nono",
+                                    **bridge.NONO_ARTIFACT_IDENTITY},
+                   "nonoProfileIdentity": synthetic_profile_identity()}
+        with patch.object(bridge, "validate_unshare_identity",
+                          return_value=request["unshareIdentity"]), \
+             patch.object(bridge, "validate_bwrap_identity",
+                          return_value=request["bwrapIdentity"]), \
+             patch.object(bridge, "_revalidate_nono",
+                          return_value=request["nonoIdentity"]) as nono, \
+             patch.object(bridge, "_revalidate_nono_profile",
+                          return_value=request["nonoProfileIdentity"]) as profile:
+            bridge._revalidate_launchers(request)
+        nono.assert_called_once_with(request)
+        profile.assert_called_once_with(request)
 
     def test_private_mounts_rebind_canonical_visibility_before_write_grants(self):
         build = getattr(bridge, 'bubblewrap_argv', None)

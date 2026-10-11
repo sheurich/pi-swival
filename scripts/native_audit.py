@@ -5,7 +5,7 @@ non-secret route metadata leaves memory; diagnostics never include configuration
 """
 
 # Swival imports remain lazy so preflight cannot initialize a provider.
-# pylint: disable=import-outside-toplevel
+# pylint: disable=import-outside-toplevel,too-many-lines
 
 import argparse
 import contextlib
@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import select
+import selectors
 import signal
 import stat
 import subprocess
@@ -73,6 +74,22 @@ BWRAP_IDENTITY = {
     "architecture": "arm64",
     "sha256": "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
 }
+# Reviewed regular member of the authenticated 0.79.0 ARM64 GNU release archive
+# with SHA-256 c4a4f4b9ae318574d30d352127a34dcc919c4d6682ee8fbd30bb8d2bd2e0e85d.
+NONO_ARTIFACT_IDENTITY = {
+    "version": "0.79.0",
+    "architecture": "aarch64-unknown-linux-gnu",
+    "bytes": 26141064,
+    "sha256": "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b",
+}
+_NONO_IDENTITY_KEYS = {"path", *NONO_ARTIFACT_IDENTITY}
+_NONO_OUTPUT_LIMIT = 16 * 1024
+_NONO_COMMAND_TIMEOUT = 5
+_NONO_WRAPPER_PROFILE = "jedisct1/swival"
+_NONO_MANIFEST_LIMIT = 64 * 1024
+_NONO_PROFILE_LIMIT = 1024 * 1024
+_NONO_PROFILE_IDENTITY_KEYS = {"config", "pack", "manifest", "profile"}
+_NONO_FILE_IDENTITY_KEYS = {"path", "bytes", "sha256"}
 _VERTEX_SELECTOR = None
 _VERTEX_SELECTOR_LOCK = threading.Lock()
 CREDENTIAL_PATTERN = re.compile(
@@ -647,6 +664,408 @@ def validate_bwrap_identity(executable):
     return _validate_launcher_identity(executable, BWRAP_IDENTITY, "bubblewrap")
 
 
+def _trusted_nono_executable(executable, *, host_path=True):
+    """Require a canonical executable protected from other-user replacement."""
+    if not isinstance(executable, str) or not os.path.isabs(executable):
+        raise NativeAuditError("Native nono identity is unavailable.")
+    candidate = Path(executable)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise NativeAuditError("Native nono identity is unavailable.") from exc
+    if str(candidate) != executable or str(resolved) != executable:
+        raise NativeAuditError("Native nono executable is not canonical.")
+    trusted_uids = {0, os.getuid()}
+    try:
+        if host_path:
+            for ancestor in reversed(resolved.parents):
+                metadata = ancestor.lstat()
+                writable = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                if (not stat.S_ISDIR(metadata.st_mode) or ancestor.is_symlink()
+                        or metadata.st_uid not in trusted_uids
+                        or (writable and not metadata.st_mode & stat.S_ISVTX)):
+                    raise NativeAuditError("Native nono path ancestry is not trusted.")
+        metadata = resolved.lstat()
+    except OSError as exc:
+        raise NativeAuditError("Native nono path ancestry is unavailable.") from exc
+    unsafe = stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID
+    trusted = all((stat.S_ISREG(metadata.st_mode),
+                   not host_path or metadata.st_uid in trusted_uids,
+                   not metadata.st_mode & unsafe, bool(metadata.st_mode & 0o111),
+                   os.access(resolved, os.X_OK)))
+    if not trusted:
+        raise NativeAuditError("Native nono executable ownership or mode is not trusted.")
+    if metadata.st_size != NONO_ARTIFACT_IDENTITY["bytes"]:
+        raise NativeAuditError("Native nono executable size is unsupported.")
+    return resolved, metadata
+
+
+def _verify_nono_capabilities(resolved):
+    """Require a supported capability API to prove the xattr is absent."""
+    getxattr = getattr(os, "getxattr", None)
+    if not callable(getxattr):
+        raise NativeAuditError("Native nono file capabilities are unverifiable.")
+    try:
+        operator.call(getxattr, resolved, "security.capability", follow_symlinks=False)
+    except OSError as exc:
+        absent = {errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA)}
+        if exc.errno not in absent:
+            raise NativeAuditError(
+                "Native nono file capabilities are unverifiable.") from exc
+    else:
+        raise NativeAuditError("Native nono file capabilities are unsupported.")
+
+
+def _nono_artifact_digest(resolved, metadata):
+    """Hash exactly the reviewed byte count and verify an ARM64 Linux ELF header."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(resolved, flags)
+        opened = os.fstat(descriptor)
+        before = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+                  metadata.st_gid, metadata.st_size)
+        after = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+                 opened.st_gid, opened.st_size)
+        if before != after or not stat.S_ISREG(opened.st_mode):
+            raise NativeAuditError("Native nono executable changed during authentication.")
+        digest = hashlib.sha256()
+        header = bytearray()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024,
+                            NONO_ARTIFACT_IDENTITY["bytes"] + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > NONO_ARTIFACT_IDENTITY["bytes"]:
+                raise NativeAuditError("Native nono executable size is unsupported.")
+            if len(header) < 20:
+                header.extend(chunk[:20 - len(header)])
+            digest.update(chunk)
+    except OSError as exc:
+        raise NativeAuditError("Native nono executable bytes are unavailable.") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if total != NONO_ARTIFACT_IDENTITY["bytes"]:
+        raise NativeAuditError("Native nono executable size is unsupported.")
+    machine = os.uname().machine.lower()
+    if (header[:4] != b"\x7fELF" or header[4:7] != bytes((2, 1, 1))
+            or int.from_bytes(header[18:20], "little") != 183
+            or machine not in {"aarch64", "arm64"}):
+        raise NativeAuditError("Native nono ELF architecture is unsupported.")
+    return digest.hexdigest()
+
+
+def _stop_identity_process(process):
+    if process is None or process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+# Keep process creation, bounded pipe reads, timeout, and teardown in one scope.
+# pylint: disable-next=too-many-branches,too-many-locals
+def _bounded_nono_version(resolved):
+    """Run only authenticated ``nono --version`` with fixed limits."""
+    environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+                   "NONO_NO_UPDATE_CHECK": "1"}
+    process = None
+    selector = selectors.DefaultSelector()
+    streams = []
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    try:
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
+            [str(resolved), "--version"], cwd="/", env=environment, shell=False,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True, close_fds=True)
+        streams = [process.stdout, process.stderr]
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        deadline = time.monotonic() + _NONO_COMMAND_TIMEOUT
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(str(resolved), _NONO_COMMAND_TIMEOUT)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(str(resolved), _NONO_COMMAND_TIMEOUT)
+            for key, _mask in events:
+                chunk = os.read(key.fd, 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffers[key.data].extend(chunk)
+                if len(buffers[key.data]) > _NONO_OUTPUT_LIMIT:
+                    raise NativeAuditError("Native nono version output exceeded its limit.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(str(resolved), _NONO_COMMAND_TIMEOUT)
+        returncode = process.wait(timeout=remaining)
+    except (OSError, subprocess.SubprocessError, NativeAuditError) as exc:
+        _stop_identity_process(process)
+        raise NativeAuditError("Native nono version identity is unavailable.") from exc
+    finally:
+        selector.close()
+        for stream in streams:
+            if stream is not None and not stream.closed:
+                stream.close()
+    if returncode or buffers["stderr"]:
+        raise NativeAuditError("Native nono version identity is unavailable.")
+    return bytes(buffers["stdout"])
+
+
+def _nono_version(resolved):
+    try:
+        output = _bounded_nono_version(resolved).decode("utf-8")
+    except UnicodeError as exc:
+        raise NativeAuditError("Native nono version identity is unavailable.") from exc
+    return output[:-1] if output.endswith("\n") and not output.endswith("\n\n") else output
+
+
+def _supported_nono_config_home():
+    """Resolve the one native profile store that the namespace exposes."""
+    home_value = os.environ.get("HOME")
+    if not isinstance(home_value, str) or not os.path.isabs(home_value):
+        raise NativeAuditError("Native nono HOME selection is unsupported.")
+    try:
+        home = Path(home_value).resolve(strict=True)
+        default_config = (home / ".config").resolve(strict=True)
+    except OSError as exc:
+        raise NativeAuditError("Native nono default profile store is unavailable.") from exc
+    if not home.is_dir() or not default_config.is_dir():
+        raise NativeAuditError("Native nono default profile store is unavailable.")
+    xdg_value = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_value is not None:
+        if not xdg_value or not os.path.isabs(xdg_value):
+            raise NativeAuditError("Native nono XDG profile store is unsupported.")
+        try:
+            xdg_config = Path(xdg_value).resolve(strict=True)
+        except OSError as exc:
+            raise NativeAuditError("Native nono XDG profile store is unsupported.") from exc
+        if xdg_config != default_config:
+            raise NativeAuditError("Native nono XDG profile store is unsupported.")
+    return default_config
+
+
+def _trusted_nono_profile_path(target, *, directory, host_path):
+    """Require a canonical local profile input protected from replacement."""
+    candidate = Path(target)
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise NativeAuditError("Native nono local profile input is unavailable.") from exc
+    if not candidate.is_absolute() or candidate != resolved:
+        raise NativeAuditError("Native nono local profile path is not canonical.")
+    trusted_uids = {0, os.getuid()}
+    try:
+        for ancestor in reversed(resolved.parents):
+            metadata = ancestor.lstat()
+            writable = metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            trusted_owner = not host_path or metadata.st_uid in trusted_uids
+            if (not stat.S_ISDIR(metadata.st_mode) or ancestor.is_symlink()
+                    or not trusted_owner
+                    or (writable and not metadata.st_mode & stat.S_ISVTX)):
+                raise NativeAuditError("Native nono local profile ancestry is unsafe.")
+        metadata = resolved.lstat()
+    except OSError as exc:
+        raise NativeAuditError("Native nono local profile input is unavailable.") from exc
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (not expected_type(metadata.st_mode)
+            or (host_path and metadata.st_uid not in trusted_uids)
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or resolved.is_symlink()):
+        raise NativeAuditError("Native nono local profile input is unsafe.")
+    return resolved, metadata
+
+
+def _bounded_local_json(target, limit, *, host_path):
+    resolved, metadata = _trusted_nono_profile_path(
+        target, directory=False, host_path=host_path)
+    if metadata.st_size > limit:
+        raise NativeAuditError("Native nono local profile input exceeded its limit.")
+    descriptor = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+        opened = os.fstat(descriptor)
+        before = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
+                  metadata.st_gid, metadata.st_size)
+        after = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+                 opened.st_gid, opened.st_size)
+        if before != after or not stat.S_ISREG(opened.st_mode):
+            raise NativeAuditError("Native nono local profile input changed.")
+        contents = bytearray()
+        while len(contents) <= limit:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(contents)))
+            if not chunk:
+                break
+            contents.extend(chunk)
+    except OSError as exc:
+        raise NativeAuditError("Native nono local profile input is unavailable.") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(contents) > limit or len(contents) != metadata.st_size:
+        raise NativeAuditError("Native nono local profile input exceeded its limit.")
+    try:
+        parsed = json.loads(bytes(contents).decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise NativeAuditError("Native nono local profile input is invalid.") from exc
+    if not isinstance(parsed, dict):
+        raise NativeAuditError("Native nono local profile input is invalid.")
+    identity = {"path": str(resolved), "bytes": len(contents),
+                "sha256": hashlib.sha256(contents).hexdigest()}
+    return parsed, identity
+
+
+def validate_nono_profile_identity(*, host_path=True):
+    """Validate the exact local pack inputs used by the released profile loader."""
+    config = _supported_nono_config_home()
+    pack = config / "nono" / "packages" / "jedisct1" / "swival"
+    pack, _metadata = _trusted_nono_profile_path(
+        pack, directory=True, host_path=host_path)
+    manifest, manifest_identity = _bounded_local_json(
+        pack / "package.json", _NONO_MANIFEST_LIMIT, host_path=host_path)
+    artifacts = manifest.get("artifacts")
+    if (not isinstance(manifest.get("schema_version"), int)
+            or isinstance(manifest.get("schema_version"), bool)
+            or not isinstance(manifest.get("name"), str)
+            or not isinstance(artifacts, list) or len(artifacts) > 128):
+        raise NativeAuditError("Native nono local package manifest is invalid.")
+    profile_artifacts = [artifact for artifact in artifacts
+                         if isinstance(artifact, dict)
+                         and artifact.get("type") == "profile"]
+    if len(profile_artifacts) != 1:
+        raise NativeAuditError("Native nono local package profile selection is ambiguous.")
+    selected = profile_artifacts[0]
+    if (selected.get("install_as") != "swival"
+            or not isinstance(selected.get("path"), str) or not selected["path"]):
+        raise NativeAuditError("Native nono local package has no Swival profile.")
+    profile, profile_identity = _bounded_local_json(
+        pack / "profiles" / "swival.json", _NONO_PROFILE_LIMIT, host_path=host_path)
+    if not profile:
+        raise NativeAuditError("Native nono local Swival profile is invalid.")
+    return {"config": str(config), "pack": str(pack),
+            "manifest": manifest_identity, "profile": profile_identity}
+
+
+def _bound_nono_file_identity(item):
+    if not isinstance(item, dict) or set(item) != _NONO_FILE_IDENTITY_KEYS:
+        return False
+    item_path = item.get("path")
+    item_bytes = item.get("bytes")
+    item_hash = item.get("sha256")
+    if not isinstance(item_path, str) or not os.path.isabs(item_path):
+        return False
+    if (not isinstance(item_bytes, int) or isinstance(item_bytes, bool)
+            or item_bytes < 0):
+        return False
+    return (isinstance(item_hash, str)
+            and bool(re.fullmatch(r"[a-f0-9]{64}", item_hash)))
+
+
+def _bound_nono_profile_identity(identity):
+    return (isinstance(identity, dict)
+            and set(identity) == _NONO_PROFILE_IDENTITY_KEYS
+            and all(isinstance(identity.get(key), str)
+                    and os.path.isabs(identity[key]) for key in ("config", "pack"))
+            and all(_bound_nono_file_identity(identity.get(key))
+                    for key in ("manifest", "profile")))
+
+
+def validate_nono_identity(executable, *, host_path=True):
+    """Authenticate the reviewed nono artifact before any nono execution."""
+    resolved, metadata = _trusted_nono_executable(executable, host_path=host_path)
+    _verify_nono_capabilities(resolved)
+    digest = _nono_artifact_digest(resolved, metadata)
+    if digest != NONO_ARTIFACT_IDENTITY["sha256"]:
+        raise NativeAuditError("Native nono executable hash is unsupported.")
+    if _nono_version(resolved) != f'nono {NONO_ARTIFACT_IDENTITY["version"]}':
+        raise NativeAuditError("Native nono version is unsupported.")
+    return {"path": str(resolved), **NONO_ARTIFACT_IDENTITY}
+
+
+def _bound_nono_identity(identity, executable):
+    return (isinstance(identity, dict) and set(identity) == _NONO_IDENTITY_KEYS
+            and identity.get("path") == executable
+            and all(identity.get(key) == value
+                    for key, value in NONO_ARTIFACT_IDENTITY.items()))
+
+
+def _verify_sdk_nono_resolution(executable):
+    """Call the pinned SDK resolver and bind its selected target to the request."""
+    from swival import sandbox_nono
+
+    try:
+        selected = sandbox_nono._find_nono()  # pylint: disable=protected-access
+        if not isinstance(selected, str) or not os.path.isabs(selected):
+            raise ValueError("non-absolute SDK selection")
+        resolved = Path(selected).resolve(strict=True)
+    except Exception as exc:
+        raise NativeAuditError("Native SDK nono resolution is unavailable.") from exc
+    if str(resolved) != executable:
+        raise NativeAuditError("Native SDK nono executable changed.")
+
+
+def _revalidate_nono(request, *, host_path=True):
+    identity = validate_nono_identity(request.get("nono"), host_path=host_path)
+    if identity != request.get("nonoIdentity"):
+        raise NativeAuditError("Native nono identity changed before execution.")
+    _verify_sdk_nono_resolution(identity["path"])
+    return identity
+
+
+def _revalidate_nono_profile(request, *, host_path=True):
+    identity = validate_nono_profile_identity(host_path=host_path)
+    if identity != request.get("nonoProfileIdentity"):
+        raise NativeAuditError("Native nono local profile changed before execution.")
+    return identity
+
+
+@contextlib.contextmanager
+def _bound_nono_sdk(request):
+    """Replace the released unbounded package query after a bounded check."""
+    from swival import sandbox_nono
+
+    # Bubblewrap can remap host owner IDs. Probe and launch already verified
+    # owner/ancestor policy; the read-only final boundary reauthenticates modes,
+    # capabilities, architecture, exact bytes, version, and SDK resolution.
+    identity = _revalidate_nono(request, host_path=False)
+    if sandbox_nono.WRAPPER_PROFILE != _NONO_WRAPPER_PROFILE:
+        raise NativeAuditError("Native SDK nono profile identity changed.")
+    _revalidate_nono_profile(request, host_path=False)
+    original = sandbox_nono.profile_pack_installed
+
+    def installed(executable, profile):
+        try:
+            selected = Path(executable)
+            resolved = selected.resolve(strict=True)
+        except (OSError, TypeError) as exc:
+            raise NativeAuditError("Native SDK nono package query changed.") from exc
+        if (not selected.is_absolute() or str(resolved) != identity["path"]
+                or profile != _NONO_WRAPPER_PROFILE):
+            raise NativeAuditError("Native SDK nono package query changed.")
+        return True
+
+    sandbox_nono.profile_pack_installed = installed
+    try:
+        yield
+    finally:
+        sandbox_nono.profile_pack_installed = original
+
+
 def run_native(request):
     """Dispatch exactly one /audit with fixed, restrictive Session policies."""
     platform_verified = all((
@@ -654,6 +1073,8 @@ def run_native(request):
         request.get("bwrapVersion") == "0.12.0",
         request.get("bwrapIdentity") == BWRAP_IDENTITY,
         request.get("unshareIdentity") == UNSHARE_IDENTITY,
+        _bound_nono_identity(request.get("nonoIdentity"), request.get("nono")),
+        _bound_nono_profile_identity(request.get("nonoProfileIdentity")),
         request.get("sessionSandbox") == "builtin",
     ))
     if not platform_verified:
@@ -677,6 +1098,9 @@ def run_native(request):
     ])
     with (_bound_transport(public),
           _expansion_failures(len(scope["mandatory_files"])) as failures,
+          # This final context authenticates nono and its fixed local package
+          # query immediately before Session invokes the released SDK path.
+          _bound_nono_sdk(request),
           Session(**settings, base_dir=request["snapshot"], files="some", commands="none",
                   sandbox="builtin", sandbox_auto_session=False, network="provider-only",
                   no_instructions=True, no_skills=True, metaskills="off", memory=False,
@@ -690,6 +1114,8 @@ def run_native(request):
             "requestedEffort": public["reasoningEffort"], "network": "provider-only",
             "sandbox": {"external": "bubblewrap", "bwrapVersion": request.get("bwrapVersion"),
                         "bwrapIdentity": request.get("bwrapIdentity"),
+                        "nonoIdentity": request.get("nonoIdentity"),
+                        "nonoProfileIdentity": request.get("nonoProfileIdentity"),
                         "startup": {"executable": "unshare",
                                     "identity": request.get("unshareIdentity")},
                         "session": "builtin"},
@@ -883,11 +1309,13 @@ def supervise_bubblewrap(request, payload, input_bytes=None):
 
 
 def _revalidate_launchers(request):
-    """Bind both prepared identities to their executables immediately before launch."""
+    """Bind all prepared identities to their executables immediately before launch."""
     if validate_unshare_identity(request.get("unshare")) != request.get("unshareIdentity"):
         raise NativeAuditError("Native unshare identity changed before execution.")
     if validate_bwrap_identity(request.get("bwrap")) != request.get("bwrapIdentity"):
         raise NativeAuditError("Native bubblewrap identity changed before execution.")
+    _revalidate_nono(request)
+    _revalidate_nono_profile(request)
 
 
 def launch_native():
@@ -928,6 +1356,8 @@ def launch_native():
     sys.exit(code)
 
 
+# Fixed protocol modes remain explicit and value-free.
+# pylint: disable-next=too-many-branches
 def main():
     """Run the bounded JSON protocol with value-free diagnostics."""
     if sys.argv[1:2] == ["--launch"]:
@@ -942,6 +1372,10 @@ def main():
         print(json.dumps(validate_unshare_identity(request.get("unshare"))))
     elif sys.argv[1:] == ["--validate-bwrap"]:
         print(json.dumps(validate_bwrap_identity(request.get("bwrap"))))
+    elif sys.argv[1:] == ["--validate-nono"]:
+        print(json.dumps(validate_nono_identity(request.get("nono"))))
+    elif sys.argv[1:] == ["--validate-nono-profile"]:
+        print(json.dumps(validate_nono_profile_identity()))
     elif sys.argv[1:] == ["--probe"]:
         _revalidate_launchers(request)
         code = supervise_bubblewrap(request, [request["python"], "-I", "-B",
@@ -950,6 +1384,7 @@ def main():
             raise NativeAuditError("Native bubblewrap runtime capability check failed.")
     elif sys.argv[1:] == ["--preflight"]:
         _, public = resolve_native_config(request)
+        _supported_nono_config_home()
         if "snapshot" in request:
             public["scope"] = native_scope(request)
         print(json.dumps(public))

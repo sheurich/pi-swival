@@ -65,6 +65,14 @@ class NativeEntryTests(unittest.TestCase):
         # These are API/transport tests, not an assertion of Darwin kernel isolation.
         self.enterContext(patch.object(sys, "platform", "linux"))
         self.enterContext(patch.object(bridge, "check_boundary"))
+        # SDK/artifact boundary mock only. Dedicated identity tests exercise the
+        # production validator; this released-pipeline fixture is not live trust proof.
+        self.enterContext(patch.object(
+            bridge, "_revalidate_nono",
+            side_effect=lambda request, **_kwargs: request["nonoIdentity"],
+        ))
+        self.enterContext(patch.object(
+            bridge, "_revalidate_nono_profile", return_value={"pack": "/trusted/profile"}))
         # unittest owns the context lifetime through enterContext.
         self.root = Path(self.enterContext(
             tempfile.TemporaryDirectory(prefix="offline-native-")  # pylint: disable=consider-using-with
@@ -92,6 +100,15 @@ class NativeEntryTests(unittest.TestCase):
                               capture_output=True, check=True, timeout=5).stdout.decode().strip()
 
     def request(self):
+        config = self.root / "config"
+        pack = config / "nono" / "packages" / "jedisct1" / "swival"
+        profile_identity = {
+            "config": str(config), "pack": str(pack),
+            "manifest": {"path": str(pack / "package.json"), "bytes": 1,
+                         "sha256": "2" * 64},
+            "profile": {"path": str(pack / "profiles" / "swival.json"), "bytes": 1,
+                        "sha256": "3" * 64},
+        }
         request = {"source": str(self.repo), "snapshot": str(self.repo),
                    "evidence": str(self.evidence),
                    "routing": {"provider": "lmstudio", "model": "offline-model",
@@ -99,6 +116,10 @@ class NativeEntryTests(unittest.TestCase):
                    "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
                    "bwrapIdentity": dict(bridge.BWRAP_IDENTITY),
                    "unshareIdentity": dict(bridge.UNSHARE_IDENTITY),
+                   "nono": "/trusted/nono",
+                   "nonoIdentity": {"path": "/trusted/nono",
+                                    **bridge.NONO_ARTIFACT_IDENTITY},
+                   "nonoProfileIdentity": profile_identity,
                    "sessionSandbox": "builtin",
                    "audit": {"paths": [], "all": True, "workers": 1, "patchMaxTurns": 5},
                    "expectedScope": audit._resolve_scope(str(self.repo), []).to_dict()}
@@ -125,6 +146,27 @@ class NativeEntryTests(unittest.TestCase):
                     with self.assertRaisesRegex(bridge.NativeAuditError, "route.*changed"):
                         bridge.run_native(request)
                     session.assert_not_called()
+
+    def test_nono_identity_is_revalidated_immediately_before_session_construction(self):
+        request = self.request()
+        reached = []
+
+        def revalidate(actual, **kwargs):
+            self.assertIs(actual, request)
+            self.assertEqual(kwargs, {"host_path": False})
+            reached.append("nono")
+            return actual["nonoIdentity"]
+
+        def construct(**_kwargs):
+            self.assertEqual(reached, ["nono"])
+            reached.append("session")
+            raise AssertionError("synthetic Session stop")
+
+        with patch.object(bridge, "_revalidate_nono", side_effect=revalidate), \
+             patch("swival.session.Session", side_effect=construct):
+            with self.assertRaisesRegex(AssertionError, "Session stop"):
+                bridge.run_native(request)
+        self.assertEqual(reached, ["nono", "session"])
 
     def test_native_route_binding_materializes_safe_defaults_without_provider(self):
         request = self.request()
@@ -950,12 +992,19 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
             "audit": {"all": True}, "route": result["route"],
             "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
             "bwrapIdentity": bridge.BWRAP_IDENTITY,
-            "unshareIdentity": bridge.UNSHARE_IDENTITY, "sessionSandbox": "builtin"
+            "unshareIdentity": bridge.UNSHARE_IDENTITY,
+            "nono": result["sandbox"]["nonoIdentity"]["path"],
+            "nonoIdentity": result["sandbox"]["nonoIdentity"],
+            "nonoProfileIdentity": result["sandbox"]["nonoProfileIdentity"],
+            "sessionSandbox": "builtin"
         }))
         (export / "request.json").write_text(json.dumps({
             "expectedRoute": result["route"], "sandbox": "bubblewrap",
             "bwrapVersion": "0.12.0", "bwrapIdentity": bridge.BWRAP_IDENTITY,
             "unshareIdentity": bridge.UNSHARE_IDENTITY,
+            "nono": result["sandbox"]["nonoIdentity"]["path"],
+            "nonoIdentity": result["sandbox"]["nonoIdentity"],
+            "nonoProfileIdentity": result["sandbox"]["nonoProfileIdentity"],
             "sessionSandbox": "builtin",
         }))
         (export / "completed.json").write_text(json.dumps({

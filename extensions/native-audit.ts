@@ -187,6 +187,39 @@ const PINNED_BWRAP_IDENTITY = Object.freeze({
 	architecture: "arm64",
 	sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
 });
+// Reviewed regular member of the authenticated 0.79.0 ARM64 GNU release archive
+// with SHA-256 c4a4f4b9ae318574d30d352127a34dcc919c4d6682ee8fbd30bb8d2bd2e0e85d.
+const PINNED_NONO_ARTIFACT_IDENTITY = Object.freeze({
+	version: "0.79.0",
+	architecture: "aarch64-unknown-linux-gnu",
+	bytes: 26141064,
+	sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b",
+});
+const pinnedNonoIdentity = (value: unknown, executable?: string): value is Record<string, unknown> => {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const identity = value as Record<string, unknown>;
+	if (Object.keys(identity).sort().join(",") !== "architecture,bytes,path,sha256,version") return false;
+	if (typeof identity.path !== "string" || !path.isAbsolute(identity.path) ||
+		path.resolve(identity.path) !== identity.path || (executable !== undefined && identity.path !== executable)) return false;
+	return Object.entries(PINNED_NONO_ARTIFACT_IDENTITY).every(([key, expected]) => identity[key] === expected);
+};
+const localNonoFileIdentity = (value: unknown, expectedPath: string, limit: number): boolean => {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const identity = value as Record<string, unknown>;
+	return Object.keys(identity).sort().join(",") === "bytes,path,sha256" && identity.path === expectedPath &&
+		Number.isSafeInteger(identity.bytes) && (identity.bytes as number) >= 0 && (identity.bytes as number) <= limit &&
+		typeof identity.sha256 === "string" && /^[a-f0-9]{64}$/.test(identity.sha256);
+};
+const localNonoProfileIdentity = (value: unknown): value is Record<string, unknown> => {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const identity = value as Record<string, any>;
+	if (Object.keys(identity).sort().join(",") !== "config,manifest,pack,profile" ||
+		typeof identity.config !== "string" || typeof identity.pack !== "string" ||
+		!path.isAbsolute(identity.config) || path.resolve(identity.config) !== identity.config ||
+		identity.pack !== path.join(identity.config, "nono", "packages", "jedisct1", "swival")) return false;
+	return localNonoFileIdentity(identity.manifest, path.join(identity.pack, "package.json"), 64 * 1024) &&
+		localNonoFileIdentity(identity.profile, path.join(identity.pack, "profiles", "swival.json"), 1024 * 1024);
+};
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scripts");
 export interface NativeTerminal {
 	exitCode: number;
@@ -352,7 +385,7 @@ export async function prepareNativeAudit(
 		if (field.endsWith("Override") && params[field] !== undefined) routing[field.slice(0, -8)] = params[field];
 	}
 	const request: Record<string, any> = { source: identity.sourceRoot, sourceGitDir: identity.sourceGitDir,
-		routing, audit, timeoutMs, python, unshare, bwrap, sandbox: "bubblewrap", sessionSandbox: "builtin" };
+		routing, audit, timeoutMs, python, unshare, bwrap, nono, sandbox: "bubblewrap", sessionSandbox: "builtin" };
 	const preflight = async () => JSON.parse((await boundedExec(python, ["-I", "-B",
 		path.join(scriptRoot, "native_audit.py"), "--preflight"], identity.sourceRoot, JSON.stringify(request),
 		{ ...trustedGit.env, PATH: request.runtimePath ?? trustedGit.env.PATH },
@@ -391,12 +424,34 @@ export async function prepareNativeAudit(
 	}
 	request.bwrapIdentity = bwrapIdentity;
 	request.bwrapVersion = "0.12.0";
-	await boundedExec(nono, ["--version"], cwd, undefined, trustedGit.env, 5000, 16384);
+	let nonoIdentity: Record<string, unknown>;
+	try {
+		nonoIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
+			path.join(scriptRoot, "native_audit.py"), "--validate-nono"], cwd,
+			JSON.stringify({ nono }), trustedGit.env, 10_000, 16 * 1024)).toString());
+	} catch {
+		throw new Error("Native audit requires the reviewed nono 0.79.0 ARM64 GNU executable identity; no fallback.");
+	}
+	if (!pinnedNonoIdentity(nonoIdentity, nono)) {
+		throw new Error("Native audit nono identity did not match the reviewed artifact; no fallback.");
+	}
+	request.nonoIdentity = nonoIdentity;
+	let nonoProfileIdentity: Record<string, unknown>;
+	try {
+		nonoProfileIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
+			path.join(scriptRoot, "native_audit.py"), "--validate-nono-profile"], cwd,
+			JSON.stringify({}), trustedGit.env, 10_000, 16 * 1024)).toString());
+	} catch {
+		throw new Error("Native audit requires the safe local jedisct1/swival nono profile in the default store; no pull or fallback.");
+	}
+	if (!localNonoProfileIdentity(nonoProfileIdentity)) {
+		throw new Error("Native audit local nono profile identity is unsupported; no pull or fallback.");
+	}
+	request.nonoProfileIdentity = nonoProfileIdentity;
 	const visible = [identity.sourceRoot, identity.sourceGitDir, scriptRoot,
 		path.dirname(path.dirname(python)), path.dirname(path.dirname(await fs.realpath(python))),
-		path.dirname(trustedGit.executable), path.dirname(nono)];
+		path.dirname(trustedGit.executable), path.dirname(nono), nonoProfileIdentity.pack as string];
 	for (const target of [path.join(os.homedir(), ".config", "swival"),
-		path.join(os.homedir(), ".config", "nono", "packages", "jedisct1", "swival"),
 		process.env.CHATGPT_TOKEN_DIR ?? path.join(os.homedir(), ".config", "litellm", "chatgpt")]) {
 		try { visible.push(await fs.realpath(target)); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -435,7 +490,8 @@ export async function prepareNativeAudit(
 		await fs.writeFile(path.join(runDir, "manifest.json"), JSON.stringify({ ...manifest,
 			sandbox: "bubblewrap", bwrapVersion: request.bwrapVersion,
 			bwrapIdentity: request.bwrapIdentity, unshareIdentity: request.unshareIdentity,
-			sessionSandbox: "builtin",
+			nono: request.nono, nonoIdentity: request.nonoIdentity,
+			nonoProfileIdentity: request.nonoProfileIdentity, sessionSandbox: "builtin",
 			scope: scoped.scope, audit, route }, null, 2), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "request.json"), JSON.stringify(request), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
@@ -679,6 +735,8 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 		if (!["completed", "partial"].includes(result.status) || result.sandbox?.external !== "bubblewrap" ||
 			result.sandbox?.bwrapVersion !== "0.12.0" ||
 			!isDeepStrictEqual(result.sandbox?.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
+			!pinnedNonoIdentity(result.sandbox?.nonoIdentity) ||
+			!localNonoProfileIdentity(result.sandbox?.nonoProfileIdentity) ||
 			result.sandbox?.session !== "builtin" || result.network !== "provider-only") {
 			return { status: "failed", error: "Native runtime/sandbox completion evidence is missing." };
 		}
@@ -691,6 +749,13 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 			!isDeepStrictEqual(request.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
 			!isDeepStrictEqual(manifest.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
 			!isDeepStrictEqual(request.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
+			typeof request.nono !== "string" ||
+			!pinnedNonoIdentity(request.nonoIdentity, request.nono) || manifest.nono !== request.nono ||
+			!localNonoProfileIdentity(request.nonoProfileIdentity) ||
+			!isDeepStrictEqual(manifest.nonoIdentity, request.nonoIdentity) ||
+			!isDeepStrictEqual(result.sandbox?.nonoIdentity, request.nonoIdentity) ||
+			!isDeepStrictEqual(manifest.nonoProfileIdentity, request.nonoProfileIdentity) ||
+			!isDeepStrictEqual(result.sandbox?.nonoProfileIdentity, request.nonoProfileIdentity) ||
 			!isDeepStrictEqual(result.sandbox?.startup,
 				{ executable: "unshare", identity: PINNED_UNSHARE_IDENTITY }) ||
 			manifest.route?.version !== 1 || !isDeepStrictEqual(manifest.route, request.expectedRoute) ||
