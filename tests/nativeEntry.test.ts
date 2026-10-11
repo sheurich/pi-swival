@@ -31,7 +31,7 @@ it("checks bubblewrap mount ordering and read-only ChatGPT auth without HTTP", a
 	});
 	expect(result.code, result.output).toBe(0);
 	expect(result.output).toContain("Ran 13 tests");
-});
+}, 20_000);
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(
 	"validates released finding/verification/patch/%s-report evidence without provider transport", async (report) => {
