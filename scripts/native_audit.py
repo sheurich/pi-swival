@@ -88,8 +88,35 @@ _NONO_COMMAND_TIMEOUT = 5
 _NONO_WRAPPER_PROFILE = "jedisct1/swival"
 _NONO_MANIFEST_LIMIT = 64 * 1024
 _NONO_PROFILE_LIMIT = 1024 * 1024
-_NONO_PROFILE_IDENTITY_KEYS = {"config", "pack", "manifest", "profile"}
+_NONO_PROFILE_NAMESPACE_LIMIT = 128
+_NONO_PROFILE_PACK_LIMIT = 1024
+_NONO_PROFILE_IDENTITY_KEYS = {
+    "config", "pack", "manifest", "profile", "defaultPolicy"
+}
 _NONO_FILE_IDENTITY_KEYS = {"path", "bytes", "sha256"}
+# Nono 0.79.0 copies these reviewed jedisct1/swival@0.1.2 subjects
+# byte-for-byte to the installed paths validated below. No alternate serialization
+# or runtime-learned identity is accepted.
+NONO_PROFILE_ARTIFACT_IDENTITIES = {
+    "manifest": {
+        "bytes": 968,
+        "sha256": "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2",
+    },
+    "profile": {
+        "bytes": 1747,
+        "sha256": "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c",
+    },
+}
+# Reviewed nono 0.79.0 resolves an unshadowed ``default`` to this embedded,
+# non-inheriting definition. Its groups and implicit default groups are also
+# embedded in the authenticated executable; package groups cannot replace an
+# embedded group name.
+NONO_DEFAULT_POLICY_IDENTITY = {
+    "name": "default",
+    "source": "authenticated-nono-0.79.0-embedded-policy",
+    "extends": [],
+    "nonoSha256": NONO_ARTIFACT_IDENTITY["sha256"],
+}
 _VERTEX_SELECTOR = None
 _VERTEX_SELECTOR_LOCK = threading.Lock()
 CREDENTIAL_PATTERN = re.compile(
@@ -890,15 +917,32 @@ def _trusted_nono_profile_path(target, *, directory, host_path):
     return resolved, metadata
 
 
-def _bounded_local_json(target, limit, *, host_path):
+def _reject_duplicate_json_keys(pairs):
+    """Reject ambiguous objects instead of applying JSON's last-key rule."""
+    parsed = {}
+    for key, value in pairs:
+        if key in parsed:
+            raise ValueError("duplicate JSON object key")
+        parsed[key] = value
+    return parsed
+
+
+def _reject_nonfinite_json(_value):
+    """Reject non-standard numeric constants in local policy inputs."""
+    raise ValueError("non-finite JSON number")
+
+
+def _bounded_local_file(target, limit, *, host_path):
+    """Read one canonical regular resolver input with a fixed byte limit."""
     resolved, metadata = _trusted_nono_profile_path(
         target, directory=False, host_path=host_path)
     if metadata.st_size > limit:
         raise NativeAuditError("Native nono local profile input exceeded its limit.")
     descriptor = None
     try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(resolved, flags)
+        descriptor = os.open(
+            resolved, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(descriptor)
         before = (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid,
                   metadata.st_gid, metadata.st_size)
@@ -919,25 +963,204 @@ def _bounded_local_json(target, limit, *, host_path):
             os.close(descriptor)
     if len(contents) > limit or len(contents) != metadata.st_size:
         raise NativeAuditError("Native nono local profile input exceeded its limit.")
+    return resolved, bytes(contents)
+
+
+def _strict_json_object(contents, diagnostic):
     try:
-        parsed = json.loads(bytes(contents).decode("utf-8"))
+        parsed = json.loads(contents.decode("utf-8"),
+                            object_pairs_hook=_reject_duplicate_json_keys,
+                            parse_constant=_reject_nonfinite_json)
     except (UnicodeError, ValueError) as exc:
-        raise NativeAuditError("Native nono local profile input is invalid.") from exc
+        raise NativeAuditError(diagnostic) from exc
     if not isinstance(parsed, dict):
-        raise NativeAuditError("Native nono local profile input is invalid.")
+        raise NativeAuditError(diagnostic)
+    return parsed
+
+
+def _bounded_local_json(target, limit, expected_identity, *, host_path):
+    resolved, contents = _bounded_local_file(target, limit, host_path=host_path)
     identity = {"path": str(resolved), "bytes": len(contents),
                 "sha256": hashlib.sha256(contents).hexdigest()}
+    if any(identity.get(key) != expected_identity.get(key)
+           for key in ("bytes", "sha256")):
+        raise NativeAuditError("Native nono local profile input identity is unsupported.")
+    parsed = _strict_json_object(
+        contents, "Native nono local profile input is invalid.")
     return parsed, identity
 
 
+def _reject_nono_default_override(target):
+    """Require a resolver candidate to be absent, including broken symlinks."""
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.") from exc
+    raise NativeAuditError(
+        "Native nono inherited default profile override is unsupported.")
+
+
+def _bounded_directory_names(target, limit, *, host_path):
+    """List one trusted resolver directory without unbounded traversal."""
+    resolved, _metadata = _trusted_nono_profile_path(
+        target, directory=True, host_path=host_path)
+    names = []
+    try:
+        with os.scandir(resolved) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > limit:
+                    raise NativeAuditError(
+                        "Native nono default profile resolver exceeded its limit.")
+    except OSError as exc:
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.") from exc
+    return resolved, sorted(names)
+
+
+def _installed_nono_pack_paths(config, *, host_path):
+    """Mirror the bounded namespace/pack directory part of nono's store scan."""
+    store, namespaces = _bounded_directory_names(
+        config / "nono" / "packages", _NONO_PROFILE_NAMESPACE_LIMIT,
+        host_path=host_path)
+    packs = []
+    entry_count = 0
+    for namespace_name in namespaces:
+        namespace = store / namespace_name
+        try:
+            metadata = namespace.lstat()
+        except OSError as exc:
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.")
+        if not stat.S_ISDIR(metadata.st_mode):
+            continue
+        namespace, names = _bounded_directory_names(
+            namespace, _NONO_PROFILE_PACK_LIMIT, host_path=host_path)
+        entry_count += len(names)
+        if entry_count > _NONO_PROFILE_PACK_LIMIT:
+            raise NativeAuditError(
+                "Native nono default profile resolver exceeded its limit.")
+        for pack_name in names:
+            candidate = namespace / pack_name
+            try:
+                metadata = candidate.lstat()
+            except OSError as exc:
+                raise NativeAuditError(
+                    "Native nono default profile resolver input is invalid.") from exc
+            if stat.S_ISLNK(metadata.st_mode):
+                raise NativeAuditError(
+                    "Native nono default profile resolver input is invalid.")
+            if not stat.S_ISDIR(metadata.st_mode):
+                continue
+            pack, _metadata = _trusted_nono_profile_path(
+                candidate, directory=True, host_path=host_path)
+            packs.append(pack)
+            if len(packs) > _NONO_PROFILE_PACK_LIMIT:
+                raise NativeAuditError(
+                    "Native nono default profile resolver exceeded its limit.")
+    return packs
+
+
+def _reject_pack_default_profile(pack, *, host_path):
+    """Reject install_as or alias declarations that can resolve ``default``."""
+    manifest_path = pack / "package.json"
+    try:
+        metadata = manifest_path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.")
+    try:
+        _resolved, contents = _bounded_local_file(
+            manifest_path, _NONO_MANIFEST_LIMIT, host_path=host_path)
+        manifest = _strict_json_object(
+            contents, "Native nono default profile resolver input is invalid.")
+    except NativeAuditError as exc:
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.") from exc
+    schema_version = manifest.get("schema_version")
+    artifacts = manifest.get("artifacts", [])
+    if (not isinstance(schema_version, int) or isinstance(schema_version, bool)
+            or not 0 <= schema_version <= 0xFFFFFFFF):
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.")
+    if (not isinstance(manifest.get("name"), str)
+            or not isinstance(artifacts, list) or len(artifacts) > 128):
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.")
+    artifact_types = {"profile", "instruction", "trust_policy", "groups", "plugin"}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.")
+        artifact_type = artifact.get("type")
+        install_as = artifact.get("install_as")
+        aliases = artifact.get("aliases", [])
+        if (artifact_type not in artifact_types
+                or not isinstance(artifact.get("path"), str)):
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.")
+        if ((install_as is not None and not isinstance(install_as, str))
+                or not isinstance(aliases, list)
+                or any(not isinstance(alias, str) for alias in aliases)):
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.")
+        if (artifact_type == "profile" and isinstance(install_as, str)
+                and (install_as == "default" or "default" in aliases)):
+            raise NativeAuditError(
+                "Native nono inherited default profile override is unsupported.")
+
+
+def _validate_nono_default_policy(config, pack, *, host_path):
+    """Prove ``default`` falls through every file route to authenticated bytes."""
+    profiles, _metadata = _trusted_nono_profile_path(
+        pack / "profiles", directory=True, host_path=host_path)
+    _reject_nono_default_override(profiles / "default.json")
+
+    nono_config, _metadata = _trusted_nono_profile_path(
+        config / "nono", directory=True, host_path=host_path)
+    user_profiles = nono_config / "profiles"
+    try:
+        metadata = user_profiles.lstat()
+    except FileNotFoundError:
+        metadata = None
+    except OSError as exc:
+        raise NativeAuditError(
+            "Native nono default profile resolver input is invalid.") from exc
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise NativeAuditError(
+                "Native nono default profile resolver input is invalid.")
+        user_profiles, _metadata = _trusted_nono_profile_path(
+            user_profiles, directory=True, host_path=host_path)
+        _reject_nono_default_override(user_profiles / "default.jsonc")
+        _reject_nono_default_override(user_profiles / "default.json")
+
+    for candidate in _installed_nono_pack_paths(config, host_path=host_path):
+        if candidate != pack:
+            _reject_pack_default_profile(candidate, host_path=host_path)
+    return dict(NONO_DEFAULT_POLICY_IDENTITY)
+
+
 def validate_nono_profile_identity(*, host_path=True):
-    """Validate the exact local pack inputs used by the released profile loader."""
+    """Validate the complete local policy closure used by the released loader."""
     config = _supported_nono_config_home()
     pack = config / "nono" / "packages" / "jedisct1" / "swival"
     pack, _metadata = _trusted_nono_profile_path(
         pack, directory=True, host_path=host_path)
     manifest, manifest_identity = _bounded_local_json(
-        pack / "package.json", _NONO_MANIFEST_LIMIT, host_path=host_path)
+        pack / "package.json", _NONO_MANIFEST_LIMIT,
+        NONO_PROFILE_ARTIFACT_IDENTITIES["manifest"], host_path=host_path)
     artifacts = manifest.get("artifacts")
     if (not isinstance(manifest.get("schema_version"), int)
             or isinstance(manifest.get("schema_version"), bool)
@@ -954,26 +1177,24 @@ def validate_nono_profile_identity(*, host_path=True):
             or not isinstance(selected.get("path"), str) or not selected["path"]):
         raise NativeAuditError("Native nono local package has no Swival profile.")
     profile, profile_identity = _bounded_local_json(
-        pack / "profiles" / "swival.json", _NONO_PROFILE_LIMIT, host_path=host_path)
-    if not profile:
+        pack / "profiles" / "swival.json", _NONO_PROFILE_LIMIT,
+        NONO_PROFILE_ARTIFACT_IDENTITIES["profile"], host_path=host_path)
+    if not profile or profile.get("extends") != "default":
         raise NativeAuditError("Native nono local Swival profile is invalid.")
+    default_policy = _validate_nono_default_policy(
+        config, pack, host_path=host_path)
     return {"config": str(config), "pack": str(pack),
-            "manifest": manifest_identity, "profile": profile_identity}
+            "manifest": manifest_identity, "profile": profile_identity,
+            "defaultPolicy": default_policy}
 
 
-def _bound_nono_file_identity(item):
+def _bound_nono_file_identity(item, expected):
     if not isinstance(item, dict) or set(item) != _NONO_FILE_IDENTITY_KEYS:
         return False
     item_path = item.get("path")
-    item_bytes = item.get("bytes")
-    item_hash = item.get("sha256")
     if not isinstance(item_path, str) or not os.path.isabs(item_path):
         return False
-    if (not isinstance(item_bytes, int) or isinstance(item_bytes, bool)
-            or item_bytes < 0):
-        return False
-    return (isinstance(item_hash, str)
-            and bool(re.fullmatch(r"[a-f0-9]{64}", item_hash)))
+    return all(item.get(key) == value for key, value in expected.items())
 
 
 def _bound_nono_profile_identity(identity):
@@ -981,8 +1202,10 @@ def _bound_nono_profile_identity(identity):
             and set(identity) == _NONO_PROFILE_IDENTITY_KEYS
             and all(isinstance(identity.get(key), str)
                     and os.path.isabs(identity[key]) for key in ("config", "pack"))
-            and all(_bound_nono_file_identity(identity.get(key))
-                    for key in ("manifest", "profile")))
+            and all(_bound_nono_file_identity(
+                identity.get(key), NONO_PROFILE_ARTIFACT_IDENTITIES[key])
+                    for key in ("manifest", "profile"))
+            and identity.get("defaultPolicy") == NONO_DEFAULT_POLICY_IDENTITY)
 
 
 def validate_nono_identity(executable, *, host_path=True):

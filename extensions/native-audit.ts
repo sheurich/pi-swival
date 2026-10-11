@@ -203,22 +203,39 @@ const pinnedNonoIdentity = (value: unknown, executable?: string): value is Recor
 		path.resolve(identity.path) !== identity.path || (executable !== undefined && identity.path !== executable)) return false;
 	return Object.entries(PINNED_NONO_ARTIFACT_IDENTITY).every(([key, expected]) => identity[key] === expected);
 };
-const localNonoFileIdentity = (value: unknown, expectedPath: string, limit: number): boolean => {
+// Nono 0.79.0 copies these reviewed jedisct1/swival@0.1.2 subjects
+// byte-for-byte. Native evidence accepts no alternate policy serialization.
+const PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES = Object.freeze({
+	manifest: Object.freeze({ bytes: 968,
+		sha256: "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2" }),
+	profile: Object.freeze({ bytes: 1747,
+		sha256: "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c" }),
+});
+const PINNED_NONO_DEFAULT_POLICY_IDENTITY = Object.freeze({
+	name: "default",
+	source: "authenticated-nono-0.79.0-embedded-policy",
+	extends: Object.freeze([]),
+	nonoSha256: PINNED_NONO_ARTIFACT_IDENTITY.sha256,
+});
+const localNonoFileIdentity = (value: unknown, expectedPath: string,
+	expected: Readonly<{ bytes: number; sha256: string }>): boolean => {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const identity = value as Record<string, unknown>;
 	return Object.keys(identity).sort().join(",") === "bytes,path,sha256" && identity.path === expectedPath &&
-		Number.isSafeInteger(identity.bytes) && (identity.bytes as number) >= 0 && (identity.bytes as number) <= limit &&
-		typeof identity.sha256 === "string" && /^[a-f0-9]{64}$/.test(identity.sha256);
+		identity.bytes === expected.bytes && identity.sha256 === expected.sha256;
 };
 const localNonoProfileIdentity = (value: unknown): value is Record<string, unknown> => {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const identity = value as Record<string, any>;
-	if (Object.keys(identity).sort().join(",") !== "config,manifest,pack,profile" ||
+	if (Object.keys(identity).sort().join(",") !== "config,defaultPolicy,manifest,pack,profile" ||
 		typeof identity.config !== "string" || typeof identity.pack !== "string" ||
 		!path.isAbsolute(identity.config) || path.resolve(identity.config) !== identity.config ||
 		identity.pack !== path.join(identity.config, "nono", "packages", "jedisct1", "swival")) return false;
-	return localNonoFileIdentity(identity.manifest, path.join(identity.pack, "package.json"), 64 * 1024) &&
-		localNonoFileIdentity(identity.profile, path.join(identity.pack, "profiles", "swival.json"), 1024 * 1024);
+	return localNonoFileIdentity(identity.manifest, path.join(identity.pack, "package.json"),
+		PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES.manifest) &&
+		localNonoFileIdentity(identity.profile, path.join(identity.pack, "profiles", "swival.json"),
+			PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES.profile) &&
+		isDeepStrictEqual(identity.defaultPolicy, PINNED_NONO_DEFAULT_POLICY_IDENTITY);
 };
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scripts");
 export interface NativeTerminal {

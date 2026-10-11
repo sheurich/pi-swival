@@ -30,7 +30,7 @@ it("checks bubblewrap mount ordering and read-only ChatGPT auth without HTTP", a
 			(error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 	});
 	expect(result.code, result.output).toBe(0);
-	expect(result.output).toContain("Ran 26 tests");
+	expect(result.output).toContain("Ran 37 tests");
 }, 20_000);
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(

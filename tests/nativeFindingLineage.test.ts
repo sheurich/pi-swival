@@ -18,6 +18,12 @@ const unshareIdentity = { path: "/usr/bin/unshare", version: "unshare from util-
 const nono = "/trusted/nono";
 const nonoIdentity = { path: nono, version: "0.79.0", architecture: "aarch64-unknown-linux-gnu",
 	bytes: 26141064, sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b" };
+const reviewedProfileArtifacts = {
+	manifest: { bytes: 968, sha256: "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2" },
+	profile: { bytes: 1747, sha256: "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c" },
+};
+const reviewedDefaultPolicy = { name: "default", source: "authenticated-nono-0.79.0-embedded-policy",
+	extends: [], nonoSha256: nonoIdentity.sha256 };
 
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -27,13 +33,16 @@ const producerOutput = (scenario: string, home: string) => JSON.parse(execFileSy
 		env: { HOME: home, PATH: process.env.PATH, LITELLM_LOCAL_MODEL_COST_MAP: "True" },
 	}).toString());
 
-function lineage(scenario: string) {
+function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault = false) {
 	const artifactRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-lineage-"))); roots.push(artifactRoot);
 	const runId = `lineage-${scenario}`; const root = path.join(artifactRoot, runId); fs.mkdirSync(root);
 	const profilePack = path.join(root, "nono", "packages", "jedisct1", "swival");
 	const nonoProfileIdentity = { config: root, pack: profilePack,
-		manifest: { path: path.join(profilePack, "package.json"), bytes: 1, sha256: "2".repeat(64) },
-		profile: { path: path.join(profilePack, "profiles", "swival.json"), bytes: 1, sha256: "3".repeat(64) } };
+		manifest: { path: path.join(profilePack, "package.json"), ...reviewedProfileArtifacts.manifest },
+		profile: { path: path.join(profilePack, "profiles", "swival.json"), ...reviewedProfileArtifacts.profile,
+			...(unreviewedProfile ? { sha256: "0".repeat(64) } : {}) },
+		defaultPolicy: { ...reviewedDefaultPolicy,
+			...(unreviewedDefault ? { source: "local-file" } : {}) } };
 	const generated = producerOutput(scenario, root);
 	const expectedDecisions: Record<string, string[]> = { keep: ["keep"], rewrite: ["keep_with_changes"], drop: ["drop"],
 		mixed: ["keep_with_changes", "drop"], "projection-collision": ["keep_with_changes", "drop"] };
@@ -120,6 +129,20 @@ describe("released Swival finding lineage", () => {
 			expect(recovered.details.results[0].nativeAudit.status).toBe("completed");
 		}
 	}, 15_000);
+
+	it.each([
+		["profile", true, false],
+		["inherited default", false, true],
+	] as const)("rejects completed evidence with an unreviewed nonempty %s identity",
+		async (_name, unreviewedProfile, unreviewedDefault) => {
+			const fixture = lineage("keep", unreviewedProfile, unreviewedDefault);
+			expect((await fixture.direct).status).not.toBe("completed");
+			for (const action of ["status", "resume"] as const) {
+				const recovered = await fixture.recover(action);
+				expect(recovered.isError).toBe(true);
+				expect(recovered.details.results[0].nativeAudit.status).not.toBe("completed");
+			}
+		}, 15_000);
 
 	it.each(invalid)("rejects impossible lineage state: %s", async (scenario) => {
 		const fixture = lineage(scenario);

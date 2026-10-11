@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "swival",
+  "version": "0.1.2",
+  "description": "Teaches Swival how to work inside a nono security sandbox. Ships the nono-sandbox skill that diagnoses permission denials and helps users draft profile extensions when they need more access.",
+  "license": "MIT",
+  "author": "Frank Denis <github@pureftpd.org>",
+  "platforms": ["macos", "linux"],
+  "min_nono_version": "0.53.0",
+  "artifacts": [
+    { "type": "profile", "path": "policy.json", "install_as": "swival" },
+    { "type": "plugin", "path": "skills/nono-sandbox/SKILL.md" },
+    { "type": "plugin", "path": "wiring/swival-skills-dir-marker" }
+  ],
+  "wiring": [
+    {
+      "type": "write_file",
+      "source": "wiring/swival-skills-dir-marker",
+      "dest": "$HOME/.config/swival/skills/.nono-swival-pack-marker"
+    },
+    {
+      "type": "symlink",
+      "link": "$HOME/.config/swival/skills/nono-sandbox",
+      "target": "$PACK_DIR/skills/nono-sandbox"
+    }
+  ]
+}

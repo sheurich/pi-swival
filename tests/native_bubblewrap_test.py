@@ -9,6 +9,7 @@ import json
 import operator
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import time
@@ -23,31 +24,70 @@ bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
 
+REVIEWED_PACK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "nono-swival-0.1.2"
+REVIEWED_MANIFEST_BYTES = REVIEWED_PACK_FIXTURE.joinpath("package.json").read_bytes()
+REVIEWED_PROFILE_BYTES = REVIEWED_PACK_FIXTURE.joinpath("policy.json").read_bytes()
+REVIEWED_PROFILE_ARTIFACTS = {
+    "manifest": {"bytes": 968,
+                 "sha256": "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2"},
+    "profile": {"bytes": 1747,
+                "sha256": "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c"},
+}
+REVIEWED_DEFAULT_POLICY_IDENTITY = {
+    "name": "default", "source": "authenticated-nono-0.79.0-embedded-policy",
+    "extends": [],
+    "nonoSha256": "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b",
+}
+
+
 def synthetic_profile_identity(config="/trusted/config"):
+    """Build a path-only unit mock around the reviewed byte identities."""
     pack = f"{config}/nono/packages/jedisct1/swival"
     return {"config": config, "pack": pack,
-            "manifest": {"path": f"{pack}/package.json", "bytes": 1,
-                         "sha256": "2" * 64},
-            "profile": {"path": f"{pack}/profiles/swival.json", "bytes": 1,
-                        "sha256": "3" * 64}}
+            "manifest": {"path": f"{pack}/package.json",
+                         **REVIEWED_PROFILE_ARTIFACTS["manifest"]},
+            "profile": {"path": f"{pack}/profiles/swival.json",
+                        **REVIEWED_PROFILE_ARTIFACTS["profile"]},
+            "defaultPolicy": dict(REVIEWED_DEFAULT_POLICY_IDENTITY)}
 
 
 def write_local_profile_pack(home, *, include_manifest=True, include_profile=True):
-    """Create only the loader inputs, without a parent package lockfile."""
+    """Install exact reviewed source subjects at their nono loader paths."""
     pack = home / ".config" / "nono" / "packages" / "jedisct1" / "swival"
     profiles = pack / "profiles"
     profiles.mkdir(parents=True)
     if include_manifest:
-        (pack / "package.json").write_text(json.dumps({
-            "schema_version": 1, "name": "swival",
-            "artifacts": [{"type": "profile", "path": "policy.json",
-                           "install_as": "swival"}],
-        }), encoding="utf-8")
+        (pack / "package.json").write_bytes(REVIEWED_MANIFEST_BYTES)
     if include_profile:
-        (profiles / "swival.json").write_text(
-            json.dumps({"extends": "default", "meta": {"name": "swival"}}),
-            encoding="utf-8")
+        (profiles / "swival.json").write_bytes(REVIEWED_PROFILE_BYTES)
     return pack
+
+
+def write_default_override(home, route, policy):
+    """Create one real nono 0.79.0 lookup route for the inherited default."""
+    config = home / ".config" / "nono"
+    selected = config / "packages" / "jedisct1" / "swival"
+    contents = json.dumps(policy)
+    if route == "sibling":
+        (selected / "profiles" / "default.json").write_text(contents, encoding="utf-8")
+    elif route in {"user-jsonc", "user-json"}:
+        profiles = config / "profiles"
+        profiles.mkdir(parents=True, exist_ok=True)
+        suffix = ".jsonc" if route == "user-jsonc" else ".json"
+        profiles.joinpath(f"default{suffix}").write_text(contents, encoding="utf-8")
+    elif route in {"pack-install-as", "pack-alias"}:
+        pack = config / "packages" / "attacker" / route
+        (pack / "profiles").mkdir(parents=True)
+        install_as = "default" if route == "pack-install-as" else "innocent"
+        aliases = [] if route == "pack-install-as" else ["default"]
+        (pack / "package.json").write_text(json.dumps({
+            "schema_version": 1, "name": route,
+            "artifacts": [{"type": "profile", "path": "policy.json",
+                           "install_as": install_as, "aliases": aliases}],
+        }), encoding="utf-8")
+        (pack / "profiles" / f"{install_as}.json").write_text(contents, encoding="utf-8")
+    else:
+        raise AssertionError(f"unknown override route: {route}")
 
 
 # Identity, boundary, and auth controls share one release-pinned fixture.
@@ -201,6 +241,340 @@ class NativeBubblewrapTests(unittest.TestCase):
                 pack.chmod(0o755)
                 (pack / "profiles").chmod(0o755)
 
+    def test_local_profile_accepts_reviewed_source_and_installed_representations(self):
+        expected = {
+            role: {"bytes": len(contents), "sha256": hashlib.sha256(contents).hexdigest()}
+            for role, contents in (("manifest", REVIEWED_MANIFEST_BYTES),
+                                   ("profile", REVIEWED_PROFILE_BYTES))
+        }
+        self.assertEqual(expected, REVIEWED_PROFILE_ARTIFACTS)
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home)
+            self.assertEqual((pack / "package.json").read_bytes(), REVIEWED_MANIFEST_BYTES)
+            self.assertEqual((pack / "profiles" / "swival.json").read_bytes(),
+                             REVIEWED_PROFILE_BYTES)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                identity = bridge.validate_nono_profile_identity()
+            self.assertEqual({key: {field: identity[key][field]
+                                    for field in ("bytes", "sha256")}
+                              for key in ("manifest", "profile")}, expected)
+            self.assertEqual(identity["defaultPolicy"], REVIEWED_DEFAULT_POLICY_IDENTITY)
+
+    def test_local_profile_rejects_unreviewed_policy_capabilities_without_execution(self):
+        marker = Path(tempfile.gettempdir()) / "native-profile-hook-must-not-run"
+        marker.unlink(missing_ok=True)
+        reviewed = json.loads(REVIEWED_PROFILE_BYTES)
+        cases = {
+            "external-sandbox": {**reviewed, "linux": {"sandbox_policy": "external"}},
+            "connect-port": {**reviewed, "network": {"block": False,
+                                                       "connect_port": [443]}},
+            "session-hook": {**reviewed, "session_hooks": {
+                "before": [f"touch {marker}"]}},
+            "benign-unreviewed": {"extends": "default", "meta": {"name": "swival"}},
+        }
+        for name, policy in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                home = Path(root).resolve() / "home"
+                home.mkdir()
+                pack = write_local_profile_pack(home)
+                (pack / "profiles" / "swival.json").write_text(
+                    json.dumps(policy), encoding="utf-8")
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                     patch.object(bridge.subprocess, "Popen",
+                                  side_effect=AssertionError("process execution forbidden")), \
+                     patch.object(socket, "create_connection",
+                                  side_effect=AssertionError("network forbidden")), \
+                     self.assertRaisesRegex(bridge.NativeAuditError, "identity"):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    bridge.validate_nono_profile_identity()
+        self.assertFalse(marker.exists())
+
+    def test_local_profile_rejects_selected_subject_byte_substitution_before_parsing(self):
+        manifest = json.loads(REVIEWED_MANIFEST_BYTES)
+        changed_artifact = json.loads(REVIEWED_MANIFEST_BYTES)
+        changed_artifact["artifacts"][0]["install_as"] = "other"
+        cases = (
+            ("manifest-extra", "package.json",
+             json.dumps({**manifest, "review_status": "looks-safe"}).encode()),
+            ("manifest-artifact", "package.json", json.dumps(changed_artifact).encode()),
+            ("manifest-malformed", "package.json", b"{"),
+            ("manifest-duplicate", "package.json",
+             b'{"schema_version":1,"schema_version":1,"name":"swival"}'),
+            ("profile-substitution", "profiles/swival.json", REVIEWED_MANIFEST_BYTES),
+            ("profile-malformed", "profiles/swival.json", b"{"),
+            ("profile-duplicate", "profiles/swival.json",
+             b'{"extends":"default","extends":"default"}'),
+        )
+        for name, relative, contents in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                home = Path(root).resolve() / "home"
+                home.mkdir()
+                pack = write_local_profile_pack(home)
+                (pack / relative).write_bytes(contents)
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                     self.assertRaisesRegex(
+                         bridge.NativeAuditError,
+                         "Native nono local profile input identity is unsupported"):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    bridge.validate_nono_profile_identity()
+
+    def test_default_resolver_enforces_namespace_and_total_pack_limits(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            selected = write_local_profile_pack(home)
+            store = selected.parent.parent
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                 patch.object(bridge.subprocess, "Popen",
+                              side_effect=AssertionError("process execution forbidden")), \
+                 patch.object(socket, "create_connection",
+                              side_effect=AssertionError("network forbidden")), \
+                 patch.object(bridge, "_NONO_PROFILE_NAMESPACE_LIMIT", 1):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self.assertEqual(bridge.validate_nono_profile_identity()["pack"],
+                                 str(selected))
+                (store / "other").mkdir()
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "^Native nono default profile resolver exceeded its limit\\.$"):
+                    bridge.validate_nono_profile_identity()
+            self.assertEqual((selected / "package.json").read_bytes(),
+                             REVIEWED_MANIFEST_BYTES)
+
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            selected = write_local_profile_pack(home)
+            store = selected.parent.parent
+            (store / "alpha" / "one").mkdir(parents=True)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                 patch.object(bridge.subprocess, "Popen",
+                              side_effect=AssertionError("process execution forbidden")), \
+                 patch.object(socket, "create_connection",
+                              side_effect=AssertionError("network forbidden")), \
+                 patch.object(bridge, "_NONO_PROFILE_PACK_LIMIT", 2):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self.assertEqual(bridge.validate_nono_profile_identity()["pack"],
+                                 str(selected))
+                (store / "beta" / "two").mkdir(parents=True)
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "^Native nono default profile resolver exceeded its limit\\.$"):
+                    bridge.validate_nono_profile_identity()
+
+    def test_default_resolver_enforces_manifest_and_artifact_limits(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            selected = write_local_profile_pack(home)
+            other = selected.parent.parent / "other" / "manifest-limit"
+            other.mkdir(parents=True)
+            manifest_path = other / "package.json"
+            manifest = b'{"schema_version":1,"name":"at-limit","artifacts":[]}'
+            manifest_path.write_bytes(manifest.ljust(968, b" "))
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                 patch.object(bridge.subprocess, "Popen",
+                              side_effect=AssertionError("process execution forbidden")), \
+                 patch.object(socket, "create_connection",
+                              side_effect=AssertionError("network forbidden")), \
+                 patch.object(bridge, "_NONO_MANIFEST_LIMIT", 968):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self.assertEqual(bridge.validate_nono_profile_identity()["pack"],
+                                 str(selected))
+                manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "^Native nono default profile resolver input is invalid\\.$"):
+                    bridge.validate_nono_profile_identity()
+
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            selected = write_local_profile_pack(home)
+            other = selected.parent.parent / "other" / "artifact-limit"
+            other.mkdir(parents=True)
+            manifest_path = other / "package.json"
+
+            def artifact_manifest(count):
+                return json.dumps({"schema_version": 1, "name": "artifact-limit",
+                                   "artifacts": [{"type": "instruction",
+                                                  "path": f"item-{index}"}
+                                                 for index in range(count)]})
+
+            manifest_path.write_text(artifact_manifest(128), encoding="utf-8")
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                 patch.object(bridge.subprocess, "Popen",
+                              side_effect=AssertionError("process execution forbidden")), \
+                 patch.object(socket, "create_connection",
+                              side_effect=AssertionError("network forbidden")):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                self.assertEqual(bridge.validate_nono_profile_identity()["pack"],
+                                 str(selected))
+                manifest_path.write_text(artifact_manifest(129), encoding="utf-8")
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "^Native nono default profile resolver input is invalid\\.$"):
+                    bridge.validate_nono_profile_identity()
+
+    def test_default_resolver_rejects_namespace_and_package_symlinks(self):
+        for kind in ("namespace", "package"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as root:
+                home = Path(root).resolve() / "home"
+                home.mkdir()
+                selected = write_local_profile_pack(home)
+                store = selected.parent.parent
+                if kind == "namespace":
+                    (store / "linked-namespace").symlink_to(
+                        store / "jedisct1", target_is_directory=True)
+                else:
+                    namespace = store / "other"
+                    namespace.mkdir()
+                    (namespace / "linked-package").symlink_to(
+                        selected, target_is_directory=True)
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                     patch.object(bridge.subprocess, "Popen",
+                                  side_effect=AssertionError("process execution forbidden")), \
+                     patch.object(socket, "create_connection",
+                                  side_effect=AssertionError("network forbidden")), \
+                     self.assertRaisesRegex(
+                         bridge.NativeAuditError,
+                         "^Native nono default profile resolver input is invalid\\.$"):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    bridge.validate_nono_profile_identity()
+                self.assertEqual((selected / "profiles" / "swival.json").read_bytes(),
+                                 REVIEWED_PROFILE_BYTES)
+
+    def test_default_resolver_strictly_parses_third_party_manifests(self):
+        cases = {
+            "duplicate": b'{"schema_version":1,"name":"first","name":"second"}',
+            "nan": b'{"schema_version":1,"name":"bad","value":NaN}',
+            "infinity": b'{"schema_version":1,"name":"bad","value":Infinity}',
+            "negative-infinity": b'{"schema_version":1,"name":"bad","value":-Infinity}',
+        }
+        for name, contents in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as root:
+                home = Path(root).resolve() / "home"
+                home.mkdir()
+                selected = write_local_profile_pack(home)
+                other = selected.parent.parent / "other" / name
+                other.mkdir(parents=True)
+                (other / "package.json").write_bytes(contents)
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                     patch.object(bridge.subprocess, "Popen",
+                                  side_effect=AssertionError("process execution forbidden")), \
+                     patch.object(socket, "create_connection",
+                                  side_effect=AssertionError("network forbidden")), \
+                     patch.object(bridge, "_strict_json_object",
+                                  wraps=bridge._strict_json_object) as strict, \
+                     self.assertRaisesRegex(
+                         bridge.NativeAuditError,
+                         "^Native nono default profile resolver input is invalid\\.$"):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    bridge.validate_nono_profile_identity()
+                self.assertTrue(any(call_args.args[0] == contents
+                                    for call_args in strict.call_args_list))
+
+    def test_local_profile_rejects_every_default_override_route_without_execution(self):
+        self.assertEqual(json.loads(REVIEWED_PROFILE_BYTES)["extends"], "default")
+        routes = ("sibling", "user-jsonc", "user-json",
+                  "pack-install-as", "pack-alias")
+        for route in routes:
+            for capability in ("external", "connect-port", "session-hook"):
+                with self.subTest(route=route, capability=capability), \
+                     tempfile.TemporaryDirectory() as root:
+                    home = Path(root).resolve() / "home"
+                    home.mkdir()
+                    write_local_profile_pack(home)
+                    marker = Path(root) / "inherited-hook-must-not-run"
+                    policy = {
+                        "external": {"linux": {"sandbox_policy": "external"}},
+                        "connect-port": {"network": {"connect_port": [443]}},
+                        "session-hook": {"session_hooks": {
+                            "before": {"script": str(marker)}}},
+                    }[capability]
+                    write_default_override(home, route, policy)
+                    with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                         patch.object(bridge.subprocess, "Popen",
+                                      side_effect=AssertionError("hook execution forbidden")), \
+                         patch.object(socket, "create_connection",
+                                      side_effect=AssertionError("network forbidden")), \
+                         self.assertRaisesRegex(
+                             bridge.NativeAuditError,
+                             "Native nono inherited default profile override is unsupported"):
+                        os.environ.pop("XDG_CONFIG_HOME", None)
+                        bridge.validate_nono_profile_identity()
+                    self.assertFalse(marker.exists())
+
+    def test_local_profile_rejects_ambiguous_symlink_and_malformed_default_inputs(self):
+        cases = ("ambiguous-user", "sibling-symlink", "user-symlink",
+                 "malformed-pack-manifest")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as root:
+                home = Path(root).resolve() / "home"
+                home.mkdir()
+                pack = write_local_profile_pack(home)
+                user_profiles = home / ".config" / "nono" / "profiles"
+                if case == "ambiguous-user":
+                    user_profiles.mkdir(parents=True)
+                    for suffix in ("jsonc", "json"):
+                        (user_profiles / f"default.{suffix}").write_text("{}", encoding="utf-8")
+                elif case == "sibling-symlink":
+                    outside = home / "outside-default.json"
+                    outside.write_text("{}", encoding="utf-8")
+                    (pack / "profiles" / "default.json").symlink_to(outside)
+                elif case == "user-symlink":
+                    user_profiles.mkdir(parents=True)
+                    outside = home / "outside-default.json"
+                    outside.write_text("{}", encoding="utf-8")
+                    (user_profiles / "default.jsonc").symlink_to(outside)
+                else:
+                    other = home / ".config" / "nono" / "packages" / "bad" / "pack"
+                    other.mkdir(parents=True)
+                    (other / "package.json").write_bytes(b"{")
+                expected = ("resolver input is invalid" if case == "malformed-pack-manifest"
+                            else "default profile override is unsupported")
+                with patch.dict(os.environ, {"HOME": str(home)}, clear=False), \
+                     self.assertRaisesRegex(bridge.NativeAuditError, expected):
+                    os.environ.pop("XDG_CONFIG_HOME", None)
+                    bridge.validate_nono_profile_identity()
+
+    def test_local_profile_default_resolution_drift_fails_revalidation(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                identity = bridge.validate_nono_profile_identity()
+                (pack / "profiles" / "default.json").write_text(
+                    json.dumps({"network": {"connect_port": [443]}}), encoding="utf-8")
+                with self.assertRaisesRegex(bridge.NativeAuditError, "default profile override"):
+                    bridge._revalidate_nono_profile({"nonoProfileIdentity": identity})
+
+    def test_local_profile_identity_pin_rejects_substitution_and_drift(self):
+        reviewed = synthetic_profile_identity()
+        self.assertTrue(bridge._bound_nono_profile_identity(reviewed))
+        substituted = json.loads(json.dumps(reviewed))
+        substituted["profile"]["sha256"] = "0" * 64
+        self.assertFalse(bridge._bound_nono_profile_identity(substituted))
+        substituted = json.loads(json.dumps(reviewed))
+        substituted["defaultPolicy"]["source"] = "local-file"
+        self.assertFalse(bridge._bound_nono_profile_identity(substituted))
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root).resolve() / "home"
+            home.mkdir()
+            pack = write_local_profile_pack(home)
+            with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+                os.environ.pop("XDG_CONFIG_HOME", None)
+                identity = bridge.validate_nono_profile_identity()
+                (pack / "profiles" / "swival.json").write_bytes(
+                    REVIEWED_PROFILE_BYTES + b"\n")
+                with self.assertRaises(bridge.NativeAuditError):
+                    bridge._revalidate_nono_profile({"nonoProfileIdentity": identity})
+
     def test_local_profile_rejects_stale_lockfile_missing_and_unsafe_inputs(self):
         with tempfile.TemporaryDirectory() as root:
             home = Path(root).resolve() / "home"
@@ -210,20 +584,22 @@ class NativeBubblewrapTests(unittest.TestCase):
                 json.dumps({"packages": {"jedisct1/swival": {}}}), encoding="utf-8")
             with patch.dict(os.environ, {"HOME": str(home)}, clear=False):
                 os.environ.pop("XDG_CONFIG_HOME", None)
-                with self.assertRaises(bridge.NativeAuditError):
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "Native nono local profile input is unavailable\\."):
                     bridge.validate_nono_profile_identity()
-                (pack / "package.json").write_text(json.dumps({
-                    "schema_version": 1, "name": "swival",
-                    "artifacts": [{"type": "profile", "path": "policy.json",
-                                   "install_as": "swival"}],
-                }), encoding="utf-8")
+                (pack / "package.json").write_bytes(REVIEWED_MANIFEST_BYTES)
                 (pack / "profiles" / "swival.json").unlink()
-                with self.assertRaises(bridge.NativeAuditError):
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "Native nono local profile input is unavailable\\."):
                     bridge.validate_nono_profile_identity()
                 outside = home / "outside-profile.json"
                 outside.write_text("{}", encoding="utf-8")
                 (pack / "profiles" / "swival.json").symlink_to(outside)
-                with self.assertRaises(bridge.NativeAuditError):
+                with self.assertRaisesRegex(
+                        bridge.NativeAuditError,
+                        "Native nono local profile path is not canonical\\."):
                     bridge.validate_nono_profile_identity()
 
     def test_local_profile_rejects_ambiguous_profile_artifacts(self):

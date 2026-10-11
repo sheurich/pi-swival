@@ -49,10 +49,9 @@ function fixture(behavior = "complete") {
 	fs.mkdirSync(source); fs.mkdirSync(artifacts); fs.mkdirSync(bin);
 	const profilePack = path.join(root, ".config", "nono", "packages", "jedisct1", "swival");
 	fs.mkdirSync(path.join(profilePack, "profiles"), { recursive: true });
-	fs.writeFileSync(path.join(profilePack, "package.json"), JSON.stringify({ schema_version: 1, name: "swival",
-		artifacts: [{ type: "profile", path: "policy.json", install_as: "swival" }] }));
-	fs.writeFileSync(path.join(profilePack, "profiles", "swival.json"),
-		JSON.stringify({ extends: "default", meta: { name: "swival" } }));
+	const reviewedPack = path.join(ROOT, "tests", "fixtures", "nono-swival-0.1.2");
+	fs.copyFileSync(path.join(reviewedPack, "package.json"), path.join(profilePack, "package.json"));
+	fs.copyFileSync(path.join(reviewedPack, "policy.json"), path.join(profilePack, "profiles", "swival.json"));
 	const git = (...args: string[]) => execFileSync("git", ["-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: source, timeout: 5000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 	git("init", "--template="); git("config", "user.name", "Test"); git("config", "user.email", "test@example.invalid");
 	fs.writeFileSync(path.join(source, "code.py"), behavior === "lost-expansion"

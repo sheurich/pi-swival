@@ -104,10 +104,17 @@ class NativeEntryTests(unittest.TestCase):
         pack = config / "nono" / "packages" / "jedisct1" / "swival"
         profile_identity = {
             "config": str(config), "pack": str(pack),
-            "manifest": {"path": str(pack / "package.json"), "bytes": 1,
-                         "sha256": "2" * 64},
-            "profile": {"path": str(pack / "profiles" / "swival.json"), "bytes": 1,
-                        "sha256": "3" * 64},
+            "manifest": {"path": str(pack / "package.json"),
+                         **bridge.NONO_PROFILE_ARTIFACT_IDENTITIES["manifest"]},
+            "profile": {"path": str(pack / "profiles" / "swival.json"),
+                        **bridge.NONO_PROFILE_ARTIFACT_IDENTITIES["profile"]},
+            # Explicit unit-boundary mock; live validation is covered separately.
+            "defaultPolicy": {
+                "name": "default",
+                "source": "authenticated-nono-0.79.0-embedded-policy",
+                "extends": [],
+                "nonoSha256": bridge.NONO_ARTIFACT_IDENTITY["sha256"],
+            },
         }
         request = {"source": str(self.repo), "snapshot": str(self.repo),
                    "evidence": str(self.evidence),
