@@ -841,6 +841,8 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 		if (new Set(verifiedKeys).size !== verifiedKeys.length ||
 			Object.keys(state.artifact_state).length !== verifiedKeys.length ||
 			verifiedKeys.some((key) => !Object.hasOwn(state.artifact_state, key))) return incomplete();
+		const reportFilenames = new Set<string>();
+		const patchFilenames = new Set<string>();
 		for (const key of verifiedKeys) {
 			const entry = state.artifact_state[key];
 			if (!isPlainRecord(entry)) return incomplete();
@@ -848,6 +850,10 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 			for (const [field, extension] of [["report_filename", "md"], ["patch_filename", "patch"]]) {
 				const name = entry[field];
 				if (typeof name !== "string" || !new RegExp(`^[0-9]+-[a-zA-Z0-9_-]+\\.${extension}$`).test(name)) throw new Error("Unsupported native artifact filename.");
+				const filenames = extension === "md" ? reportFilenames : patchFilenames;
+				if (filenames.has(name)) return { status: "failed" as const,
+					error: "Native artifact filenames are reused across findings.", statePath };
+				filenames.add(name);
 				const file = path.join(artifactDir, "evidence", "audit-findings", name);
 				const stat = await fs.lstat(file);
 				if ((await fs.realpath(file)) !== file || !stat.isFile() || stat.size > 8 * 1024 * 1024) {

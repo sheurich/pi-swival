@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import registerExtension from "../extensions/index.js";
-import { inspectNativeAudit } from "../extensions/native-audit.js";
+import { inspectNativeAudit, nativeFindingKey } from "../extensions/native-audit.js";
 import { nativeTestPython as python } from "./nativePython.js";
 
 const roots: string[] = [];
@@ -33,7 +33,10 @@ const producerOutput = (scenario: string, home: string) => JSON.parse(execFileSy
 		env: { HOME: home, PATH: process.env.PATH, LITELLM_LOCAL_MODEL_COST_MAP: "True" },
 	}).toString());
 
-function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault = false) {
+type ArtifactPairMode = "distinct" | "report-reuse" | "patch-reuse" | "both-reused";
+
+function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault = false,
+	artifactPairMode?: ArtifactPairMode) {
 	const artifactRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-lineage-"))); roots.push(artifactRoot);
 	const runId = `lineage-${scenario}`; const root = path.join(artifactRoot, runId); fs.mkdirSync(root);
 	const profilePack = path.join(root, "nono", "packages", "jedisct1", "swival");
@@ -59,6 +62,25 @@ function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault 
 		});
 		expect(generated.released_decisions).toEqual(expectedDecisions[scenario]);
 	} else expect(generated.producer.lineage_function).toBe("handwritten-negative-state");
+	if (artifactPairMode) {
+		const state = generated.persisted_state;
+		const firstFinding = state.proposed_findings[0];
+		const secondFinding = { ...firstFinding, title: "second", locations: ["code.py:2"] };
+		const secondKey = nativeFindingKey(secondFinding);
+		if (!secondKey || secondKey === generated.verified_keys[0]) throw new Error("invalid distinct finding fixture");
+		state.proposed_findings.push(secondFinding);
+		state.verification_state[secondKey] = { status: "verified" };
+		state.verified_findings.push({ ...state.verified_findings[0], finding: secondFinding });
+		const firstArtifact = state.artifact_state[generated.verified_keys[0]];
+		state.artifact_state[secondKey] = {
+			status: "written",
+			report_filename: artifactPairMode === "report-reuse" || artifactPairMode === "both-reused"
+				? firstArtifact.report_filename : "002-lineage.md",
+			patch_filename: artifactPairMode === "patch-reuse" || artifactPairMode === "both-reused"
+				? firstArtifact.patch_filename : "002-lineage.patch",
+		};
+		generated.verified_keys.push(secondKey);
+	}
 	const evidence = path.join(root, "evidence"); const stateDir = path.join(evidence, "native-state", "abc12345");
 	const findingsDir = path.join(evidence, "audit-findings"); fs.mkdirSync(stateDir, { recursive: true }); fs.mkdirSync(findingsDir);
 	const artifactState: Record<string, any> = generated.persisted_state?.artifact_state ?? {};
@@ -80,7 +102,8 @@ function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault 
 		verified_findings: generated.verified_findings, adjudication_discarded: generated.adjudication_discarded };
 	const scope = state.scope; const commit = scope.commit;
 	const route = { version: 1, provider: "lmstudio", model: "offline", reasoningEffort: "low" };
-	fs.writeFileSync(path.join(stateDir, "state.json"), generated.persisted_state_text ?? JSON.stringify(state));
+	fs.writeFileSync(path.join(stateDir, "state.json"), artifactPairMode
+		? JSON.stringify(state) : generated.persisted_state_text ?? JSON.stringify(state));
 	fs.writeFileSync(path.join(root, "run-meta.json"), JSON.stringify({ runId, artifactDir: root,
 		nativeAuditRequested: true, startedAt: Date.now(), agent: "native-audit", task: "/audit" }));
 	fs.writeFileSync(path.join(root, "completed.json"), JSON.stringify({ exitCode: 0, exitedAt: new Date().toISOString(),
@@ -129,6 +152,19 @@ describe("released Swival finding lineage", () => {
 			expect(recovered.details.results[0].nativeAudit.status).toBe("completed");
 		}
 	}, 15_000);
+
+	it("accepts two independently keyed findings with distinct artifact pairs", async () => {
+		const fixture = lineage("keep", false, false, "distinct");
+		expect((await fixture.direct).status).toBe("completed");
+	});
+
+	it.each(["report-reuse", "patch-reuse", "both-reused"] as const)(
+		"rejects independently keyed findings with %s at the artifact uniqueness check", async (mode) => {
+			const fixture = lineage("keep", false, false, mode);
+			expect(await fixture.direct).toMatchObject({
+				status: "failed", error: "Native artifact filenames are reused across findings.",
+			});
+		});
 
 	it.each([
 		["profile", true, false],
