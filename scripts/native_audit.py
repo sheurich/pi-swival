@@ -511,7 +511,9 @@ def resolve_native_config(request):
         raise NativeAuditError(
             "Unsupported native runtime; require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+."
         )
-    if "USE_LITELLM_PROXY" in os.environ:
+    if ("USE_LITELLM_PROXY" in os.environ
+            or any(name.lower() in {"http_proxy", "https_proxy", "all_proxy"}
+                   for name in os.environ)):
         raise NativeAuditError("Unsupported native transport proxy requirements.")
     protected_environment = ("SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD")
     if any(name in os.environ for name in protected_environment):

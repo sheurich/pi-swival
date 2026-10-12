@@ -82,8 +82,10 @@ class NativeEntryTests(unittest.TestCase):
         self.repo.mkdir()
         self.evidence.mkdir()
         self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config")
-        }))
+            "PATH": os.environ["PATH"], "HOME": str(self.root),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        }, clear=True))
         for name in ("socket", "create_connection", "getaddrinfo"):
             self.enterContext(patch.object(socket, name,
                                           side_effect=AssertionError("provider/network forbidden")))
@@ -338,10 +340,25 @@ class NativeEntryTests(unittest.TestCase):
                 bridge._route_binding(settings, None)
 
     def test_native_route_rejects_hidden_proxy_and_alternate_bedrock_endpoint_routes(self):
+        import litellm  # pylint: disable=import-outside-toplevel
+
         request = self.request()
         with patch.dict(os.environ, {"USE_LITELLM_PROXY": "true"}):
             with self.assertRaisesRegex(bridge.NativeAuditError, "proxy"):
                 bridge.resolve_native_config(request)
+        proxy_names = ("USE_LITELLM_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                       "https_proxy", "all_proxy", "hTtP_pRoXy", "hTtPs_PrOxY", "aLl_PrOxY")
+        for name in proxy_names:
+            for value in ("", "http://synthetic-proxy.invalid"):
+                with self.subTest(name=name, value=bool(value)), \
+                     patch.dict(os.environ, {name: value}), \
+                     patch("swival.session.Session") as session, \
+                     patch.object(litellm, "completion") as transport:
+                    with self.assertRaisesRegex(bridge.NativeAuditError,
+                                                "Unsupported native transport proxy requirements"):
+                        bridge.run_native(request)
+                    session.assert_not_called()
+                    transport.assert_not_called()
         for prefix in ("mantle", "agent", "agentcore", "claude_platform", "openai"):
             with self.subTest(prefix=prefix), self.assertRaises(bridge.NativeAuditError):
                 bridge._route_binding({"provider": "bedrock", "model": prefix + "/offline-model",

@@ -76,6 +76,26 @@ describe("native audit dispatch boundary", () => {
 		expect(fs.existsSync(path.join(root, "generic-dispatch"))).toBe(false);
 		expect(fs.readdirSync(root)).toEqual([]);
 	});
+	it("registered native tool rejects an ambient proxy before artifacts, workers, or providers", async () => {
+		const source = repository(); const home = scratch();
+		fs.mkdirSync(path.join(home, ".config"), { recursive: true });
+		const previous = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+			hTtP_pRoXy: process.env.hTtP_pRoXy };
+		process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+		process.env.hTtP_pRoXy = "";
+		try {
+			const result = await tool.execute("audit", { audit: { all: true }, modelOverride: "offline-model" },
+				undefined, undefined, { cwd: source, hasUI: false });
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toMatch(/preflight failed.*No native worker\/provider was started/i);
+			expect(fs.readdirSync(root)).toEqual([]);
+			expect(fs.existsSync(path.join(root, "generic-dispatch"))).toBe(false);
+		} finally {
+			for (const [name, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[name]; else process.env[name] = value;
+			}
+		}
+	});
 });
 
 describe("native preflight protection requirements (no worker, no provider)", () => {
@@ -121,6 +141,16 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		expect(result.output).toMatch(/protected/i);
 		expect(result.output).not.toContain("synthetic-never-log-this");
 	});
+	it.each([
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+		"hTtP_pRoXy", "hTtPs_PrOxY", "aLl_PrOxY",
+	].flatMap((name) => [[name, ""], [name, "http://synthetic-proxy.invalid"]]))
+		("rejects %s by presence for %s without a provider", async (name, value) => {
+			const result = await runPreflight(repository(), scratch(), { [name]: value }, { model: "offline-model" });
+			expect(result.code).toBe(1);
+			expect(result.output).toContain("Unsupported native transport proxy requirements.");
+			expect(result.output).not.toContain("synthetic-proxy.invalid");
+		});
 	it("resolves global profile and explicit model/provider/effort without initializing a provider", async () => {
 		const home = scratch();
 		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
