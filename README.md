@@ -159,7 +159,7 @@ The harness covers parsing, dispatch, report acceptance, traces, snapshots, arti
 npm test
 ```
 
-Require Node 22.19+ or Node 24, Pi 1.0.4, uv, and an installed Python 3.13. `./tests/setup.sh` installs local Vitest, TypeScript 5.9.3, and Node types 24.10.1 with `--ignore-scripts`, links the selected Pi peers, and syncs hash-locked Swival 1.0.46 into ignored `tests/.venv` using wheels only. It preserves npm configuration and global installations. Run it directly because npm exports script-approval policy to lifecycle children, which prevents the nested npm install. `npm test` and `npm run typecheck` never install dependencies. Native tests never silently skip missing dependencies.
+Require Node 22.19+ or Node 24, Pi 1.0.4 or later, uv, and an installed Python 3.13. CI tests Pi 1.0.4 and 1.2.0 against both Node versions using isolated, locked dependency fixtures in `tests/pi-hosts/`. Their overrides keep Pi's internal packages at the selected host version. `./tests/setup.sh` installs local Vitest, TypeScript 5.9.3, and Node types 24.10.1 with `--ignore-scripts`, links the selected Pi peers, and syncs hash-locked Swival 1.0.46 into ignored `tests/.venv` using wheels only. It preserves npm configuration and global installations. Run it directly because npm exports script-approval policy to lifecycle children, which prevents the nested npm install. `npm test` and `npm run typecheck` never install dependencies. Native tests never silently skip missing dependencies.
 
 From the package root:
 

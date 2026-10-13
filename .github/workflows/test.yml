@@ -17,14 +17,18 @@ jobs:
       fail-fast: false
       matrix:
         node-version: ['22.19.0', '24']
+        pi-version: ['1.0.4', '1.2.0']
+    env:
+      PI_CODING_AGENT_PACKAGE: >-
+        ${{ github.workspace }}/tests/pi-hosts/${{ matrix.pi-version }}/node_modules/@earendil-works/pi-coding-agent
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903  # v5.0.0
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Install Pi 1.0.4 globally
-        run: npm install --ignore-scripts -g "@earendil-works/pi-coding-agent@1.0.4"
+      - name: Install locked Pi host
+        run: npm ci --prefix "tests/pi-hosts/${{ matrix.pi-version }}" --ignore-scripts --no-audit --no-fund
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
         with:
