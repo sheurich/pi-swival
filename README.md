@@ -126,6 +126,8 @@ Compatibility tightening: command-name allowlists, including `git`, are write-ca
 
 Ordinary delegation adds one fixed plain-text heading to task delivery. Leading slash/bang text stays a prompt even with ambient `oneshot_commands=true`; task metadata remains unchanged. Use the explicit `audit` API for native execution. This blocks unintended command-script dispatch; it does not prevent model prompt injection.
 
+For ordinary single-mode `async: true`, `output` is bound before the detached wrapper starts and is materialized automatically after verified successful completion; no later `status`/`resume` call or live Pi parent is required. Relative output paths remain anchored to the original dispatch `cwd`. The default `outputMode` is `file-only`: completed `status` reports the path and size, while `resume` returns file metadata and a pointer without the body. `outputMode: "inline"` writes the same file and includes the body on `resume`. Rejected, malformed, sandbox-unverified, cancelled, or otherwise failed runs do not export partial output. Output uses a mode-0600 temporary file, symlink checks, and atomic rename; write failures are recorded in the artifact directory and make later `status`/`resume` fail explicitly rather than claiming the file was written. If verification fails after rename, cleanup erases the answer through the held file descriptor and restores mode `0600`. This can leave an empty file; cleanup never deletes a substituted target pathname. Descriptor erasure failures are reported explicitly. Startup failures can retain an empty mode-`0600` temporary file when cleanup cannot verify its live descriptor.
+
 ## Layout
 
 ```text

@@ -30,6 +30,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -63,6 +64,23 @@ const ASYNC_RUNNER_PATH = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../scripts/async-runner.cjs",
 );
+interface OutputBinding {
+	target: string;
+	/** Informational caller-facing path; only the canonical target is written. */
+	outputPath: string;
+	temporary: string;
+	directory: string;
+	directoryIdentity: { dev: number; ino: number };
+	fd: number;
+	identity: { dev: number; ino: number };
+}
+interface OutputFileResult { outputPath: string; outputBytes: number; outputLineCount: number }
+const outputFiles = createRequire(import.meta.url)("../scripts/output-file.cjs") as {
+	prepareOutputFile(outputPath: string, cwdAnchor: string): OutputBinding;
+	discardOutputFile(binding: OutputBinding): void;
+	selectAsyncOutputBody(answer: string | undefined, stdout: string, outputRequested: boolean): string;
+	writeOutputFile(outputPath: string, cwdAnchor: string, body: string): OutputFileResult;
+};
 
 // ------------------------------------------------- async run tracking --
 
@@ -88,6 +106,10 @@ export interface RunMeta {
 	nonoRequested?: boolean;
 	/** Required reviewer evidence from the effective launch arguments. */
 	reviewRequired?: boolean;
+	/** Startup-bound destination for an ordinary async run. Informational on
+	 * reload: only the detached wrapper's inherited descriptors authorize it. */
+	outputPath?: string;
+	outputMode?: "inline" | "file-only";
 	nativeAuditRequested?: boolean;
 }
 
@@ -103,6 +125,16 @@ interface AsyncRunEntry {
 interface CompletedMarker {
 	exitCode: number | null;
 	exitedAt: string; // ISO 8601
+}
+
+interface AsyncOutputResult {
+	status: "written" | "not-written" | "error";
+	outputPath: string;
+	outputMode: "inline" | "file-only";
+	outputBytes?: number;
+	outputLineCount?: number;
+	reason?: string;
+	error?: string;
 }
 
 /** Unified view of an async run's state, for use in control actions. */
@@ -166,79 +198,19 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
-async function hasSymlinkInPath(resolved: string, cwdAnchor: string): Promise<string | null> {
-	// 1. Check if the target leaf itself is an existing symlink
-	try {
-		const lst = await fs.promises.lstat(resolved);
-		if (lst.isSymbolicLink()) return resolved;
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-	}
-
-	// 2. For any path that resolves inside cwdAnchor, verify no parent directory component
-	// under cwdAnchor is a symlink.
-	const anchor = path.resolve(cwdAnchor);
-	let current = path.dirname(resolved);
-	while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
-		try {
-			const lst = await fs.promises.lstat(current);
-			if (lst.isSymbolicLink()) return current;
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-		}
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return null;
-}
-
 async function writeRunOutput(
 	r: SwivalResult,
 	outputPath: string,
 	outputMode: "inline" | "file-only" | undefined,
 	cwdAnchor: string,
 ): Promise<void> {
-	const isRelative = !path.isAbsolute(outputPath);
-	const resolved = isRelative ? path.resolve(cwdAnchor, outputPath) : outputPath;
-	let tmpFile: string | undefined;
+	const resolved = path.isAbsolute(outputPath) ? path.resolve(outputPath) : path.resolve(cwdAnchor, outputPath);
 	try {
-		// Refuse to write through an existing symlink (both the leaf file and
-		// any parent directory component within cwdAnchor). `outputPath` is model-controlled;
-		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
-		// or `linked.txt -> /etc/passwd`) so a caller-chosen path
-		// silently redirects writes to an attacker-chosen target.
-		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
-		if (symlinkFound) {
-			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
-		}
-		const dir = path.dirname(resolved);
-		await fs.promises.mkdir(dir, { recursive: true });
-		// Double check directory component after mkdir
-		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor);
-		if (postMkdirSymlink) {
-			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
-		}
-		const body = r.finalOutput ?? "";
-		// finalOutput may carry decrypted secrets or task-adjacent sensitive
-		// content; write to a temporary file opened with flag 'wx' and mode 0600,
-		// apply chmod, and atomically rename so the destination is never left
-		// world-readable or partially written on failure.
-		tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		try {
-			await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
-			await fs.promises.chmod(tmpFile, 0o600);
-			await fs.promises.rename(tmpFile, resolved);
-		} finally {
-			if (tmpFile) {
-				await fs.promises.unlink(tmpFile).catch(() => {});
-			}
-		}
-		r.outputPath = resolved;
-		// Default file-only when output is set; inline opts back in.
+		const written = outputFiles.writeOutputFile(outputPath, cwdAnchor, r.finalOutput ?? "");
+		r.outputPath = written.outputPath;
 		r.outputMode = outputMode ?? "file-only";
-		r.outputBytes = Buffer.byteLength(body, "utf-8");
-		r.outputLineCount = body === "" ? 0 : body.split("\n").length;
+		r.outputBytes = written.outputBytes;
+		r.outputLineCount = written.outputLineCount;
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		r.stderrTail = [...r.stderrTail, `failed to write output to ${resolved}: ${msg}`];
@@ -2039,7 +2011,9 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
 				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean") ||
 				("nativeAuditRequested" in parsed && typeof parsed.nativeAuditRequested !== "boolean") ||
-				("reviewRequired" in parsed && typeof parsed.reviewRequired !== "boolean")
+				("reviewRequired" in parsed && typeof parsed.reviewRequired !== "boolean") ||
+				("outputPath" in parsed && typeof parsed.outputPath !== "string") ||
+				("outputMode" in parsed && !["inline", "file-only"].includes(String(parsed.outputMode)))
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -2100,17 +2074,20 @@ async function loadRunState(
 			}
 			return info;
 		}
-		// Also read completed.json when the entry says exited, so callers
-		// that need the marker (e.g. resume) get it without a separate read.
-		if (entry.exited) {
-			try {
-				const txt = await fs.promises.readFile(
-					path.join(entry.meta.artifactDir, "completed.json"),
-					"utf-8",
-				);
-				info.completed = JSON.parse(txt) as CompletedMarker;
-			} catch { /* best-effort */ }
-		}
+		// The durable wrapper writes completed.json immediately before it exits;
+		// its ChildProcess close event can arrive a tick later. Prefer that marker
+		// whenever present so status/resume and a newly registered extension agree.
+		try {
+			const txt = await fs.promises.readFile(
+				path.join(entry.meta.artifactDir, "completed.json"),
+				"utf-8",
+			);
+			info.completed = JSON.parse(txt) as CompletedMarker;
+			info.exited = true;
+			info.exitCode = info.completed.exitCode;
+			entry.exited = true;
+			entry.exitCode = info.completed.exitCode;
+		} catch { /* still running or completion marker unavailable */ }
 		return info;
 	}
 
@@ -2141,7 +2118,29 @@ async function loadRunState(
 
 interface CompletedAsyncInspection {
 	report: ReportSummary | undefined;
+	output?: AsyncOutputResult;
 	reason?: FailureReason;
+}
+
+async function readAsyncOutputResult(meta: RunMeta): Promise<{ output?: AsyncOutputResult; error?: string }> {
+	if (!meta.outputPath) return {};
+	const resultPath = path.join(meta.artifactDir, "output-result.json");
+	try {
+		const stat = await fs.promises.lstat(resultPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) throw new Error("output result is not a bounded regular file");
+		const raw = JSON.parse(await fs.promises.readFile(resultPath, "utf8")) as Record<string, unknown>;
+		if (!["written", "not-written", "error"].includes(String(raw.status)) ||
+			raw.outputPath !== meta.outputPath || raw.outputMode !== meta.outputMode ||
+			(raw.outputBytes !== undefined && (!Number.isSafeInteger(raw.outputBytes) || (raw.outputBytes as number) < 0)) ||
+			(raw.outputLineCount !== undefined && (!Number.isSafeInteger(raw.outputLineCount) || (raw.outputLineCount as number) < 0)) ||
+			(raw.reason !== undefined && typeof raw.reason !== "string") ||
+			(raw.error !== undefined && typeof raw.error !== "string")) {
+			throw new Error("output result does not match startup-bound output metadata");
+		}
+		return { output: raw as unknown as AsyncOutputResult };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
 }
 
 async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
@@ -2153,13 +2152,23 @@ async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedA
 	const effectiveBootstrapReason = bootstrapCheck.reason ?? nonoCheck.reason;
 	const stderr = await fs.promises.readFile(state.meta.stderrFile, "utf-8").catch(() => "");
 	const stderrLines = stderr.split("\n").filter(Boolean);
-	const reason = terminalFailureReason(
+	const outputResult = await readAsyncOutputResult(state.meta);
+	let reason: FailureReason | undefined;
+	if (outputResult.error) {
+		reason = { code: "unknown", text: `Async output evidence is missing or invalid: ${outputResult.error}` };
+	} else if (outputResult.output?.status === "error") {
+		reason = { code: "unknown", text: `Failed to write output to ${state.meta.outputPath}: ${outputResult.output.error ?? "unknown write error"}` };
+	}
+	reason ??= terminalFailureReason(
 		state.exitCode ?? 1,
 		effectiveReport,
 		stderrLines,
 		effectiveBootstrapReason,
 	);
-	return { report: effectiveReport, reason };
+	if (!reason && outputResult.output?.status !== undefined && outputResult.output.status !== "written") {
+		reason = { code: "unknown", text: `Async output was not written: ${outputResult.output.reason ?? "terminal success was not verified"}` };
+	}
+	return { report: effectiveReport, output: outputResult.output, reason };
 }
 
 function formatCompletedAsyncFailure(
@@ -2201,7 +2210,8 @@ export async function runSingleSwivalAsync(
 	cwd: string | undefined,
 	overrides: SwivalOverrides,
 	artifactRoot: string = ARTIFACT_ROOT,
-): Promise<{ runId: string; artifactDir: string }> {
+	output?: { path: string; mode?: "inline" | "file-only"; cwdAnchor: string },
+): Promise<{ runId: string; artifactDir: string; outputPath?: string; outputMode?: "inline" | "file-only" }> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		throw new Error(unknownAgentMessage(agentName, agents));
@@ -2211,6 +2221,8 @@ export async function runSingleSwivalAsync(
 		throw new Error(reviewerError);
 	}
 	const runCwd = cwd ?? defaultCwd;
+	const dispatchCwd = path.resolve(runCwd);
+	const asyncArtifactRoot = output ? path.resolve(artifactRoot) : artifactRoot;
 	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
 	if (argumentError) throw new SwivalArgumentError(argumentError);
 
@@ -2221,7 +2233,7 @@ export async function runSingleSwivalAsync(
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
-	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
+	const { artifactDir, ts, runId } = mintArtifactDir(agentName, asyncArtifactRoot);
 	const traceDir = path.join(artifactDir, "trace");
 	await fs.promises.mkdir(traceDir, { recursive: true, mode: 0o700 });
 
@@ -2242,29 +2254,79 @@ export async function runSingleSwivalAsync(
 		args.push("--");
 	}
 
-	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
-	// opening stderrFd throws, close stdoutFd before propagating. Both are
-	// closed in the spawn try/finally so we never hold references that keep
-	// the event loop alive.
-	const stdoutFd = fs.openSync(stdoutFile, "w");
+	// Bind both directories before detaching. The runner holds dispatch cwd;
+	// its output committer holds output cwd. Both verify this read-only, unlinked
+	// config before Swival starts. Reloadable metadata grants no file authority.
+	let outputBinding: OutputBinding | undefined;
+	let outputConfigFd: number | undefined;
+	if (output) {
+		const dispatchStat = fs.statSync(dispatchCwd);
+		if (!dispatchStat.isDirectory()) throw new Error("dispatch cwd is not a directory");
+		outputBinding = outputFiles.prepareOutputFile(output.path, output.cwdAnchor);
+		const configPath = path.join(artifactDir, `.output-binding-${process.pid}-${randomBytes(8).toString("hex")}`);
+		try {
+			fs.writeFileSync(configPath, JSON.stringify({
+				dispatchIdentity: { dev: dispatchStat.dev, ino: dispatchStat.ino },
+				outputMode: output.mode ?? "file-only",
+				binding: {
+					target: outputBinding.target,
+					outputPath: outputBinding.outputPath,
+					temporary: outputBinding.temporary,
+					directory: outputBinding.directory,
+					directoryIdentity: outputBinding.directoryIdentity,
+					identity: outputBinding.identity,
+				},
+			}), { encoding: "utf8", mode: 0o600, flag: "wx" });
+			outputConfigFd = fs.openSync(configPath, "r");
+			fs.unlinkSync(configPath);
+		} catch (err) {
+			try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
+			try { fs.unlinkSync(configPath); } catch { /* ignore */ }
+			outputFiles.discardOutputFile(outputBinding);
+			throw err;
+		}
+	}
+
+	let stdoutFd: number;
+	try {
+		stdoutFd = fs.openSync(stdoutFile, "w");
+	} catch (err) {
+		if (outputBinding) outputFiles.discardOutputFile(outputBinding);
+		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
+		throw err;
+	}
 	let stderrFd: number;
 	try {
 		stderrFd = fs.openSync(stderrFile, "w");
 	} catch (err) {
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
+		if (outputBinding) outputFiles.discardOutputFile(outputBinding);
+		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
 		throw err;
 	}
 	let proc: ChildProcess;
+	let spawned = false;
 	try {
-		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
+		const runnerArgs = [ASYNC_RUNNER_PATH, artifactDir];
+		if (outputBinding) runnerArgs.push("--async-output-v1");
+		runnerArgs.push(...args);
+		proc = spawn(process.execPath, runnerArgs, {
 			cwd: runCwd,
 			shell: false,
-			stdio: ["ignore", stdoutFd, stderrFd],
+			stdio: outputBinding
+				? ["ignore", stdoutFd, stderrFd, outputBinding.fd, outputConfigFd!]
+				: ["ignore", stdoutFd, stderrFd],
 			detached: true,
 		});
+		spawned = true;
 	} finally {
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		try { fs.closeSync(stderrFd!); } catch { /* ignore */ }
+		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
+		if (outputBinding) {
+			if (spawned) try { fs.closeSync(outputBinding.fd); } catch { /* ignore */ }
+			else outputFiles.discardOutputFile(outputBinding);
+		}
 	}
 
 	const meta: RunMeta = {
@@ -2279,6 +2341,7 @@ export async function runSingleSwivalAsync(
 		agentFsRequested,
 		nonoRequested,
 		reviewRequired: hasCliFlag(args, "--self-review") || Boolean(lastCliOptionValue(args, "--reviewer")),
+		...(outputBinding ? { outputPath: outputBinding.outputPath, outputMode: output?.mode ?? "file-only" as const } : {}),
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
@@ -2338,7 +2401,11 @@ export async function runSingleSwivalAsync(
 		);
 	}
 
-	return { runId, artifactDir };
+	return {
+		runId,
+		artifactDir,
+		...(meta.outputPath ? { outputPath: meta.outputPath, outputMode: meta.outputMode } : {}),
+	};
 }
 
 // ---------------------------------------------------------- run single (sync) --
@@ -2890,8 +2957,8 @@ const SwivalParams = Type.Object({
 				"Cap (in characters) on a task's finalOutput inlined into the tool-response content. Applies to single, chain, and parallel modes. When output exceeds the cap, the response shows the first maxInlineBytes characters followed by a [truncated N chars; full output at <artifactDir>] marker. Omit (default) to inline the full output — silent truncation is never the default. To avoid token growth entirely, pass `output: \"...\"` paths instead.",
 		}),
 	),
-	output: Type.Optional(Type.String({ description: "Single/chain mode: file path to write the run's finalOutput to. Relative paths resolve against cwd. When set, the tool-response content defaults to file-only metadata (path + size) instead of inlining the body — set outputMode=\"inline\" to also receive the body inline." })),
-	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Single/chain mode: how to surface output in the tool-response content. Default with output is file-only; inline returns the body even when also writing to a file." })),
+	output: Type.Optional(Type.String({ description: "Single/chain mode: file path to write the run's finalOutput to. Relative paths resolve against the original cwd. In ordinary async single mode, output is written automatically only after verified success; status/resume is not required. When set, response content defaults to file-only metadata — set outputMode=\"inline\" to also receive the body inline." })),
+	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Single/chain mode: how to surface output. Default with output is file-only; inline returns the body even when also writing to a file. For ordinary async runs, status reports output metadata and resume follows this mode." })),
 	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock budget in milliseconds for the swival process. On expiry: SIGTERM, then SIGKILL after 5 seconds. No default; only enforced when set." })),
 
 	// ---- async / background execution ----
@@ -3420,8 +3487,11 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					}
 					const outcome = inspection.report?.outcome ?? "unknown";
 					const exitedAt = state.completed?.exitedAt ?? "unknown";
+					const outputLine = inspection.output?.status === "written"
+						? `\nOutput: ${inspection.output.outputPath} (${inspection.output.outputLineCount ?? 0} lines, ${inspection.output.outputBytes ?? 0} bytes; ${inspection.output.outputMode})`
+						: "";
 					return {
-						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}` }],
+						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}${outputLine}` }],
 						details: makeDetails("single")([]),
 					};
 				}
@@ -3515,11 +3585,18 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						};
 					}
 					// Read final output only after terminal success is established.
-					const stdoutContent = await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
-					const finalOutput = (inspection.report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
+					const output = inspection.output?.status === "written" ? inspection.output : undefined;
+					const stdoutContent = output ? "" : await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
+					const finalOutput = outputFiles.selectAsyncOutputBody(inspection.report?.answer, stdoutContent, Boolean(output));
 					const feedback = inspection.report?.lastReviewFeedback;
 					const outcome = inspection.report?.outcome ?? "unknown";
-					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
+					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}`;
+					if (output) {
+						text += `\nOutput: ${output.outputPath} (${output.outputLineCount ?? 0} lines, ${output.outputBytes ?? 0} bytes; ${output.outputMode})`;
+						text += output.outputMode === "inline" ? `\n\n${finalOutput}` : `\n\n→ ${output.outputPath}`;
+					} else {
+						text += `\n\n${finalOutput}`;
+					}
 					if (feedback) text += `\n\n─── reviewer feedback ───\n${feedback}`;
 					return {
 						content: [{ type: "text", text }],
@@ -3812,8 +3889,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				const task = params.task as string;
 				let runId: string;
 				let artifactDir: string;
+				let outputPath: string | undefined;
+				let outputMode: "inline" | "file-only" | undefined;
 				try {
-					({ runId, artifactDir } = await runSingleSwivalAsync(
+					({ runId, artifactDir, outputPath, outputMode } = await runSingleSwivalAsync(
 						ctx.cwd,
 						agents,
 						agentName,
@@ -3821,6 +3900,11 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						discoveryCwd,
 						overrides,
 						artifactRoot,
+						params.output ? {
+							path: params.output,
+							mode: params.outputMode,
+							cwdAnchor: resolveDispatchCwd(undefined, params.cwd, ctx.cwd),
+						} : undefined,
 					));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
@@ -3838,6 +3922,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							`runId:        ${runId}`,
 							`agent:        ${agentName}`,
 							`artifactDir:  ${artifactDir}`,
+							...(outputPath ? [`Output will be written to: ${outputPath} (${outputMode ?? "file-only"})`] : []),
 							``,
 							`Use action:"status" id:"${runId}" to check progress.`,
 							`Use action:"resume" id:"${runId}" to retrieve the final output when done.`,
