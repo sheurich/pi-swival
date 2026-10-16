@@ -139,6 +139,39 @@ describe("discoverSwivalAgents definition isolation", () => {
 });
 
 describe("discoverSwivalAgents frontmatter compatibility", () => {
+	it.each(["----", "---suffix", "--- ", "---\t"])(
+		"rejects an opening delimiter that is not a whole --- line: %j", (delimiter) => {
+			fs.writeFileSync(path.join(userDir, "invalid.md"), [
+				delimiter, "name: invalid", "description: helper", "---", "PRIVATE_PROMPT",
+			].join("\n"));
+			const result = discoverSwivalAgents(root, "user");
+			expect(result.agents.some((a) => a.name === "invalid")).toBe(false);
+			expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
+			expect(result.dispatchBlocked).toBe(true);
+		},
+	);
+
+	it.each(["----", "---suffix", "--- ", "---\t"])(
+		"rejects a closing delimiter that is not a whole --- line: %j", (delimiter) => {
+			fs.writeFileSync(path.join(userDir, "invalid.md"), [
+				"---", "name: invalid", "description: helper", delimiter, "PRIVATE_PROMPT",
+			].join("\n"));
+			const result = discoverSwivalAgents(root, "user");
+			expect(result.agents.some((a) => a.name === "invalid")).toBe(false);
+			expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
+			expect(result.dispatchBlocked).toBe(true);
+		},
+	);
+
+	it("accepts an exact closing delimiter at end of file", () => {
+		fs.writeFileSync(path.join(userDir, "compatible.md"),
+			"---\nname: compatible\ndescription: helper\n---");
+		const result = discoverSwivalAgents(root, "user");
+		expect(result.diagnostics).toEqual([]);
+		expect(result.agents.find((a) => a.name === "compatible"))
+			.toMatchObject({ systemPrompt: "" });
+	});
+
 	it.each(["\n", "\r\n", "\r"])("preserves BOM, newline and trimmed-body semantics for %j", (newline) => {
 		fs.writeFileSync(path.join(userDir, "compatible.md"), [
 			"\ufeff---", "name: compatible", "description: helper", "---", "", " First line", "", "Last line  ", "",

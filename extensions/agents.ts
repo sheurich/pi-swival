@@ -141,12 +141,12 @@ type RawFrontmatter = Record<string, unknown>;
 type Diagnose = (code: AgentDiscoveryCode, source: AgentSource, name?: string) => void;
 
 function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; body: string } {
-	// Match Pi's BOM, newline, delimiter and body handling without its emitting YAML.parse call.
+	// Normalize Pi's BOM/newline forms, but require whole-line frontmatter delimiters.
 	const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-	const end = normalized.startsWith("---") ? normalized.indexOf("\n---", 3) : -1;
-	if (end === -1) return { frontmatter: {}, body: normalized };
-	const yaml = normalized.slice(4, end);
-	const body = normalized.slice(end + 4).trim();
+	const match = normalized.match(/^---\n([\s\S]*?)\n---(?:\n|$)/);
+	if (!match) return { frontmatter: {}, body: normalized };
+	const yaml = match[1];
+	const body = normalized.slice(match[0].length).trim();
 	if (!yaml) return { frontmatter: {}, body };
 
 	// "error" prevents conversion warnings without "silent", which hides MULTIPLE_DOCS errors.
