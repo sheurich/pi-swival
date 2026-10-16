@@ -12,7 +12,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
-import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { parseDocument } from "yaml";
 
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "bundled" | "user" | "project";
@@ -111,61 +112,110 @@ export interface SwivalAgentConfig {
 	extraArgs?: string[];
 }
 
+export type AgentDiscoveryCode =
+	| "invalid_yaml"
+	| "invalid_frontmatter"
+	| "invalid_definition"
+	| "unreadable_definition"
+	| "unreadable_directory"
+	| "outside_directory";
+
+export interface AgentDiscoveryDiagnostic {
+	code: AgentDiscoveryCode;
+	source: AgentSource;
+}
+
 export interface SwivalAgentDiscoveryResult {
 	agents: SwivalAgentConfig[];
 	projectAgentsDir: string | null;
+	diagnostics: AgentDiscoveryDiagnostic[];
+	diagnosticsTotal: number;
+	diagnosticsOmitted: number;
+	/** Internal dispatch guards; never expose names from invalid definitions in the catalogue. */
+	invalidAgentNames: string[];
+	dispatchBlocked: boolean;
 }
 
+const MAX_DISCOVERY_DIAGNOSTICS = 12;
 type RawFrontmatter = Record<string, unknown>;
+type Diagnose = (code: AgentDiscoveryCode, source: AgentSource, name?: string) => void;
+
+function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; body: string } {
+	// Normalize Pi's BOM/newline forms, but require whole-line frontmatter delimiters.
+	const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+	const match = normalized.match(/^---\n([\s\S]*?)\n---(?:\n|$)/);
+	if (!match) return { frontmatter: {}, body: normalized };
+	const yaml = match[1];
+	const body = normalized.slice(match[0].length).trim();
+	if (!yaml) return { frontmatter: {}, body };
+
+	// "error" prevents conversion warnings without "silent", which hides MULTIPLE_DOCS errors.
+	// parseDocument retains errors/warnings for inspection and does not emit them.
+	const document = parseDocument(yaml, { logLevel: "error", prettyErrors: false });
+	if (document.errors.length > 0 || document.warnings.length > 0) throw new Error("invalid_yaml");
+	return { frontmatter: document.toJS({ maxAliasCount: 100 }) ?? {}, body };
+}
+
+function asString(v: unknown): string | undefined {
+	if (v === undefined || typeof v === "string") return v;
+	throw new Error("invalid_definition");
+}
 
 function asBool(v: unknown): boolean | undefined {
-	if (typeof v === "boolean") return v;
+	if (v === undefined || typeof v === "boolean") return v;
 	if (typeof v === "string") {
 		const s = v.trim().toLowerCase();
 		if (["true", "yes", "1", "on"].includes(s)) return true;
 		if (["false", "no", "0", "off"].includes(s)) return false;
 	}
-	return undefined;
+	throw new Error("invalid_definition");
 }
 
 function asStringArray(v: unknown): string[] | undefined {
-	if (Array.isArray(v)) return v.map((x) => String(x)).filter(Boolean);
+	if (v === undefined) return undefined;
+	if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v.filter(Boolean);
 	if (typeof v === "string") {
 		return v
 			.split(",")
 			.map((s) => s.trim())
 			.filter(Boolean);
 	}
-	return undefined;
+	throw new Error("invalid_definition");
 }
 
 function asEnum<T extends string>(v: unknown, allowed: readonly T[]): T | undefined {
-	if (typeof v !== "string") return undefined;
-	const s = v.trim() as T;
-	return allowed.includes(s) ? s : undefined;
+	if (v === undefined) return undefined;
+	if (typeof v === "string" && allowed.includes(v.trim() as T)) return v.trim() as T;
+	throw new Error("invalid_definition");
 }
 
 function asNumber(v: unknown): number | undefined {
+	if (v === undefined) return undefined;
 	if (typeof v === "number" && Number.isFinite(v)) return v;
 	if (typeof v === "string") {
 		const n = Number(v);
 		if (Number.isFinite(n)) return n;
 	}
-	return undefined;
+	throw new Error("invalid_definition");
 }
 
-function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[] {
+function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose) {
 	const agents: SwivalAgentConfig[] = [];
-	if (!fs.existsSync(dir)) return agents;
+	const invalidAgentNames = new Set<string>();
+	const reject = (code: AgentDiscoveryCode, name?: string) => {
+		diagnose(code, source, name);
+		if (name !== undefined) invalidAgentNames.add(name);
+	};
 
 	let entries: fs.Dirent[];
 	try {
 		entries = fs.readdirSync(dir, { withFileTypes: true });
-	} catch {
-		return agents;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") reject("unreadable_directory");
+		return { agents, invalidAgentNames };
 	}
 
-	for (const entry of entries) {
+	for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) {
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
@@ -175,96 +225,121 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 		try {
 			realFilePath = fs.realpathSync(filePath);
 		} catch {
+			reject("unreadable_definition");
 			continue;
 		}
-		if (realFilePath !== filePath && !realFilePath.startsWith(dir + path.sep)) continue;
+		if (realFilePath !== filePath && !realFilePath.startsWith(dir + path.sep)) {
+			reject("outside_directory");
+			continue;
+		}
 		let content: string;
 		try {
 			content = fs.readFileSync(realFilePath, "utf-8");
 		} catch {
+			reject("unreadable_definition");
 			continue;
 		}
 
-		const { frontmatter: fm, body } = parseFrontmatter<RawFrontmatter>(content);
-		const name = typeof fm.name === "string" ? fm.name : "";
+		let parsed: { frontmatter: RawFrontmatter; body: string };
+		try {
+			parsed = parseAgentFrontmatter(content);
+		} catch {
+			reject("invalid_yaml");
+			continue;
+		}
+		const { frontmatter: fm, body } = parsed;
+		if (fm === null || typeof fm !== "object" || Array.isArray(fm)) {
+			reject("invalid_frontmatter");
+			continue;
+		}
+		const name = typeof fm.name === "string" && fm.name.trim() ? fm.name : undefined;
 		const description = typeof fm.description === "string" ? fm.description : "";
-		if (!name || !description) continue;
+		if (!name || !description.trim()) {
+			reject("invalid_definition", name);
+			continue;
+		}
 
-		const agentConfig: SwivalAgentConfig = {
-			name,
-			description,
-			systemPrompt: body,
-			source,
-			filePath,
+		let agentConfig: SwivalAgentConfig;
+		try {
+			agentConfig = {
+				name,
+				description,
+				systemPrompt: body,
+				source,
+				filePath,
 
-			provider: typeof fm.provider === "string" ? fm.provider : undefined,
-			profile: typeof fm.profile === "string" ? fm.profile : undefined,
-			model: typeof fm.model === "string" ? fm.model : undefined,
-			baseUrl: typeof fm.baseUrl === "string" ? fm.baseUrl : undefined,
-			temperature: asNumber(fm.temperature),
-			topP: asNumber(fm.topP),
-			seed: asNumber(fm.seed),
-			reasoningEffort: typeof fm.reasoningEffort === "string" ? fm.reasoningEffort : undefined,
-			maxOutputTokens: asNumber(fm.maxOutputTokens),
-			maxTurns: asNumber(fm.maxTurns),
-			providerTimeout: asNumber(fm.providerTimeout),
-			initialToolChoice: asEnum(fm.initialToolChoice, ["auto", "required"] as const),
+				provider: asString(fm.provider),
+				profile: asString(fm.profile),
+				model: asString(fm.model),
+				baseUrl: asString(fm.baseUrl),
+				temperature: asNumber(fm.temperature),
+				topP: asNumber(fm.topP),
+				seed: asNumber(fm.seed),
+				reasoningEffort: asString(fm.reasoningEffort),
+				maxOutputTokens: asNumber(fm.maxOutputTokens),
+				maxTurns: asNumber(fm.maxTurns),
+				providerTimeout: asNumber(fm.providerTimeout),
+				initialToolChoice: asEnum(fm.initialToolChoice, ["auto", "required"] as const),
 
-			selfReview: asBool(fm.selfReview),
-			reviewer: typeof fm.reviewer === "string" ? fm.reviewer : undefined,
-			reviewPrompt: typeof fm.reviewPrompt === "string" ? fm.reviewPrompt : undefined,
-			verify: typeof fm.verify === "string" ? fm.verify : undefined,
-			maxReviewRounds: asNumber(fm.maxReviewRounds),
-			requiresReviewer: asBool(fm.requiresReviewer),
+				selfReview: asBool(fm.selfReview),
+				reviewer: asString(fm.reviewer),
+				reviewPrompt: asString(fm.reviewPrompt),
+				verify: asString(fm.verify),
+				maxReviewRounds: asNumber(fm.maxReviewRounds),
+				requiresReviewer: asBool(fm.requiresReviewer),
 
-			sandbox: asEnum(fm.sandbox, ["builtin", "agentfs", "nono"] as const),
-			sandboxSession: typeof fm.sandboxSession === "string" ? fm.sandboxSession : undefined,
-			sandboxStrictRead: asBool(fm.sandboxStrictRead),
-			noSandboxAutoSession: asBool(fm.noSandboxAutoSession),
-			nonoProfile: typeof fm.nonoProfile === "string" ? fm.nonoProfile : undefined,
-			nonoRollback: asBool(fm.nonoRollback),
-			nonoBlockNet: asBool(fm.nonoBlockNet),
-			nonoAllowDomain: asStringArray(fm.nonoAllowDomain),
-			network: asEnum(fm.network, ["full", "provider-only", "none"] as const),
-			files: asEnum(fm.files, ["none", "some", "all"] as const),
-			commands: typeof fm.commands === "string" ? fm.commands : undefined,
-			commandMiddleware: typeof fm.commandMiddleware === "string" ? fm.commandMiddleware : undefined,
-			baseDir: typeof fm.baseDir === "string" ? fm.baseDir : undefined,
-			addDir: asStringArray(fm.addDir),
-			addDirRo: asStringArray(fm.addDirRo),
-			encryptSecrets: asBool(fm.encryptSecrets),
-			noReadGuard: asBool(fm.noReadGuard),
-			yolo: asBool(fm.yolo),
+				sandbox: asEnum(fm.sandbox, ["builtin", "agentfs", "nono"] as const),
+				sandboxSession: asString(fm.sandboxSession),
+				sandboxStrictRead: asBool(fm.sandboxStrictRead),
+				noSandboxAutoSession: asBool(fm.noSandboxAutoSession),
+				nonoProfile: asString(fm.nonoProfile),
+				nonoRollback: asBool(fm.nonoRollback),
+				nonoBlockNet: asBool(fm.nonoBlockNet),
+				nonoAllowDomain: asStringArray(fm.nonoAllowDomain),
+				network: asEnum(fm.network, ["full", "provider-only", "none"] as const),
+				files: asEnum(fm.files, ["none", "some", "all"] as const),
+				commands: asString(fm.commands),
+				commandMiddleware: asString(fm.commandMiddleware),
+				baseDir: asString(fm.baseDir),
+				addDir: asStringArray(fm.addDir),
+				addDirRo: asStringArray(fm.addDirRo),
+				encryptSecrets: asBool(fm.encryptSecrets),
+				noReadGuard: asBool(fm.noReadGuard),
+				yolo: asBool(fm.yolo),
 
-			instructionsFull: asBool(fm.instructionsFull),
-			noInstructions: asBool(fm.noInstructions),
-			noMemory: asBool(fm.noMemory),
-			noSkills: asBool(fm.noSkills),
-			skillsDir: asStringArray(fm.skillsDir),
+				instructionsFull: asBool(fm.instructionsFull),
+				noInstructions: asBool(fm.noInstructions),
+				noMemory: asBool(fm.noMemory),
+				noSkills: asBool(fm.noSkills),
+				skillsDir: asStringArray(fm.skillsDir),
 
-			maxOutputKb: asNumber(fm.maxOutputKb),
-			maxOutputLines: asNumber(fm.maxOutputLines),
+				maxOutputKb: asNumber(fm.maxOutputKb),
+				maxOutputLines: asNumber(fm.maxOutputLines),
 
-			noLifecycle: asBool(fm.noLifecycle),
-			noMcp: asBool(fm.noMcp),
-			noA2a: asBool(fm.noA2a),
-			noHistory: asBool(fm.noHistory),
-			noContinue: asBool(fm.noContinue),
-			noSubagents: asBool(fm.noSubagents),
-			subagents: asBool(fm.subagents),
+				noLifecycle: asBool(fm.noLifecycle),
+				noMcp: asBool(fm.noMcp),
+				noA2a: asBool(fm.noA2a),
+				noHistory: asBool(fm.noHistory),
+				noContinue: asBool(fm.noContinue),
+				noSubagents: asBool(fm.noSubagents),
+				subagents: asBool(fm.subagents),
 
-			a2aConfig: typeof fm.a2aConfig === "string" ? fm.a2aConfig : undefined,
-			allowA2a: asBool(fm.allowA2a),
+				a2aConfig: asString(fm.a2aConfig),
+				allowA2a: asBool(fm.allowA2a),
 
-			quiet: asBool(fm.quiet),
-			extraArgs: asStringArray(fm.extraArgs),
+				quiet: asBool(fm.quiet),
+				extraArgs: asStringArray(fm.extraArgs),
 
-			cache: asBool(fm.cache),
-			cacheDir: typeof fm.cacheDir === "string" ? fm.cacheDir : undefined,
+				cache: asBool(fm.cache),
+				cacheDir: asString(fm.cacheDir),
 
-			proactiveSummaries: asBool(fm.proactiveSummaries),
-			retries: asNumber(fm.retries),
-		};
+				proactiveSummaries: asBool(fm.proactiveSummaries),
+				retries: asNumber(fm.retries),
+			};
+		} catch {
+			reject("invalid_definition", name);
+			continue;
+		}
 		// Strip dangerous fields from project-local agents to prevent privilege escalation
 		if (source === "project") {
 			agentConfig.yolo = undefined;
@@ -310,7 +385,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): SwivalAgentConfig[
 		agents.push(agentConfig);
 	}
 
-	return agents;
+	return { agents, invalidAgentNames };
 }
 
 function findNearestProjectSwivalAgentsDir(cwd: string): string | null {
@@ -352,27 +427,48 @@ export function discoverSwivalAgents(cwd: string, scope: AgentScope): SwivalAgen
 	const userDir = path.join(getAgentDir(), "swival-agents");
 	const projectAgentsDir = findNearestProjectSwivalAgentsDir(cwd);
 
-	const bundledAgents = loadAgentsFromDir(getBundledAgentsDir(), "bundled");
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const diagnostics: AgentDiscoveryDiagnostic[] = [];
+	let diagnosticsTotal = 0;
+	let dispatchBlocked = false;
+	const diagnose: Diagnose = (code, source, name) => {
+		diagnosticsTotal++;
+		if (diagnostics.length < MAX_DISCOVERY_DIAGNOSTICS) diagnostics.push({ code, source });
+		// An excluded symlink is not an admitted definition and cannot veto
+		// valid agents. Its target remains unread; in-scope failures fail closed.
+		if (name === undefined && code !== "outside_directory") dispatchBlocked = true;
+	};
 
-	// Lowest priority first; later entries override by name.
+	// Invalid identities remain tombstones so a broken override cannot select
+	// a lower-priority definition. Never guess an identity from the filename.
 	const agentMap = new Map<string, SwivalAgentConfig>();
-	for (const a of bundledAgents) agentMap.set(a.name, a);
-	if (scope === "both" || scope === "user") {
-		for (const a of userAgents) agentMap.set(a.name, a);
-	}
-	if (scope === "both" || scope === "project") {
-		for (const a of projectAgents) {
-			// A repo-controlled project agent can shadow a trusted (bundled or
-			// user) name to silently defeat that name's reviewer/test contract
-			// (e.g. impersonating "test-runner" without requiresReviewer). Once
-			// a more-trusted source declares requiresReviewer, an untrusted
-			// project override cannot unset it.
-			if (agentMap.get(a.name)?.requiresReviewer === true) a.requiresReviewer = true;
+	const invalidAgentNames = new Set<string>();
+	const reviewerRequirements = new Map<string, boolean | undefined>();
+	const directories: [string, AgentSource][] = [[getBundledAgentsDir(), "bundled"]];
+	if (scope !== "project") directories.push([userDir, "user"]);
+	if (scope !== "user" && projectAgentsDir) directories.push([projectAgentsDir, "project"]);
+	for (const [dir, source] of directories) {
+		const loaded = loadAgentsFromDir(dir, source, diagnose);
+		for (const a of loaded.agents) {
+			// A project override cannot drop the trusted reviewer's contract,
+			// including when an invalid intermediate override was rejected.
+			if (source === "project" && reviewerRequirements.get(a.name) === true) a.requiresReviewer = true;
+			if (source !== "project") reviewerRequirements.set(a.name, a.requiresReviewer);
 			agentMap.set(a.name, a);
+			invalidAgentNames.delete(a.name);
+		}
+		for (const name of loaded.invalidAgentNames) {
+			agentMap.delete(name);
+			invalidAgentNames.add(name);
 		}
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	return {
+		agents: Array.from(agentMap.values()).sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+		projectAgentsDir,
+		diagnostics,
+		diagnosticsTotal,
+		diagnosticsOmitted: diagnosticsTotal - diagnostics.length,
+		invalidAgentNames: Array.from(invalidAgentNames).sort(),
+		dispatchBlocked,
+	};
 }

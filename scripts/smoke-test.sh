@@ -4,8 +4,7 @@
 # Runs three layers of check, ordered cheapest first:
 #   1. Manifest:    every path declared in package.json#pi resolves on disk.
 #   2. Frontmatter: every bundled agent has a name and description.
-#   3. Loadability: pi -e <pkg> loads the extension, skills, and prompts
-#                   without printing an error to stderr.
+#   3. Loadability: the offline SDK test loads the package and lists its agents.
 #
 # Designed to run in CI on a clean ubuntu-latest with Pi installed globally.
 # Exit non-zero on first failure.
@@ -78,34 +77,28 @@ for (const file of files) {
 if (!ok) process.exit(1);
 "
 
-step "3. Pi loads the package without errors"
+step "3. Pi loads the package offline"
 
-# Use a scratch home so we do not pollute developer config, and so this is
-# repeatable on CI runners. Pi reads ~/.pi/agent for ambient extensions.
+# Bootstrap before loading: a clean checkout has no YAML runtime dependency
+# or Vitest harness. setup.sh is idempotent when npm test runs it again.
+"$ROOT/tests/setup.sh"
+
 SCRATCH="$(mktemp -d -t pi-swival-smoke.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT
-mkdir -p "$SCRATCH/.pi/agent"
+LOG="$SCRATCH/loader.log"
 
-# pi -e mounts our package for one run. With no message and -p, pi loads
-# extensions, skills, and prompts and exits because there is no work.
-# This avoids needing an LLM provider — the load phase still reports any
-# extension errors on stderr.
-LOG="$SCRATCH/pi.log"
-HOME="$SCRATCH" pi -e "$ROOT" -p --no-session > "$LOG" 2>&1
-ec=$?
+# Reuse the guarded SDK loader test; do not create a CLI auth/model runtime.
+# Keep failures inside an OR-list so set -e cannot hide the captured output.
+ec=0
+(
+  cd "$ROOT/tests"
+  HOME="$SCRATCH" node ./node_modules/vitest/vitest.mjs run catalogueLoad.test.ts
+) > "$LOG" 2>&1 || ec=$?
 
 if [[ $ec -ne 0 ]]; then
-  echo "pi exited $ec" >&2
+  echo "offline Pi loader test exited $ec" >&2
   cat "$LOG" >&2
   fail "pi load failed"
-fi
-
-# Pi exits 0 even when extensions fail to load — so grep for explicit
-# load errors.
-if grep -E 'Failed to load extension|Tool .* conflicts|extension load error' "$LOG" >&2; then
-  echo "---" >&2
-  cat "$LOG" >&2
-  fail "pi printed an extension load error"
 fi
 
 echo "  ok pi loaded the package cleanly"
