@@ -1,6 +1,7 @@
 """Offline released-SDK lineage corpus; no native pipeline or provider transport."""
 # Released private entry points are intentional compatibility assertions.
-# pylint: disable=protected-access,missing-function-docstring,too-many-locals,too-many-branches,too-many-statements
+# pylint: disable=protected-access,missing-function-docstring,too-many-locals
+# pylint: disable=too-many-branches,too-many-statements
 from dataclasses import asdict
 import hashlib
 from importlib.metadata import version
@@ -176,20 +177,24 @@ def released_phase45(scenario, state, context, first, second):
 def corpus(scenario):
     first = finding("first")
     second = finding("second", location="other.py:2", proof="other", source="other.py")
-    with tempfile.TemporaryDirectory() as directory:
+    temporary = Path(__file__).resolve().parent / ".scratch" / "tmp"
+    temporary.mkdir(parents=True, exist_ok=True)
+    assert temporary.resolve() == temporary
+    with tempfile.TemporaryDirectory(dir=temporary) as directory:
         root = Path(directory)
         (root / "code.py").write_text("value = 1\n", encoding="utf-8")
         (root / "other.py").write_text("value = 2\n", encoding="utf-8")
         subprocess.run(["git", "init", "--template="], cwd=root, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                         "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
-                        "add", "."], cwd=root, check=True, stdout=subprocess.DEVNULL)
+                        "add", "."], cwd=root, check=True, stdout=subprocess.DEVNULL, timeout=5)
         subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                         "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
-                        "commit", "-m", "fixture"], cwd=root, check=True, stdout=subprocess.DEVNULL)
+                        "commit", "-m", "fixture"], cwd=root, check=True,
+                            stdout=subprocess.DEVNULL, timeout=5)
         commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, check=True,
-                                text=True, stdout=subprocess.PIPE).stdout.strip()
+                                text=True, stdout=subprocess.PIPE, timeout=5).stdout.strip()
         state = audit.AuditRunState("lineage", audit.AuditScope("master", commit,
                                     ["code.py", "other.py"], ["code.py", "other.py"], []),
                                     ["code.py", "other.py"], state_dir=root / ".state")

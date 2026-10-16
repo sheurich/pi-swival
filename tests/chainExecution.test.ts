@@ -81,11 +81,8 @@ describe("chain execution {previous} substitution", () => {
 
 		expect(result.isError).not.toBe(true);
 		expect(executedTasks).toHaveLength(2);
-		expect(executedTasks[0]).toBe("Delegated task (plain text):\n\nStep 1");
-		// Verify literal substitution and one delivery heading after substitution.
-		expect(executedTasks[1]).toBe("Delegated task (plain text):\n\nVerify Price: $100 & $& and $' exactly");
-		expect(result.details.results.map((run: any) => run.task)).toEqual([
-			"Step 1", "Verify Price: $100 & $& and $' exactly",
-		]);
+		expect(executedTasks[0]).toBe("Step 1");
+		// Verify that {previous} was replaced literally with the exact string from Step 1
+		expect(executedTasks[1]).toBe("Verify Price: $100 & $& and $' exactly");
 	});
 });

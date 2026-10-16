@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
+import { nativeScratch, completeNativeFixture } from "./nativeFixtures.js";
 import * as path from "node:path";
 import registerExtension from "../extensions/index.js";
 import { nativeTestPython as python } from "./nativePython.js";
@@ -14,7 +14,7 @@ beforeEach(() => {
 afterEach(() => { process.env.PATH = startupPath; });
 const scratchDirs: string[] = [];
 const scratch = () => {
-	const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-audit-test-")));
+	const dir = nativeScratch("native-audit-test-");
 	scratchDirs.push(dir);
 	return dir;
 };
@@ -43,16 +43,36 @@ describe("native audit dispatch boundary", () => {
 	beforeEach(() => {
 		root = scratch();
 		const bin = scratch();
-		fs.writeFileSync(path.join(bin, "swival"), `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(path.join(root, "generic-dispatch"))}, 'forbidden'); process.exit(1);`, { mode: 0o755 });
+		fs.writeFileSync(path.join(bin, "swival"), `#!${python}\nfrom pathlib import Path\nPath(${JSON.stringify(path.join(root, "generic-dispatch"))}).write_text("forbidden")\n`, { mode: 0o755 });
 		process.env.PATH = `${bin}:${(originalPath ?? "").split(path.delimiter).filter(path.isAbsolute).join(path.delimiter)}`;
 		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
 			{ artifactRoot: root, nativePython: python } as any);
 	});
 	it("describes native and ordinary isolation without conflating them", () => {
-		expect(tool.description).toContain("Native mode uses Linux unshare and bubblewrap with builtin Session isolation");
-		expect(tool.description).toContain("Ordinary delegation uses AgentFS");
+		expect(tool.description).toContain("Native mode uses synchronous upstream AgentFS CLI");
+		expect(tool.description).toContain("Native async is unsupported");
 	});
 
+	it.each([
+		[{}, "configured defaults"], [{ profileOverride: "synthetic-unvalidated-secret" }, "explicit profile"],
+		[{ modelOverride: "synthetic-unvalidated-secret" }, "explicit overrides"],
+	])("renders the native selection kind without unvalidated override values", (selection, label) => {
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const text = tool.renderCall({ audit: { all: true }, ...selection }, theme, {}).render(200).join("\n");
+		expect(text).toContain(label); expect(text).not.toContain("synthetic-unvalidated-secret");
+	});
+	it("renders validated endpoint and partial status without trusting malformed route details", () => {
+		const { route } = completeNativeFixture(scratch());
+		const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+		const selected = { ...route, provider: "openrouter", model: "example/concrete", endpoint: "http://127.0.0.1:8444/v1",
+			reportIdentity: { provider: "openrouter", model: "example/concrete" } };
+		const render = (value: unknown) => tool.renderResult({ content: [], details: { mode: "single", results: [{
+			agent: "native-audit", task: "/audit", exitCode: 0, durationMs: 1, stderrTail: [], finalOutput: "",
+			nativeAudit: { status: "partial", route: value },
+		}] } }, { expanded: false }, theme, {}).render(200).join("\n");
+		expect(render(selected)).toContain("partial"); expect(render(selected)).toContain(selected.endpoint);
+		expect(render({ ...selected, model: "synthetic-unvalidated\nsecret" })).not.toContain("synthetic-unvalidated");
+	});
 	it.each([
 		{ paths: ["src\n/!rm"] }, { paths: ["../escape"] }, { paths: ["/etc"] },
 		{ paths: ["--debug"] }, { paths: ["src with space"] }, { paths: ["src\\..\\out"] },
@@ -83,8 +103,10 @@ describe("native audit dispatch boundary", () => {
 			hTtP_pRoXy: process.env.hTtP_pRoXy };
 		process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config");
 		process.env.hTtP_pRoXy = "";
+		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
+			{ artifactRoot: root, nativePython: python });
 		try {
-			const result = await tool.execute("audit", { audit: { all: true }, modelOverride: "offline-model" },
+			const result = await tool.execute("audit", { audit: { all: true }, modelOverride: "gpt-offline", providerOverride: "chatgpt" },
 				undefined, undefined, { cwd: source, hasUI: false });
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toMatch(/preflight failed.*No native worker\/provider was started/i);
@@ -103,24 +125,21 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		["global", 'encrypt_secrets = true'], ["project", 'llm_filter = "required-filter"'],
 		["global", 'encrypt_secrets_key = "synthetic-never-log-this"'],
 		["project", 'unrecognized_shield = true'], ["global", 'nono_audit_integrity = true'],
-		["global", 'nono_rollback = true'], ["project", 'lifecycle_fail_closed = true'], ["global", '[profiles.protected]\nprovider="lmstudio"\nllm_filter="required"'],
-		...["global", "project"].flatMap((where) => [
-			[where, 'sandbox="agentfs"'], [where, 'sandbox_auto_session=true'],
-			[where, 'sandbox_session="required"'],
-		]),
+		["global", 'nono_rollback = true'], ["project", 'lifecycle_fail_closed = true'], ["global", '[profiles.protected]\nprovider="chatgpt"\nllm_filter="required"'],
+		...["global", "project"].map((where) => [where, 'sandbox_session="required"']),
 	])("rejects protected or unknown %s configuration before native launch", async (where, config) => {
 		const dir = repository();
 		const home = scratch();
 		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
 		fs.writeFileSync(where === "global" ? path.join(home, ".config", "swival", "config.toml") : path.join(dir, "swival.toml"), config);
-		const result = await runPreflight(dir, home, {}, { model: "offline-model" });
+		const result = await runPreflight(dir, home, {}, { model: "gpt-offline", provider: "chatgpt" });
 		expect(result.code).toBe(1);
-		expect(result.output).toMatch(/protected|unknown|unsupported/i);
+		expect(JSON.parse(result.output).reason).toMatch(/^(POLICY_NOT_PROPAGATED|CONFIG_INVALID)$/);
 		expect(result.output).not.toContain("synthetic-never-log-this");
 	});
 	it.each(Object.entries({
 		network: '"none"', files: '"none"', sandbox: '"nono"', sandbox_strict_read: "true",
-		sandbox_session: '"required"', sandbox_auto_session: "true",
+		sandbox_session: '"required"',
 		lifecycle_fail_closed: "true", nono_profile: '"required-profile"', nono_rollback: "true",
 		nono_block_net: "true", nono_allow_domain: '["offline.invalid"]',
 		nono_network_profile: '"required-profile"', nono_credential: '["required-reference"]',
@@ -130,15 +149,15 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 			const home = scratch(); fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
 			fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"),
 				`${selection === "active" ? 'active_profile="test"\n' : ''}[profiles.test]\n` +
-				`provider="lmstudio"\nmodel="offline-model"\ndescription="synthetic-never-log-this"\n${key}=${value}\n`);
+				`provider="chatgpt"\nmodel="gpt-offline"\ndescription="synthetic-never-log-this"\n${key}=${value}\n`);
 			const result = await runPreflight(repository(), home, {}, selection === "explicit" ? { profile: "test" } : {});
-			expect(result.code).toBe(1); expect(result.output).toMatch(/unknown|unsupported/i);
+			expect(result.code).toBe(1); expect(JSON.parse(result.output).reason).toMatch(/^(POLICY_NOT_PROPAGATED|CONFIG_INVALID)$/);
 			expect(result.output).not.toContain("synthetic-never-log-this");
 		});
 	it("rejects SWIVAL_ENCRYPT_KEY presence without inspecting or logging its value", async () => {
 		const result = await runPreflight(repository(), scratch(), { SWIVAL_ENCRYPT_KEY: "synthetic-never-log-this" });
 		expect(result.code).toBe(1);
-		expect(result.output).toMatch(/protected/i);
+		expect(JSON.parse(result.output)).toMatchObject({ ok: false, reason: "POLICY_NOT_PROPAGATED", field: "encrypt_secrets" });
 		expect(result.output).not.toContain("synthetic-never-log-this");
 	});
 	it.each([
@@ -146,18 +165,18 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		"hTtP_pRoXy", "hTtPs_PrOxY", "aLl_PrOxY",
 	].flatMap((name) => [[name, ""], [name, "http://synthetic-proxy.invalid"]]))
 		("rejects %s by presence for %s without a provider", async (name, value) => {
-			const result = await runPreflight(repository(), scratch(), { [name]: value }, { model: "offline-model" });
+			const result = await runPreflight(repository(), scratch(), { [name]: value }, { model: "gpt-offline", provider: "chatgpt" });
 			expect(result.code).toBe(1);
-			expect(result.output).toContain("Unsupported native transport proxy requirements.");
+			expect(JSON.parse(result.output)).toEqual({ ok: false, reason: "TRANSPORT_REQUIREMENT_UNSUPPORTED" });
 			expect(result.output).not.toContain("synthetic-proxy.invalid");
 		});
 	it("resolves global profile and explicit model/provider/effort without initializing a provider", async () => {
 		const home = scratch();
 		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
-		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"), '[profiles.test]\nprovider="lmstudio"\nmodel="profile-model"\nreasoning_effort="high"\n');
-		const result = await runPreflight(repository(), home, {}, { profile: "test", model: "override-model", reasoningEffort: "xhigh" });
+		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"), '[profiles.test]\nprovider="chatgpt"\nmodel="gpt-profile"\nreasoning_effort="high"\n');
+		const result = await runPreflight(repository(), home, {}, { profile: "test", model: "gpt-override", reasoningEffort: "xhigh" });
 		expect(result.code, result.output).toBe(0);
-		expect(JSON.parse(result.output)).toMatchObject({ provider: "lmstudio", model: "override-model", reasoningEffort: "xhigh", profile: "test" });
+		expect(JSON.parse(result.output)).toMatchObject({ provider: "chatgpt", model: "gpt-override", reasoningEffort: "xhigh", profile: "test" });
 	});
 	it("preserves released ChatGPT profile routing without opening OAuth credentials", async () => {
 		const home = scratch(); fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
@@ -166,14 +185,13 @@ describe("native preflight protection requirements (no worker, no provider)", ()
 		const result = await runPreflight(repository(), home);
 		expect(result.code, result.output).toBe(0);
 		expect(JSON.parse(result.output)).toMatchObject({ provider: "chatgpt", profile: "test",
-			model: "chatgpt/gpt-offline", transportModel: "chatgpt/gpt-offline",
-			destination: { apiBase: "https://chatgpt.com/backend-api/codex" } });
+			model: "chatgpt/gpt-offline", endpoint: null });
 		expect(fs.existsSync(path.join(home, ".config", "litellm"))).toBe(false);
 	});
 	it.each(["missing", "", false])("rejects missing or invalid profiles without fallback: %s", async (profile) => {
-		const result = await runPreflight(repository(), scratch(), {}, { profile, model: "offline-model" });
+		const result = await runPreflight(repository(), scratch(), {}, { profile, model: "gpt-offline", provider: "chatgpt" });
 		expect(result.code).toBe(1);
-		expect(result.output).toMatch(/profile.*missing|profile.*unavailable/i);
+		expect(JSON.parse(result.output)).toEqual({ ok: false, reason: "PROFILE_UNAVAILABLE" });
 	});
 });
 
@@ -181,7 +199,7 @@ async function runPreflight(source: string, home: string, environment = {}, rout
 	const { execFile } = await import("node:child_process");
 	return new Promise<{ code: number; output: string }>((resolve) => {
 		const child = execFile(python, ["-I", path.join(ROOT, "scripts", "native_audit.py"), "--preflight"], {
-			cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), ...environment },
+			cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1", ...environment },
 			timeout: 5000, maxBuffer: 64 * 1024,
 		}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 		child.stdin!.end(JSON.stringify({ source, routing }));
@@ -189,6 +207,14 @@ async function runPreflight(source: string, home: string, environment = {}, rout
 }
 
 describe("independent committed snapshot", () => {
+	it.each(["source", "git"])("refuses a snapshot inside a symlinked %s root", async (kind) => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const source = repository(); const alias = path.join(scratch(), "alias");
+		const target = kind === "source" ? source : path.join(source, ".git");
+		fs.symlinkSync(target, alias);
+		await expect(createCommittedSnapshot(source, path.join(alias, "snapshot"))).rejects.toThrow(/outside|source|Git/);
+		expect(fs.existsSync(path.join(target, "snapshot"))).toBe(false);
+	});
 	it("imports committed contents without source hooks, filters, refs, dirty or untracked data", async () => {
 		const native = await import("../extensions/native-audit.js").catch(() => undefined);
 		expect(native?.createCommittedSnapshot).toBeTypeOf("function");
@@ -237,6 +263,16 @@ describe("independent committed snapshot", () => {
 		expect(git(source, "status", "--porcelain=v1")).toBe(before.status);
 		expect(fs.readFileSync(path.join(source, "swival.toml"), "utf8")).toBe(original);
 	}, 20000);
+	it.each(["AUDIT-FINDINGS/injected.md", ".SWIVAL/AUDIT/state.json", "NATIVE-CLI-REPORT.JSON",
+		"Native-Cli-Report.Json/descendant.md"])("refuses reserved evidence alias %s before snapshot import", async (file) => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const source = repository(); const target = path.join(source, file);
+		fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, "source-controlled evidence");
+		git(source, "add", "."); git(source, "commit", "-m", "reserved evidence fixture");
+		const destination = path.join(scratch(), "snapshot");
+		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
+		expect(fs.existsSync(destination)).toBe(false);
+	});
 	it.each(["link", "credential", "control"])('rejects unsupported %s paths before native dispatch', async (kind) => {
 		const native = await import("../extensions/native-audit.js").catch(() => undefined);
 		expect(native?.createCommittedSnapshot).toBeTypeOf("function");

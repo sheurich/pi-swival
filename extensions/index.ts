@@ -30,16 +30,14 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { canonicalFuturePath, captureNativeRuntime, inspectNativeAudit, prepareNativeAudit,
-	recordNativeAuditFailure, readNativeTerminal, validateNativeAuditParams, type NativeAuditResult,
-	type NativeOwnership } from "./native-audit.js";
+import { captureNativeRuntime, inspectNativeAudit, prepareNativeAudit, validateNativeAuditParams, parseNativeRoute,
+	type NativeAuditResult, type NativeAuditLaunch } from "./native-audit.js";
 import {
 	type AgentScope,
 	discoverSwivalAgents,
@@ -64,23 +62,6 @@ const ASYNC_RUNNER_PATH = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../scripts/async-runner.cjs",
 );
-interface OutputBinding {
-	target: string;
-	/** Informational caller-facing path; only the canonical target is written. */
-	outputPath: string;
-	temporary: string;
-	directory: string;
-	directoryIdentity: { dev: number; ino: number };
-	fd: number;
-	identity: { dev: number; ino: number };
-}
-interface OutputFileResult { outputPath: string; outputBytes: number; outputLineCount: number }
-const outputFiles = createRequire(import.meta.url)("../scripts/output-file.cjs") as {
-	prepareOutputFile(outputPath: string, cwdAnchor: string): OutputBinding;
-	discardOutputFile(binding: OutputBinding): void;
-	selectAsyncOutputBody(answer: string | undefined, stdout: string, outputRequested: boolean): string;
-	writeOutputFile(outputPath: string, cwdAnchor: string, body: string): OutputFileResult;
-};
 
 // ------------------------------------------------- async run tracking --
 
@@ -104,12 +85,6 @@ export interface RunMeta {
 	agentFsRequested?: boolean;
 	/** Whether this run effectively requested Nono. */
 	nonoRequested?: boolean;
-	/** Required reviewer evidence from the effective launch arguments. */
-	reviewRequired?: boolean;
-	/** Startup-bound destination for an ordinary async run. Informational on
-	 * reload: only the detached wrapper's inherited descriptors authorize it. */
-	outputPath?: string;
-	outputMode?: "inline" | "file-only";
 	nativeAuditRequested?: boolean;
 }
 
@@ -118,23 +93,12 @@ interface AsyncRunEntry {
 	proc: ChildProcess;
 	exited: boolean;
 	exitCode: number | null;
-	interruptNative?: () => void;
 }
 
 /** Written to `<artifactDir>/completed.json` when an async run exits (or fails to start). */
 interface CompletedMarker {
 	exitCode: number | null;
 	exitedAt: string; // ISO 8601
-}
-
-interface AsyncOutputResult {
-	status: "written" | "not-written" | "error";
-	outputPath: string;
-	outputMode: "inline" | "file-only";
-	outputBytes?: number;
-	outputLineCount?: number;
-	reason?: string;
-	error?: string;
 }
 
 /** Unified view of an async run's state, for use in control actions. */
@@ -148,8 +112,6 @@ interface RunStateInfo {
 	completed?: CompletedMarker;
 	/** Contents of spawn-error.txt when swival failed to start (e.g. ENOENT). */
 	spawnError?: string;
-	/** Disk-only native recovery cannot infer execution or shutdown from a PID. */
-	nativeUnknown?: boolean;
 }
 
 /**
@@ -198,19 +160,79 @@ export function applyInlineCap(body: string, cap: number | undefined, pointer: s
  * On error (mkdir / write failure) the caller's stderrTail is appended; the
  * function does not throw.
  */
+async function hasSymlinkInPath(resolved: string, cwdAnchor: string): Promise<string | null> {
+	// 1. Check if the target leaf itself is an existing symlink
+	try {
+		const lst = await fs.promises.lstat(resolved);
+		if (lst.isSymbolicLink()) return resolved;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+	}
+
+	// 2. For any path that resolves inside cwdAnchor, verify no parent directory component
+	// under cwdAnchor is a symlink.
+	const anchor = path.resolve(cwdAnchor);
+	let current = path.dirname(resolved);
+	while (current && current.startsWith(anchor + path.sep) && current !== anchor) {
+		try {
+			const lst = await fs.promises.lstat(current);
+			if (lst.isSymbolicLink()) return current;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return null;
+}
+
 async function writeRunOutput(
 	r: SwivalResult,
 	outputPath: string,
 	outputMode: "inline" | "file-only" | undefined,
 	cwdAnchor: string,
 ): Promise<void> {
-	const resolved = path.isAbsolute(outputPath) ? path.resolve(outputPath) : path.resolve(cwdAnchor, outputPath);
+	const isRelative = !path.isAbsolute(outputPath);
+	const resolved = isRelative ? path.resolve(cwdAnchor, outputPath) : outputPath;
+	let tmpFile: string | undefined;
 	try {
-		const written = outputFiles.writeOutputFile(outputPath, cwdAnchor, r.finalOutput ?? "");
-		r.outputPath = written.outputPath;
+		// Refuse to write through an existing symlink (both the leaf file and
+		// any parent directory component within cwdAnchor). `outputPath` is model-controlled;
+		// a hostile repo can pre-plant a symlink (e.g. `out/ -> ../../outside`
+		// or `linked.txt -> /etc/passwd`) so a caller-chosen path
+		// silently redirects writes to an attacker-chosen target.
+		const symlinkFound = await hasSymlinkInPath(resolved, cwdAnchor);
+		if (symlinkFound) {
+			throw new Error(`refusing to write through existing symlink at ${symlinkFound}`);
+		}
+		const dir = path.dirname(resolved);
+		await fs.promises.mkdir(dir, { recursive: true });
+		// Double check directory component after mkdir
+		const postMkdirSymlink = await hasSymlinkInPath(resolved, cwdAnchor);
+		if (postMkdirSymlink) {
+			throw new Error(`refusing to write through existing symlink at ${postMkdirSymlink}`);
+		}
+		const body = r.finalOutput ?? "";
+		// finalOutput may carry decrypted secrets or task-adjacent sensitive
+		// content; write to a temporary file opened with flag 'wx' and mode 0600,
+		// apply chmod, and atomically rename so the destination is never left
+		// world-readable or partially written on failure.
+		tmpFile = path.join(dir, `.tmp-output-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		try {
+			await fs.promises.writeFile(tmpFile, body, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+			await fs.promises.chmod(tmpFile, 0o600);
+			await fs.promises.rename(tmpFile, resolved);
+		} finally {
+			if (tmpFile) {
+				await fs.promises.unlink(tmpFile).catch(() => {});
+			}
+		}
+		r.outputPath = resolved;
+		// Default file-only when output is set; inline opts back in.
 		r.outputMode = outputMode ?? "file-only";
-		r.outputBytes = written.outputBytes;
-		r.outputLineCount = written.outputLineCount;
+		r.outputBytes = Buffer.byteLength(body, "utf-8");
+		r.outputLineCount = body === "" ? 0 : body.split("\n").length;
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		r.stderrTail = [...r.stderrTail, `failed to write output to ${resolved}: ${msg}`];
@@ -222,17 +244,9 @@ async function writeRunOutput(
  * outcome=success. Reviewer rejection and AgentError subclasses can exit zero,
  * so missing, malformed, or unknown reports must fail closed.
  */
-export function isRunFailure(r: {
-	exitCode: number;
-	nativeAudit?: NativeAuditResult;
-	report?: { outcome?: string; accepted?: boolean; reviewRequired?: boolean;
-		lastReviewExitCode?: number; resultExitCode?: number };
-}): boolean {
+export function isRunFailure(r: { exitCode: number; nativeAudit?: NativeAuditResult; report?: { outcome?: string } }): boolean {
 	if (r.nativeAudit) return r.exitCode !== 0 || r.nativeAudit.status !== "completed";
-	const report = r.report;
-	return r.exitCode !== 0 || report?.outcome !== "success" || report.accepted === false ||
-		(report.resultExitCode !== undefined && report.resultExitCode !== 0) ||
-		(report.reviewRequired === true && report.lastReviewExitCode !== 0);
+	return r.exitCode !== 0 || r.report?.outcome !== "success";
 }
 
 /**
@@ -431,6 +445,13 @@ export function enforceCompletedAsyncNono(
 }
 
 /**
+ * The exact `commands` allowlist that marks shell execution as read-only.
+ * Drift-sensitive: if the bundled audit-worker's allowlist changes, update
+ * this constant in lockstep.
+ */
+export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
+
+/**
  * True when an agent could plausibly mutate its cwd. Safety classification is
  * based on the final emitted arguments because extraArgs can override typed
  * frontmatter fields.
@@ -453,7 +474,7 @@ export function isMutatingCwdAgent(
 	const files = lastCliOptionValue(args, "--files");
 	const commands = lastCliOptionValue(args, "--commands");
 	const fileWritesDisabled = files === "none";
-	const mutatingCommandsDisabled = commands === "none";
+	const mutatingCommandsDisabled = commands === "none" || commands === READ_ONLY_AUDIT_COMMANDS;
 	return !(fileWritesDisabled && mutatingCommandsDisabled);
 }
 
@@ -825,14 +846,12 @@ function getSwivalArgumentError(
 interface ReportSummary {
 	// From stats.review_rounds — number of reviewer retry rounds that ran.
 	reviewRounds?: number;
-	// Preserve the reported outcome; final reviewer exits govern acceptance
-	// separately because upstream can report success after reviewer rejection.
-	outcome?: "success" | "failed" | "error" | "exhausted" | "interrupted" | "unknown";
+	// Derived from result.outcome. "success" means reviewer accepted (or
+	// review was disabled and swival returned a terminal answer). "failed"
+	// is a reviewer rejection. "error" is an internal AgentError (see
+	// errorMessage for the specific cause).
+	outcome?: "success" | "failed" | "error" | "interrupted" | "unknown";
 	accepted?: boolean;
-	resultExitCode?: number;
-	reviewRequired?: boolean;
-	lastReviewExitCode?: number;
-	terminalContextExhausted?: boolean;
 	// From result.error_message — populated when swival raised an AgentError
 	// subclass (ConfigError, ContextOverflowError, ToolsNotSupportedError,
 	// LifecycleError). Prefer this over stderr-tail classification when present.
@@ -912,8 +931,6 @@ export interface TraceToolCall {
 	type: "toolCall";
 	name: string;
 	args: Record<string, unknown>;
-	sessionId?: string;
-	toolUseId?: string;
 	ok?: boolean; // set when a matching tool_result arrives
 }
 export interface TraceText {
@@ -1024,24 +1041,21 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	else if (outcomeVal === "failed") outcome = "failed";
 	else if (outcomeVal === "error") outcome = "error";
 	else if (outcomeVal === "interrupted") outcome = "interrupted";
-	else if (outcomeVal === "exhausted") outcome = "exhausted";
 
-	const finalReview = timelineRaw.slice().reverse().find((entry) => entry?.type === "review");
-	const reviewRounds = toNum(stats.review_rounds);
-	const reviewRequired = Boolean(finalReview || (reviewRounds ?? 0) > 0 ||
-		settings.self_review === true || toStr(settings.reviewer)?.trim());
-	const lastReviewExitCode = toNum(finalReview?.exit_code);
-	const resultExitCode = toNum(result.exit_code);
-	const lastReviewFeedback = toStr(finalReview?.feedback)?.trim() || undefined;
-	// run.end lifecycle bookkeeping may follow the terminal loop event.
-	const terminalEvent = timelineRaw.slice().reverse().find((entry) => entry?.type !== "lifecycle");
-	const turns = toNum(stats.turns);
-	const terminalTurn = toNum(terminalEvent?.turn);
-	// Released recovered_response does not advance max_turn_seen, so stats
-	// can lag a terminal-floor failure. A marker older than stats is stale.
-	const terminalContextExhausted = outcome === "exhausted" && resultExitCode === 2 &&
-		terminalEvent?.type === "recovered_response" && terminalEvent.reason === "context_exhausted" &&
-		(turns === undefined || (terminalTurn !== undefined && terminalTurn >= turns));
+	// Last reviewer feedback: the most recent timeline entry of type "review".
+	// We include its feedback even on accepted runs (for visibility), but
+	// only surface it by default on rejections.
+	let lastReviewFeedback: string | undefined;
+	for (let i = timelineRaw.length - 1; i >= 0; i--) {
+		const entry = timelineRaw[i];
+		if (entry?.type === "review") {
+			const fb = toStr(entry.feedback);
+			if (fb && fb.trim()) {
+				lastReviewFeedback = fb.trim();
+				break;
+			}
+		}
+	}
 
 	const promptCacheRaw = stats.prompt_cache as Record<string, unknown> | undefined;
 	const promptCache =
@@ -1063,17 +1077,16 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 			: undefined;
 
 	return {
-		reviewRounds,
+		reviewRounds: toNum(stats.review_rounds),
 		outcome,
-		resultExitCode,
-		reviewRequired,
-		lastReviewExitCode,
-		terminalContextExhausted,
-		accepted: outcome === "unknown" ? undefined : outcome === "success" &&
-			(resultExitCode === undefined || resultExitCode === 0) &&
-			(!reviewRequired || lastReviewExitCode === 0),
+		accepted:
+			outcome === "success"
+				? true
+				: outcome === "failed" || outcome === "error" || outcome === "interrupted"
+					? false
+					: undefined,
 		errorMessage: toStr(result.error_message),
-		turns,
+		turns: toNum(stats.turns),
 		toolCallsTotal: toNum(stats.tool_calls_total),
 		toolCallsByName: validateToolCallsByName(stats.tool_calls_by_name),
 		totalLlmTimeS: toNum(stats.total_llm_time_s),
@@ -1238,14 +1251,10 @@ export function classifyFailure(
 	stderrLines: readonly string[],
 	report?: ReportSummary,
 ): FailureReason | undefined {
-	if (report?.terminalContextExhausted) {
-		return { code: "context_overflow", text: "Context window exhausted; even the minimal recovery prompt was rejected." };
-	}
 	// Review budget exhausted is usually success-from-swival-cli's POV (exit 0)
 	// but outcome=failed in the report. We surface it specifically so the
 	// caller knows *why* the run is marked failed rather than showing stderr.
-	if (report?.outcome !== "exhausted" && ((report?.lastReviewExitCode !== undefined && report.lastReviewExitCode !== 0) ||
-		(report?.outcome === "failed" && typeof report.reviewRounds === "number" && report.reviewRounds > 0))) {
+	if (report?.outcome === "failed" && typeof report.reviewRounds === "number" && report.reviewRounds > 0) {
 		return {
 			code: "review_rejected",
 			text: `Reviewer rejected after ${report.reviewRounds} round${report.reviewRounds === 1 ? "" : "s"}. See 'reviewer feedback' below.`,
@@ -1378,12 +1387,6 @@ export function terminalFailureReason(
 	}
 	const classified = classifyFailure(stderrLines, report);
 	if (classified) return classified;
-	if (report?.outcome === "exhausted") {
-		return { code: "max_turns", text: "Swival exhausted its turn budget (exit 2)." };
-	}
-	if (report?.reviewRequired && report.lastReviewExitCode === undefined) {
-		return { code: "config_error", text: "Required final reviewer exit evidence is missing." };
-	}
 	if (!report || report.outcome === "unknown") {
 		return {
 			code: "config_error",
@@ -1492,7 +1495,7 @@ export interface SwivalVersionCheck {
 	errorMessage?: string;
 }
 
-export const RECOMMENDED_SWIVAL_VERSION = "1.0.46";
+export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
 export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.44";
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -1668,14 +1671,12 @@ export function startTraceTail(
 	let buffer = "";
 	const toolUseNames = new Map<string, string>();
 
-	let pendingRead: Promise<void> | undefined;
+	let consuming = false;
 	let shouldRerun = false;
-	const consume = (): Promise<void> => {
-		if (pendingRead) { shouldRerun = true; return pendingRead; }
-		pendingRead = readAvailable().finally(() => { pendingRead = undefined; });
-		return pendingRead;
-	};
-	const readAvailable = async () => {
+	const consume = async () => {
+		if (consuming) { shouldRerun = true; return; }
+		consuming = true;
+		try {
 			do {
 				shouldRerun = false;
 				if (!traceFile) return;
@@ -1729,8 +1730,7 @@ export function startTraceTail(
 									if (p.type === "tool_use" && typeof p.name === "string") {
 										if (typeof p.id === "string") toolUseNames.set(p.id, p.name);
 										const args = (p.input as Record<string, unknown>) ?? {};
-										onEvent({ type: "toolCall", name: p.name, args,
-											sessionId: path.basename(traceFile!, ".jsonl"), toolUseId: toStr(p.id) });
+										onEvent({ type: "toolCall", name: p.name, args });
 									} else if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
 										onEvent({ type: "text", text: p.text });
 									}
@@ -1748,8 +1748,7 @@ export function startTraceTail(
 									if (p.type === "tool_result" && typeof p.tool_use_id === "string") {
 										const name = toolUseNames.get(p.tool_use_id) ?? "tool";
 										const ok = p.is_error !== true;
-										onEvent({ type: "toolCall", name, args: {}, ok,
-											sessionId: path.basename(traceFile!, ".jsonl"), toolUseId: p.tool_use_id });
+										onEvent({ type: "toolCall", name, args: {}, ok });
 									}
 								}
 							}
@@ -1759,6 +1758,9 @@ export function startTraceTail(
 					if (handle) await handle.close().catch(() => undefined);
 				}
 			} while (shouldRerun);
+		} finally {
+			consuming = false;
+		}
 	};
 
 	const attachFileWatcher = () => {
@@ -1803,8 +1805,6 @@ export function startTraceTail(
 	return async () => {
 		clearInterval(pollInterval);
 		watcher?.close();
-		fileWatcher?.close();
-		await pickTraceFile();
 		fileWatcher?.close();
 		await consume();
 	};
@@ -1914,11 +1914,25 @@ export async function persistArtifacts(
 
 // ------------------------------------------------- artifact lifecycle --
 
+async function isNativeArtifact(directory: string): Promise<boolean> {
+	if (path.basename(directory).startsWith("native-audit-")) return true;
+	for (const name of ["snapshot", "request.json", path.join("evidence", "native-state")]) {
+		try { await fs.promises.lstat(path.join(directory, name)); return true; }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true; }
+	}
+	try {
+		const meta = path.join(directory, "run-meta.json");
+		const stat = await fs.promises.lstat(meta);
+		if (!stat.isFile() || stat.size > 65536) return false;
+		return JSON.parse(await fs.promises.readFile(meta, "utf8")).nativeAuditRequested === true;
+	} catch { return false; }
+}
+
 /**
  * Remove artifact directories in `artifactRoot` that are older than 7 days
  * (based on directory mtime). Best-effort: individual removal failures are
- * swallowed. Called fire-and-forget on validated native launches and ordinary
- * tool invocations so old audit artifacts don't accumulate indefinitely.
+ * swallowed. Called fire-and-forget at the start of every tool invocation so
+ * old artifacts from heavy audit sessions don't accumulate indefinitely.
  */
 export async function pruneOldArtifacts(
 	artifactRoot: string = ARTIFACT_ROOT,
@@ -1942,33 +1956,16 @@ export async function pruneOldArtifacts(
 		try {
 			const stat = await fs.promises.stat(fullPath);
 			if (!stat.isDirectory() || stat.mtimeMs >= cutoff) continue;
+			if (await isNativeArtifact(fullPath)) continue;
 			// Fix 4: never prune a directory belonging to an in-flight run.
 			if (activeArtifactDirs.has(fullPath)) continue;
-			let native = name.startsWith("native-audit-");
-			for (const identifier of ["request.json", "snapshot", "runtime-bin", path.join("evidence", "native-result.json"),
-				path.join("evidence", "native-state")]) {
-				try { await fs.promises.lstat(path.join(fullPath, identifier)); native = true; }
-				catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-			}
+			// Fix 4: require completed.json — a missing marker means the run is
+			// still active or was interrupted before it could write its marker;
+			// do not prune based on mtime alone.
 			try {
-				const metaFile = path.join(fullPath, "run-meta.json");
-				const metaStat = await fs.promises.lstat(metaFile);
-				if (!metaStat.isFile() || metaStat.size > 65536) continue;
-				const meta = JSON.parse(await fs.promises.readFile(metaFile, "utf8"));
-				if (!meta || typeof meta !== "object" || Array.isArray(meta) ||
-					(meta.nativeAuditRequested !== undefined && typeof meta.nativeAuditRequested !== "boolean")) continue;
-				native ||= meta.nativeAuditRequested === true;
-			} catch (error) {
-				if (native || (error as NodeJS.ErrnoException).code !== "ENOENT") continue;
-			}
-			if (native) {
-				const terminal = readNativeTerminal(fullPath);
-				if (!terminal || terminal.shutdown === "unverified" ||
-					(terminal.shutdown === "verified" && terminal.boundary !== "bubblewrap-pidfd")) continue;
-			} else {
-				// Ordinary runs retain their existing completion-marker requirement.
-				try { await fs.promises.access(path.join(fullPath, "completed.json")); }
-				catch { continue; }
+				await fs.promises.access(path.join(fullPath, "completed.json"));
+			} catch {
+				continue;
 			}
 			await fs.promises.rm(fullPath, { recursive: true, force: true });
 		} catch {
@@ -1987,15 +1984,13 @@ export async function pruneOldArtifacts(
  */
 export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT_ROOT): Promise<RunMeta | undefined> {
 	let entries: string[];
-	let resolvedRoot: string;
 	try {
-		resolvedRoot = await canonicalFuturePath(artifactRoot);
-		entries = await fs.promises.readdir(resolvedRoot);
+		entries = await fs.promises.readdir(artifactRoot);
 	} catch {
 		return undefined;
 	}
 	for (const name of entries) {
-		const metaPath = path.join(resolvedRoot, name, "run-meta.json");
+		const metaPath = path.join(artifactRoot, name, "run-meta.json");
 		try {
 			try {
 				const metaStat = await fs.promises.stat(metaPath);
@@ -2009,23 +2004,20 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
 				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
-				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean") ||
-				("nativeAuditRequested" in parsed && typeof parsed.nativeAuditRequested !== "boolean") ||
-				("reviewRequired" in parsed && typeof parsed.reviewRequired !== "boolean") ||
-				("outputPath" in parsed && typeof parsed.outputPath !== "string") ||
-				("outputMode" in parsed && !["inline", "file-only"].includes(String(parsed.outputMode)))
+				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean")
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
-			const resolvedArtifact = await canonicalFuturePath(parsed.artifactDir as string);
+			const resolvedArtifact = path.resolve(parsed.artifactDir as string);
+			const resolvedRoot = path.resolve(artifactRoot);
 			if (!resolvedArtifact.startsWith(resolvedRoot + path.sep)) continue;
 
 			// stdoutFile and stderrFile must be under artifactDir
 			if (typeof (parsed as any).stdoutFile === "string") {
-				if (!(await canonicalFuturePath((parsed as any).stdoutFile)).startsWith(resolvedArtifact + path.sep)) continue;
+				if (!path.resolve((parsed as any).stdoutFile).startsWith(resolvedArtifact + path.sep)) continue;
 			}
 			if (typeof (parsed as any).stderrFile === "string") {
-				if (!(await canonicalFuturePath((parsed as any).stderrFile)).startsWith(resolvedArtifact + path.sep)) continue;
+				if (!path.resolve((parsed as any).stderrFile).startsWith(resolvedArtifact + path.sep)) continue;
 			}
 
 			// PID range: reject 0, 1, negative, and non-integer values
@@ -2066,39 +2058,23 @@ async function loadRunState(
 			exited: entry.exited,
 			exitCode: entry.exitCode,
 		};
-		if (entry.meta.nativeAuditRequested) {
-			const terminal = readNativeTerminal(entry.meta.artifactDir);
-			if (entry.exited && terminal) {
-				info.completed = terminal;
-				info.exitCode = terminal.exitCode;
-			}
-			return info;
+		// Also read completed.json when the entry says exited, so callers
+		// that need the marker (e.g. resume) get it without a separate read.
+		if (entry.exited) {
+			try {
+				const txt = await fs.promises.readFile(
+					path.join(entry.meta.artifactDir, "completed.json"),
+					"utf-8",
+				);
+				info.completed = JSON.parse(txt) as CompletedMarker;
+			} catch { /* best-effort */ }
 		}
-		// The durable wrapper writes completed.json immediately before it exits;
-		// its ChildProcess close event can arrive a tick later. Prefer that marker
-		// whenever present so status/resume and a newly registered extension agree.
-		try {
-			const txt = await fs.promises.readFile(
-				path.join(entry.meta.artifactDir, "completed.json"),
-				"utf-8",
-			);
-			info.completed = JSON.parse(txt) as CompletedMarker;
-			info.exited = true;
-			info.exitCode = info.completed.exitCode;
-			entry.exited = true;
-			entry.exitCode = info.completed.exitCode;
-		} catch { /* still running or completion marker unavailable */ }
 		return info;
 	}
 
 	// Disk fallback: find run-meta.json, then read completed.json + spawn-error.txt.
 	const meta = await findRunMeta(runId, artifactRoot);
-	if (!meta) return undefined;
-	if (meta.nativeAuditRequested) {
-		const terminal = readNativeTerminal(meta.artifactDir);
-		return { meta, exited: terminal !== undefined, exitCode: terminal?.exitCode ?? null,
-			completed: terminal, nativeUnknown: terminal === undefined };
-	}
+	if (!meta || meta.nativeAuditRequested || await isNativeArtifact(meta.artifactDir)) return undefined;
 
 	let completed: CompletedMarker | undefined;
 	try {
@@ -2112,63 +2088,30 @@ async function loadRunState(
 	} catch { /* no spawn error */ }
 
 	const exited = completed !== undefined;
-	const exitCode = completed?.exitCode ?? (exited ? 1 : null);
+	const exitCode = completed?.exitCode ?? null;
 	return { meta, exited, exitCode, completed, spawnError };
 }
 
 interface CompletedAsyncInspection {
 	report: ReportSummary | undefined;
-	output?: AsyncOutputResult;
 	reason?: FailureReason;
-}
-
-async function readAsyncOutputResult(meta: RunMeta): Promise<{ output?: AsyncOutputResult; error?: string }> {
-	if (!meta.outputPath) return {};
-	const resultPath = path.join(meta.artifactDir, "output-result.json");
-	try {
-		const stat = await fs.promises.lstat(resultPath);
-		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) throw new Error("output result is not a bounded regular file");
-		const raw = JSON.parse(await fs.promises.readFile(resultPath, "utf8")) as Record<string, unknown>;
-		if (!["written", "not-written", "error"].includes(String(raw.status)) ||
-			raw.outputPath !== meta.outputPath || raw.outputMode !== meta.outputMode ||
-			(raw.outputBytes !== undefined && (!Number.isSafeInteger(raw.outputBytes) || (raw.outputBytes as number) < 0)) ||
-			(raw.outputLineCount !== undefined && (!Number.isSafeInteger(raw.outputLineCount) || (raw.outputLineCount as number) < 0)) ||
-			(raw.reason !== undefined && typeof raw.reason !== "string") ||
-			(raw.error !== undefined && typeof raw.error !== "string")) {
-			throw new Error("output result does not match startup-bound output metadata");
-		}
-		return { output: raw as unknown as AsyncOutputResult };
-	} catch (error) {
-		return { error: error instanceof Error ? error.message : String(error) };
-	}
 }
 
 async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedAsyncInspection> {
 	const report = await readReport(path.join(state.meta.artifactDir, "report.json"));
-	if (report && state.meta.reviewRequired) report.reviewRequired = true;
 	const bootstrapCheck = enforceCompletedAsyncAgentFs(state.meta, report);
 	const nonoCheck = enforceCompletedAsyncNono(state.meta, bootstrapCheck.report);
 	const effectiveReport = nonoCheck.report;
 	const effectiveBootstrapReason = bootstrapCheck.reason ?? nonoCheck.reason;
 	const stderr = await fs.promises.readFile(state.meta.stderrFile, "utf-8").catch(() => "");
 	const stderrLines = stderr.split("\n").filter(Boolean);
-	const outputResult = await readAsyncOutputResult(state.meta);
-	let reason: FailureReason | undefined;
-	if (outputResult.error) {
-		reason = { code: "unknown", text: `Async output evidence is missing or invalid: ${outputResult.error}` };
-	} else if (outputResult.output?.status === "error") {
-		reason = { code: "unknown", text: `Failed to write output to ${state.meta.outputPath}: ${outputResult.output.error ?? "unknown write error"}` };
-	}
-	reason ??= terminalFailureReason(
+	const reason = terminalFailureReason(
 		state.exitCode ?? 1,
 		effectiveReport,
 		stderrLines,
 		effectiveBootstrapReason,
 	);
-	if (!reason && outputResult.output?.status !== undefined && outputResult.output.status !== "written") {
-		reason = { code: "unknown", text: `Async output was not written: ${outputResult.output.reason ?? "terminal success was not verified"}` };
-	}
-	return { report: effectiveReport, output: outputResult.output, reason };
+	return { report: effectiveReport, reason };
 }
 
 function formatCompletedAsyncFailure(
@@ -2185,11 +2128,6 @@ function formatCompletedAsyncFailure(
 }
 
 // ------------------------------------------------ async (background) --
-
-/** Keep ordinary tasks out of ambient one-shot slash/bang command dispatch. */
-function ordinaryTaskPrompt(task: string): string {
-	return `Delegated task (plain text):\n\n${task}`;
-}
 
 /**
  * Spawn Swival through a detached durable wrapper. The wrapper writes the
@@ -2210,8 +2148,7 @@ export async function runSingleSwivalAsync(
 	cwd: string | undefined,
 	overrides: SwivalOverrides,
 	artifactRoot: string = ARTIFACT_ROOT,
-	output?: { path: string; mode?: "inline" | "file-only"; cwdAnchor: string },
-): Promise<{ runId: string; artifactDir: string; outputPath?: string; outputMode?: "inline" | "file-only" }> {
+): Promise<{ runId: string; artifactDir: string }> {
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		throw new Error(unknownAgentMessage(agentName, agents));
@@ -2221,8 +2158,6 @@ export async function runSingleSwivalAsync(
 		throw new Error(reviewerError);
 	}
 	const runCwd = cwd ?? defaultCwd;
-	const dispatchCwd = path.resolve(runCwd);
-	const asyncArtifactRoot = output ? path.resolve(artifactRoot) : artifactRoot;
 	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
 	if (argumentError) throw new SwivalArgumentError(argumentError);
 
@@ -2233,7 +2168,7 @@ export async function runSingleSwivalAsync(
 
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
-	const { artifactDir, ts, runId } = mintArtifactDir(agentName, asyncArtifactRoot);
+	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
 	const traceDir = path.join(artifactDir, "trace");
 	await fs.promises.mkdir(traceDir, { recursive: true, mode: 0o700 });
 
@@ -2245,88 +2180,37 @@ export async function runSingleSwivalAsync(
 	const agentFsRequested = isAgentFsRequested(args);
 	const nonoRequested = isNonoRequested(args);
 	const isReexec = isReexecSandboxRequested(args);
-	const taskPrompt = ordinaryTaskPrompt(task);
 	if (isReexec) {
-		args.push("--", taskPrompt);
+		args.push("--", task);
 	} else {
 		const taskFile = path.join(artifactDir, "task.txt");
-		await fs.promises.writeFile(taskFile, taskPrompt, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(taskFile, task, { encoding: "utf-8", mode: 0o600 });
 		args.push("--");
 	}
 
-	// Bind both directories before detaching. The runner holds dispatch cwd;
-	// its output committer holds output cwd. Both verify this read-only, unlinked
-	// config before Swival starts. Reloadable metadata grants no file authority.
-	let outputBinding: OutputBinding | undefined;
-	let outputConfigFd: number | undefined;
-	if (output) {
-		const dispatchStat = fs.statSync(dispatchCwd);
-		if (!dispatchStat.isDirectory()) throw new Error("dispatch cwd is not a directory");
-		outputBinding = outputFiles.prepareOutputFile(output.path, output.cwdAnchor);
-		const configPath = path.join(artifactDir, `.output-binding-${process.pid}-${randomBytes(8).toString("hex")}`);
-		try {
-			fs.writeFileSync(configPath, JSON.stringify({
-				dispatchIdentity: { dev: dispatchStat.dev, ino: dispatchStat.ino },
-				outputMode: output.mode ?? "file-only",
-				binding: {
-					target: outputBinding.target,
-					outputPath: outputBinding.outputPath,
-					temporary: outputBinding.temporary,
-					directory: outputBinding.directory,
-					directoryIdentity: outputBinding.directoryIdentity,
-					identity: outputBinding.identity,
-				},
-			}), { encoding: "utf8", mode: 0o600, flag: "wx" });
-			outputConfigFd = fs.openSync(configPath, "r");
-			fs.unlinkSync(configPath);
-		} catch (err) {
-			try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
-			try { fs.unlinkSync(configPath); } catch { /* ignore */ }
-			outputFiles.discardOutputFile(outputBinding);
-			throw err;
-		}
-	}
-
-	let stdoutFd: number;
-	try {
-		stdoutFd = fs.openSync(stdoutFile, "w");
-	} catch (err) {
-		if (outputBinding) outputFiles.discardOutputFile(outputBinding);
-		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
-		throw err;
-	}
+	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
+	// opening stderrFd throws, close stdoutFd before propagating. Both are
+	// closed in the spawn try/finally so we never hold references that keep
+	// the event loop alive.
+	const stdoutFd = fs.openSync(stdoutFile, "w");
 	let stderrFd: number;
 	try {
 		stderrFd = fs.openSync(stderrFile, "w");
 	} catch (err) {
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
-		if (outputBinding) outputFiles.discardOutputFile(outputBinding);
-		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
 		throw err;
 	}
 	let proc: ChildProcess;
-	let spawned = false;
 	try {
-		const runnerArgs = [ASYNC_RUNNER_PATH, artifactDir];
-		if (outputBinding) runnerArgs.push("--async-output-v1");
-		runnerArgs.push(...args);
-		proc = spawn(process.execPath, runnerArgs, {
+		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
 			cwd: runCwd,
 			shell: false,
-			stdio: outputBinding
-				? ["ignore", stdoutFd, stderrFd, outputBinding.fd, outputConfigFd!]
-				: ["ignore", stdoutFd, stderrFd],
+			stdio: ["ignore", stdoutFd, stderrFd],
 			detached: true,
 		});
-		spawned = true;
 	} finally {
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		try { fs.closeSync(stderrFd!); } catch { /* ignore */ }
-		try { if (outputConfigFd !== undefined) fs.closeSync(outputConfigFd); } catch { /* ignore */ }
-		if (outputBinding) {
-			if (spawned) try { fs.closeSync(outputBinding.fd); } catch { /* ignore */ }
-			else outputFiles.discardOutputFile(outputBinding);
-		}
 	}
 
 	const meta: RunMeta = {
@@ -2340,8 +2224,6 @@ export async function runSingleSwivalAsync(
 		stderrFile,
 		agentFsRequested,
 		nonoRequested,
-		reviewRequired: hasCliFlag(args, "--self-review") || Boolean(lastCliOptionValue(args, "--reviewer")),
-		...(outputBinding ? { outputPath: outputBinding.outputPath, outputMode: output?.mode ?? "file-only" as const } : {}),
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
@@ -2401,11 +2283,7 @@ export async function runSingleSwivalAsync(
 		);
 	}
 
-	return {
-		runId,
-		artifactDir,
-		...(meta.outputPath ? { outputPath: meta.outputPath, outputMode: meta.outputMode } : {}),
-	};
+	return { runId, artifactDir };
 }
 
 // ---------------------------------------------------------- run single (sync) --
@@ -2531,12 +2409,14 @@ async function runSingleSwival(
 
 	const stopTrace = startTraceTail(traceDir, (event) => {
 		if (!current.traceEvents) current.traceEvents = [];
-		// Match completion by session and tool-use ID, never by tool name.
-		if (event.type === "toolCall" && event.ok !== undefined && event.toolUseId) {
+		// Merge tool_result results into the matching toolCall to avoid
+		// doubling events; we only track the most recent pending call for a
+		// name because the trace does not carry unique ids we can cheaply key
+		// on from this side.
+		if (event.type === "toolCall" && event.ok !== undefined) {
 			for (let i = current.traceEvents.length - 1; i >= 0; i--) {
 				const prev = current.traceEvents[i];
-				if (prev.type === "toolCall" && prev.toolUseId === event.toolUseId &&
-					prev.sessionId === event.sessionId && prev.ok === undefined) {
+				if (prev.type === "toolCall" && prev.name === event.name && prev.ok === undefined) {
 					prev.ok = event.ok;
 					scheduleEmit();
 					return;
@@ -2565,9 +2445,8 @@ async function runSingleSwival(
 	// input; every other run, including sandbox-less ones, passes it on argv
 	// because ambient configuration may enable a re-executing sandbox.
 	const isReexec = isReexecSandboxRequested(args);
-	const taskPrompt = ordinaryTaskPrompt(task);
 	if (isReexec) {
-		args.push("--", taskPrompt);
+		args.push("--", task);
 	} else {
 		args.push("--");
 	}
@@ -2581,7 +2460,7 @@ async function runSingleSwival(
 			});
 			if (!isReexec) {
 				proc.stdin?.on("error", () => { /* child exited before reading prompt */ });
-				proc.stdin?.end(taskPrompt, "utf-8");
+				proc.stdin?.end(task, "utf-8");
 			}
 
 			const stdoutDecoder = new TextDecoder("utf-8");
@@ -2602,7 +2481,6 @@ async function runSingleSwival(
 				timeoutTimer.unref?.();
 			}
 
-			// Both output streams always use "pipe"; only stdin varies above.
 			proc.stdout!.on("data", (buf: Buffer) => {
 				stdoutBuf += stripAnsi(stdoutDecoder.decode(buf, { stream: true }));
 				if (stdoutBuf.length > STDOUT_RING_CHARS) {
@@ -2683,9 +2561,6 @@ async function runSingleSwival(
 		current.exitCode = exitCode;
 		current.durationMs = Date.now() - started;
 		current.report = await readReport(reportPath);
-		if (current.report && (hasCliFlag(args, "--self-review") || lastCliOptionValue(args, "--reviewer"))) {
-			current.report.reviewRequired = true;
-		}
 
 		// Fail closed when emitted arguments or Swival configuration requested
 		// AgentFS or Nono but the report cannot prove sandbox engagement.
@@ -2710,7 +2585,6 @@ async function runSingleSwival(
 		}
 		emit(); // synchronous final emit: caller must see canonical end state
 
-		await stopTrace();
 		// Persist artifacts BEFORE the finally-block removes tmpDir. Callers
 		// expect report.json and <session>.jsonl to outlive the run so failure
 		// diagnosis has source material to point at.
@@ -2822,11 +2696,11 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 
 const SwivalParams = Type.Object({
 	audit: Type.Optional(Type.Object({
-		paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs. No command text or host paths." })),
-		all: Type.Optional(Type.Boolean({ description: "Deep-review every file in the selected native scope." })),
+		paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs, not commands." })),
+		all: Type.Optional(Type.Boolean({ description: "Deep-review every file in scope." })),
 		workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
 		patchMaxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-	}, { additionalProperties: false, description: "One native audit on an independent committed snapshot of Pi's repository-root cwd. Incompatible with task, agent, cwd, reviews, or permission overrides." })),
+	}, { additionalProperties: false, description: "Synchronous, source-only native audit of repository-root cwd's committed tree. No async, task, agent, cwd or permission overrides." })),
 	agent: Type.Optional(Type.String({ description: "Swival agent name (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -2957,8 +2831,8 @@ const SwivalParams = Type.Object({
 				"Cap (in characters) on a task's finalOutput inlined into the tool-response content. Applies to single, chain, and parallel modes. When output exceeds the cap, the response shows the first maxInlineBytes characters followed by a [truncated N chars; full output at <artifactDir>] marker. Omit (default) to inline the full output — silent truncation is never the default. To avoid token growth entirely, pass `output: \"...\"` paths instead.",
 		}),
 	),
-	output: Type.Optional(Type.String({ description: "Single/chain mode: file path to write the run's finalOutput to. Relative paths resolve against the original cwd. In ordinary async single mode, output is written automatically only after verified success; status/resume is not required. When set, response content defaults to file-only metadata — set outputMode=\"inline\" to also receive the body inline." })),
-	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Single/chain mode: how to surface output. Default with output is file-only; inline returns the body even when also writing to a file. For ordinary async runs, status reports output metadata and resume follows this mode." })),
+	output: Type.Optional(Type.String({ description: "Single/chain mode: file path to write the run's finalOutput to. Relative paths resolve against cwd. When set, the tool-response content defaults to file-only metadata (path + size) instead of inlining the body — set outputMode=\"inline\" to also receive the body inline." })),
+	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Single/chain mode: how to surface output in the tool-response content. Default with output is file-only; inline returns the body even when also writing to a file." })),
 	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock budget in milliseconds for the swival process. On expiry: SIGTERM, then SIGKILL after 5 seconds. No default; only enforced when set." })),
 
 	// ---- async / background execution ----
@@ -3030,7 +2904,7 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 /**
  * Render the terminal status of a run. Preserves four distinct success/
  * failure states so the caller can tell:
- *   - accepted:  terminal success with final reviewer exit 0
+ *   - accepted:  reviewer approved (review_rounds ≥ 1, outcome=success)
  *   - completed: ran without a reviewer to natural success (review_rounds=0)
  *   - rejected:  reviewer said no (outcome=failed, exit=0)
  *   - failed:    non-zero exit (swival itself crashed or was killed)
@@ -3042,17 +2916,16 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
  * cause.
  */
 export function renderStatus(r: SwivalResult): RunStatus {
+	if (r.nativeAudit) return isRunFailure(r) ? "failed" : "completed";
 	if (r.exitCode === -1) return "running";
-	if (r.nativeAudit) return r.exitCode === 0 && r.nativeAudit.status === "completed" ? "completed" : "failed";
 	if (r.exitCode !== 0) return "failed";
 	if (r.report?.outcome === "error") return "error";
 	if (r.report?.outcome === "failed") return "rejected";
 	if (r.report?.outcome === "interrupted") return "failed";
-	if (r.report?.lastReviewExitCode !== undefined && r.report.lastReviewExitCode !== 0) return "rejected";
-	if (r.report?.outcome === "success" && !isRunFailure(r)) {
-		return r.report.reviewRequired || (r.report.reviewRounds ?? 0) > 0 ? "accepted" : "completed";
+	if (r.report?.outcome === "success") {
+		const rounds = r.report.reviewRounds ?? 0;
+		return rounds > 0 ? "accepted" : "completed";
 	}
-	if (r.report?.outcome === "exhausted") return "failed";
 	// Exit zero with a missing or unknown report fails closed because no
 	// valid terminal outcome proves that the run completed successfully.
 	return "error";
@@ -3192,9 +3065,7 @@ export function buildParallelSummary(
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
 	trustProjectAgents?: boolean;
-	/** Operator-selected installed Swival interpreter; never a tool argument. */
 	nativePython?: string;
-	/** Native wall-clock ceiling. Defaults to 30 minutes. */
 	nativeMaxTimeoutMs?: number;
 }
 
@@ -3202,14 +3073,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
 	const nativeRuntime = captureNativeRuntime(options.nativePython);
 	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
-	const nativeResult = (meta: RunMeta, exitCode: number, nativeAudit: NativeAuditResult): SwivalResult => ({
-		agent: "native-audit", agentSource: "bundled", task: meta.task, exitCode, nativeAudit,
-		finalOutput: nativeAudit.answer ? applyInlineCap(
-			`Native verifier judgment; project commands and PoCs cannot execute.\n\n${nativeAudit.answer}`,
-			64 * 1024, path.join(meta.artifactDir, "evidence", "native-result.json")) : "",
-		stderrTail: [], durationMs: Date.now() - meta.startedAt,
-		artifactDir: meta.artifactDir, errorMessage: nativeAudit.error,
-		...(nativeAudit.error ? { reason: { code: "unknown" as const, text: nativeAudit.error } } : {}),
+	const nativeRuns = new Set<NativeAuditLaunch>();
+	const preparing = new Set<AbortController>();
+	pi.on?.("session_shutdown", async () => {
+		for (const controller of preparing) controller.abort();
+		for (const run of nativeRuns) run.cancel("Native audit cancelled during session shutdown.");
+		await Promise.allSettled([...nativeRuns].map((run) => run.completion));
 	});
 	pi.registerTool({
 		name: "swival-subagent",
@@ -3217,8 +3086,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		description: [
 			"Delegate a task to a swival subprocess with its built-in reviewer loop.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution), or native audit (audit object).",
-			"Native mode uses Linux unshare and bubblewrap with builtin Session isolation and provider-only network access.",
-			"Ordinary delegation uses AgentFS. Native audit rejects protected or unsupported routes without fallback.",
+			"Native mode uses synchronous upstream AgentFS CLI and provider-only policy for source-only verification. Native async is unsupported.",
 			"Bundled agents work out of the box; override or extend via ~/.pi/agent/swival-agents/ (user) or .pi/swival-agents/ (project).",
 			"Use this when you want the reviewer loop, test-as-contract, sandbox overlay, or secret encryption to wrap the subagent's work.",
 		].join(" "),
@@ -3228,149 +3096,53 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		// list entirely (see pi docs/extensions.md), so the model only sees the
 		// tool via its schema at invocation time.
 		promptSnippet:
-			"Delegate to swival with reviewer loop, ordinary AgentFS sandbox, native audit, test-as-contract, or secret encryption",
+			"Delegate to swival with reviewer loop, AgentFS sandbox, test-as-contract, or secret encryption",
 		promptGuidelines: [
-			"Use swival-subagent when a task benefits from swival's reviewer loop (retry until acceptance passes), a test-as-contract script, ordinary AgentFS isolation, native Linux unshare/bubblewrap isolation, or format-preserving secret encryption — otherwise prefer simpler tools.",
+			"Use swival-subagent when a task benefits from swival's reviewer loop (retry until acceptance passes), a test-as-contract script, OS-enforced filesystem isolation via AgentFS, or format-preserving secret encryption — otherwise prefer simpler tools.",
 		],
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if ("audit" in params) {
+				const controller = new AbortController();
+				const abort = () => controller.abort();
+				signal?.addEventListener("abort", abort, { once: true });
+				if (signal?.aborted) abort();
+				preparing.add(controller);
+				let run: NativeAuditLaunch | undefined;
 				try {
 					const input = params as unknown as Record<string, unknown>;
 					const audit = validateNativeAuditParams(input);
-					if (signal?.aborted) throw new Error("Native audit was cancelled before launch.");
 					if (!Number.isInteger(nativeMaxTimeoutMs) || nativeMaxTimeoutMs < 1 || nativeMaxTimeoutMs > 2_147_483_647) {
-						throw new Error("Invalid operator-configured native timeout ceiling.");
+						throw new Error("Invalid native timeout ceiling.");
 					}
 					const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
-					const { meta, proc } = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
-						artifactDir, runId, nativeMaxTimeoutMs, signal);
-					const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
-					asyncRuns.set(runId, entry);
-					// Validate preparation and register the live run before pruning.
-					void pruneOldArtifacts(artifactRoot);
-					let ownedChildPid: number | undefined;
-					let childOwnership: NativeOwnership | undefined;
-					let namespaceStopped = false;
-					let wrapperClosed = false;
-					let ready = false;
-					let lifecycleFailure: string | undefined;
-					let persistenceFailure: string | undefined;
-					let notifyReady!: () => void;
-					const readiness = new Promise<void>((resolve) => { notifyReady = resolve; });
-					const stopWrapper = (reason: string) => {
-						lifecycleFailure ??= reason;
-						if (proc.pid && !wrapperClosed) {
-							try { proc.kill("SIGTERM"); } catch { /* exit will transfer finalization */ }
-						}
-					};
-					entry.interruptNative = () => stopWrapper("Native audit was interrupted.");
-					const abort = () => stopWrapper("Native audit was cancelled before handoff.");
-					signal?.addEventListener("abort", abort, { once: true });
-					// Only this tracked wrapper's inherited IPC channel grants authority.
-					const ownership = (message: unknown) => {
-						const child = message as { type?: unknown; pid?: unknown } | null;
-						if (!child || typeof child !== "object" || Array.isArray(child) ||
-							Object.keys(child).sort().join(",") !== "pid,type" ||
-							!Number.isInteger(child.pid) || (child.pid as number) < 2 || (child.pid as number) > 2_147_483_647 ||
-							child.pid === process.pid || child.pid === proc.pid) {
-							stopWrapper("Native child ownership message was invalid."); return;
-						}
-						if (child.type === "native-child" && ownedChildPid === undefined) {
-							const pid = child.pid as number;
-							ownedChildPid = pid;
-							childOwnership = { signal: (name) => process.kill(-pid, name),
-								verify: async () => namespaceStopped };
-							// Register ownership before ACK, and never authorize a cancelled run.
-							if (signal?.aborted || lifecycleFailure) { abort(); return; }
-							try {
-								proc.send({ type: "native-child-owned", pid }, (error) => {
-									if (error) stopWrapper("Native child ownership acknowledgement failed.");
-								});
-							} catch { stopWrapper("Native child ownership acknowledgement failed."); }
-						} else if (child.type === "native-started" && child.pid === ownedChildPid && !ready) {
-							if (signal?.aborted || lifecycleFailure) { abort(); return; }
-							ready = true; notifyReady();
-						} else if (["native-namespace-stopped", "native-not-started"].includes(String(child.type)) &&
-							child.pid === ownedChildPid) {
-							namespaceStopped = true;
-						} else stopWrapper("Native lifecycle message was invalid.");
-					};
-					proc.on("message", ownership);
-					const completion = new Promise<number>((resolve) => {
-						let finalization: Promise<void> | undefined;
-						const settle = (code: number | null) => {
-							if (finalization) return;
-							wrapperClosed = true;
-							proc.removeListener("message", ownership);
-							finalization = (async () => {
-								let terminalCode = code ?? 1;
-								try {
-									let terminal = readNativeTerminal(meta.artifactDir);
-									if (!terminal || (terminal.shutdown === "unverified" && childOwnership)) {
-										terminal = await recordNativeAuditFailure(meta,
-											lifecycleFailure ?? "Native runner exited without verified terminal evidence.", childOwnership,
-											!childOwnership && proc.pid ? () => new Promise((done) => setTimeout(done, 5000)) : undefined);
-									}
-									terminalCode = terminal.exitCode;
-								} catch (error) {
-									terminalCode ||= 1;
-									persistenceFailure = (error as Error).message;
-								} finally {
-									childOwnership = undefined;
-									entry.exited = true;
-									entry.exitCode = terminalCode;
-									resolve(terminalCode);
-								}
-							})();
-						};
-						proc.once("error", () => { lifecycleFailure = "Native runner failed to start."; });
-						// The parent writes only after wrapper exit. A valid terminal record
-						// prevents duplicate signalling, evidence export, and rewriting.
-						proc.once("exit", settle);
-						proc.once("close", settle);
-					});
-					let readinessTimer: ReturnType<typeof setTimeout> | undefined;
-					await Promise.race([readiness, completion, new Promise<void>((resolve) => {
-						readinessTimer = setTimeout(resolve, 5000);
-					})]);
-					clearTimeout(readinessTimer);
-					if (!ready && !wrapperClosed) {
-						stopWrapper("Native runner did not establish its lifecycle.");
-						if (proc.pid) await terminateProcessGroup(proc, proc.pid, process.kill, 1000);
-					}
-					if (signal?.aborted) {
-						abort();
-						await completion;
-						signal.removeEventListener("abort", abort);
-						asyncRuns.delete(runId);
-						throw new Error(`Native audit was cancelled; runner exited. Artifacts: ${meta.artifactDir}.`);
-					}
-					const makeNativeDetails = (results: SwivalResult[]) => ({ mode: "single" as const,
-						agentScope: "user" as const, projectAgentsDir: null, results, runId });
-					if (params.async && ready && !wrapperClosed && proc.exitCode === null && proc.signalCode === null &&
-						!readNativeTerminal(meta.artifactDir)) {
-						signal?.removeEventListener("abort", abort);
-						proc.unref();
-						proc.channel?.unref();
-						void completion.then(() => setTimeout(() => asyncRuns.delete(runId), 60 * 60_000).unref());
-						return { content: [{ type: "text", text: `Native audit started.\nrunId: ${runId}\nArtifact dir: ${meta.artifactDir}` }],
-							details: makeNativeDetails([]) };
-					}
-					if (signal?.aborted) abort();
-					let code: number;
-					try { code = await completion; } finally { signal?.removeEventListener("abort", abort); asyncRuns.delete(runId); }
-					if (persistenceFailure) throw new Error(persistenceFailure);
-					const result = nativeResult(meta, code, await inspectNativeAudit(meta.artifactDir, code));
-					result.finalOutput = applyInlineCap(result.finalOutput, params.maxInlineBytes,
-						path.join(meta.artifactDir, "evidence", "native-result.json"));
-					return { content: [{ type: "text", text: `${result.errorMessage ?? result.finalOutput}\nArtifact dir: ${meta.artifactDir}` }],
-						details: makeNativeDetails([result]), isError: isRunFailure(result) };
+					run = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
+						artifactDir, runId, nativeMaxTimeoutMs, controller.signal);
+					preparing.delete(controller);
+					nativeRuns.add(run);
+					const routeText = `Resolved native route: ${run.route.provider}/${run.route.model}` +
+						(run.route.endpoint ? `; endpoint=${run.route.endpoint}` : "") +
+						(run.route.profile ? `; profile=${run.route.profile}` : "") +
+						(run.route.reasoningEffort ? `; effort=${run.route.reasoningEffort}` : "");
+					const terminal = await run.completion;
+					const nativeAudit = { ...await inspectNativeAudit(artifactDir, terminal.exitCode), route: run.route };
+					const result: SwivalResult = { agent: "native-audit", agentSource: "bundled", task: run.meta.task,
+						exitCode: terminal.exitCode, nativeAudit, stderrTail: [], durationMs: Date.now() - run.meta.startedAt,
+						artifactDir, errorMessage: nativeAudit.error,
+						finalOutput: applyInlineCap(nativeAudit.answer ?? "", params.maxInlineBytes ?? 64 * 1024,
+							path.join(artifactDir, "evidence", "native-cli-report.json")) };
+					return { content: [{ type: "text", text: `Native audit status: ${nativeAudit.status}. ${routeText}\n${nativeAudit.error ?? result.finalOutput}\nSource-only verifier judgment; patches are proposals.\nArtifact dir: ${artifactDir}` }],
+						details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [result] }, isError: isRunFailure(result) };
 				} catch (error) {
 					return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
+				} finally {
+					preparing.delete(controller);
+					signal?.removeEventListener("abort", abort);
+					if (run) nativeRuns.delete(run);
 				}
 			}
+
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
 			void pruneOldArtifacts(artifactRoot);
 
@@ -3421,7 +3193,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 			// Fix 7b: action is mutually exclusive with run-dispatch fields.
 			if (params.action) {
-				const conflicting = Object.keys(params).filter((key) => !["action", "id"].includes(key));
+				const conflicting = (["agent", "task", "tasks", "chain", "async"] as const)
+					.filter((k) => params[k] != null && params[k] !== false);
 				if (conflicting.length > 0) {
 					return {
 						content: [{ type: "text", text: `\`action\` cannot be combined with: ${conflicting.join(", ")}. Use \`action\` + \`id\` alone.` }],
@@ -3445,14 +3218,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					};
 				}
 
-				const nativeControl = async (state: RunStateInfo) => {
-					const summary = await inspectNativeAudit(state.meta.artifactDir, state.exitCode ?? 1);
-					const result = nativeResult(state.meta, state.exitCode ?? 1, summary);
-					const text = params.action === "resume" ? result.errorMessage ?? result.finalOutput :
-						result.errorMessage ?? `Native audit ${runId} completed.`;
-					return { content: [{ type: "text" as const, text: `${text}\nArtifact dir: ${state.meta.artifactDir}` }],
-						details: makeDetails("single")([result]), isError: isRunFailure(result) };
-				};
+				const saved = await findRunMeta(runId, artifactRoot);
+				if (runId.startsWith("native-audit-") || saved && (saved.nativeAuditRequested || await isNativeArtifact(saved.artifactDir))) {
+					return { content: [{ type: "text", text: "Native async and disk recovery are unsupported. A crashed audit may remain running; no export or claimed completion is available." }],
+						details: makeDetails("single")([]), isError: true };
+				}
+
 				if (params.action === "status") {
 					const state = await loadRunState(runId, artifactRoot);
 					if (!state) {
@@ -3462,7 +3233,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (state.nativeUnknown) return nativeControl(state);
 					if (!state.exited) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"}).\nArtifact dir: ${state.meta.artifactDir}` }],
@@ -3476,7 +3246,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (state.meta.nativeAuditRequested) return nativeControl(state);
 					const inspection = await inspectCompletedAsyncRun(state);
 					if (inspection.reason) {
 						return {
@@ -3487,11 +3256,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					}
 					const outcome = inspection.report?.outcome ?? "unknown";
 					const exitedAt = state.completed?.exitedAt ?? "unknown";
-					const outputLine = inspection.output?.status === "written"
-						? `\nOutput: ${inspection.output.outputPath} (${inspection.output.outputLineCount ?? 0} lines, ${inspection.output.outputBytes ?? 0} bytes; ${inspection.output.outputMode})`
-						: "";
 					return {
-						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}${outputLine}` }],
+						content: [{ type: "text", text: `Run ${runId} completed (exit ${state.exitCode ?? "?"}, outcome: ${outcome}, exitedAt: ${exitedAt}).\nArtifact dir: ${state.meta.artifactDir}` }],
 						details: makeDetails("single")([]),
 					};
 				}
@@ -3511,11 +3277,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							details: makeDetails("single")([]),
 							isError: true,
 						};
-					}
-					if (state.meta.nativeAuditRequested && state.entry.interruptNative) {
-						state.entry.interruptNative();
-						return { content: [{ type: "text", text: `Native audit ${runId} was interrupted; supervised shutdown and evidence retention are in progress.` }],
-							details: makeDetails("single")([]) };
 					}
 				const pid = state.meta.pid;
 				if (pid == null) {
@@ -3560,7 +3321,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (state.nativeUnknown) return nativeControl(state);
 					if (!state.exited) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} is still in progress (pid: ${state.meta.pid ?? "unknown"}). Wait for it to complete, or interrupt it first.` }],
@@ -3575,7 +3335,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (state.meta.nativeAuditRequested) return nativeControl(state);
 					const inspection = await inspectCompletedAsyncRun(state);
 					if (inspection.reason) {
 						return {
@@ -3585,18 +3344,11 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						};
 					}
 					// Read final output only after terminal success is established.
-					const output = inspection.output?.status === "written" ? inspection.output : undefined;
-					const stdoutContent = output ? "" : await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
-					const finalOutput = outputFiles.selectAsyncOutputBody(inspection.report?.answer, stdoutContent, Boolean(output));
+					const stdoutContent = await fs.promises.readFile(state.meta.stdoutFile, "utf-8").catch(() => "");
+					const finalOutput = (inspection.report?.answer?.trim() || stdoutContent.trim()) || "(no output)";
 					const feedback = inspection.report?.lastReviewFeedback;
 					const outcome = inspection.report?.outcome ?? "unknown";
-					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}`;
-					if (output) {
-						text += `\nOutput: ${output.outputPath} (${output.outputLineCount ?? 0} lines, ${output.outputBytes ?? 0} bytes; ${output.outputMode})`;
-						text += output.outputMode === "inline" ? `\n\n${finalOutput}` : `\n\n→ ${output.outputPath}`;
-					} else {
-						text += `\n\n${finalOutput}`;
-					}
+					let text = `Run ${runId} (${state.meta.agent}) — outcome: ${outcome}\nArtifact dir: ${state.meta.artifactDir}\n\n${finalOutput}`;
 					if (feedback) text += `\n\n─── reviewer feedback ───\n${feedback}`;
 					return {
 						content: [{ type: "text", text }],
@@ -3889,10 +3641,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				const task = params.task as string;
 				let runId: string;
 				let artifactDir: string;
-				let outputPath: string | undefined;
-				let outputMode: "inline" | "file-only" | undefined;
 				try {
-					({ runId, artifactDir, outputPath, outputMode } = await runSingleSwivalAsync(
+					({ runId, artifactDir } = await runSingleSwivalAsync(
 						ctx.cwd,
 						agents,
 						agentName,
@@ -3900,11 +3650,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						discoveryCwd,
 						overrides,
 						artifactRoot,
-						params.output ? {
-							path: params.output,
-							mode: params.outputMode,
-							cwdAnchor: resolveDispatchCwd(undefined, params.cwd, ctx.cwd),
-						} : undefined,
 					));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
@@ -3922,7 +3667,6 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							`runId:        ${runId}`,
 							`agent:        ${agentName}`,
 							`artifactDir:  ${artifactDir}`,
-							...(outputPath ? [`Output will be written to: ${outputPath} (${outputMode ?? "file-only"})`] : []),
 							``,
 							`Use action:"status" id:"${runId}" to check progress.`,
 							`Use action:"resume" id:"${runId}" to retrieve the final output when done.`,
@@ -3988,9 +3732,13 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		// ---------------------------------------------------- render call --
 
 		renderCall(args, theme, _context) {
+			if ("audit" in args) {
+				const selection = args.profileOverride !== undefined ? "explicit profile" :
+					Object.keys(args).some((key) => key.endsWith("Override")) ? "explicit overrides" : "configured defaults";
+				return new Text(theme.fg("toolTitle", theme.bold("swival native audit ")) +
+					theme.fg("muted", `[${selection}]`), 0, 0);
+			}
 			const scope: AgentScope = args.agentScope ?? "user";
-			if (args.audit) return new Text(theme.fg("toolTitle", "swival native audit") +
-				`\n  ${(args.audit.paths ?? []).join(" ") || "committed repository"}`, 0, 0);
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("swival ")) +
@@ -4050,6 +3798,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					new Text(`${rIcon} ${theme.fg("accent", r.agent)} ${theme.fg("muted", meta)}`, 0, 0),
 				);
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+				if (r.nativeAudit) {
+					let route: NativeAuditResult["route"];
+					try { route = parseNativeRoute(r.nativeAudit.route); } catch { /* Do not render unvalidated saved route values. */ }
+					container.addChild(new Text(theme.fg("muted", `Native audit: ${r.nativeAudit.status}` +
+						(route ? `; ${route.provider}/${route.model}${route.endpoint ? `; endpoint=${route.endpoint}` : ""}` : "")), 0, 0));
+				}
 				if (r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
 				}

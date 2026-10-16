@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import registerExtension from "../extensions/index.js";
 
-describe("ordinary prompt delegation with hostile Git and unusual filenames", () => {
+describe("ordinary delegation with synthetic CLI reports and hostile repository fixtures", () => {
 	const tmpDirs: string[] = [];
 	const originalPath = process.env.PATH;
 	let repoDir: string;
@@ -23,6 +23,7 @@ describe("ordinary prompt delegation with hostile Git and unusual filenames", ()
 		repoDir = makeTmp("pi-swival-audit-repo-");
 		binDir = makeTmp("pi-swival-audit-bin-");
 		artifactRoot = makeTmp("pi-swival-audit-artifacts-");
+		fs.writeFileSync(path.join(binDir, "package.json"), '{"type":"commonjs"}\n');
 
 		// Set up Git repo
 		execFileSync("git", ["init"], { cwd: repoDir });
@@ -91,7 +92,7 @@ describe("ordinary prompt delegation with hostile Git and unusual filenames", ()
 		tmpDirs.length = 0;
 	});
 
-	it("captures an ordinary report from an offline Swival transport stub when repo has hostile Git config and unusual files", async () => {
+	it("captures an ordinary report with hostile Git config and unusual files", async () => {
 		// Mock swival that exercises Git in the repository and verifies hostile config protection
 		const fakeSwival = path.join(binDir, "swival");
 		fs.writeFileSync(
@@ -168,7 +169,7 @@ if (reportIdx !== -1 && args[reportIdx + 1]) {
   fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
 }
 
-console.log('Prompt delegation completed');
+console.log('Audit completed successfully');
 process.exit(0);
 `,
 			{ mode: 0o755 },
@@ -178,7 +179,7 @@ process.exit(0);
 			"audit-call-1",
 			{
 				agent: "swival",
-				task: "Review the committed source as plain prompt text.",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,
@@ -245,7 +246,7 @@ process.exit(1);
 			"audit-call-error",
 			{
 				agent: "swival",
-				task: "Review the committed source as plain prompt text.",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,
@@ -300,7 +301,7 @@ process.exit(130);
 			"audit-call-interrupt",
 			{
 				agent: "swival",
-				task: "Review the committed source as plain prompt text.",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,

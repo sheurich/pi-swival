@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
+import { completeNativeFixture, nativeScratch } from "./nativeFixtures.js";
 import * as path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import registerExtension from "../extensions/index.js";
@@ -9,43 +9,19 @@ import { inspectNativeAudit, nativeFindingKey } from "../extensions/native-audit
 import { nativeTestPython as python } from "./nativePython.js";
 
 const roots: string[] = [];
-const bwrapIdentity = { path: "/usr/bin/bwrap", version: "bubblewrap 0.12.0", package: "bubblewrap",
-	packageVersion: "0.12.0-1~deb13u1", architecture: "arm64",
-	sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976" };
-const unshareIdentity = { path: "/usr/bin/unshare", version: "unshare from util-linux 2.41.5", package: "util-linux",
-	packageVersion: "2.41.5-0+deb13u1", architecture: "arm64",
-	sha256: "285119fd3989039d50f8904b619b2abb8b795cb56753eb0235c8c031eb880a21" };
-const nono = "/trusted/nono";
-const nonoIdentity = { path: nono, version: "0.79.0", architecture: "aarch64-unknown-linux-gnu",
-	bytes: 26141064, sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b" };
-const reviewedProfileArtifacts = {
-	manifest: { bytes: 968, sha256: "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2" },
-	profile: { bytes: 1747, sha256: "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c" },
-};
-const reviewedDefaultPolicy = { name: "default", source: "authenticated-nono-0.79.0-embedded-policy",
-	extends: [], nonoSha256: nonoIdentity.sha256 };
-
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 const producerOutput = (scenario: string, home: string) => JSON.parse(execFileSync(python,
 	["-I", "-B", path.join(import.meta.dirname, "native_lineage_fixture.py"), scenario], {
 		timeout: 10_000, maxBuffer: 1024 * 1024,
-		env: { HOME: home, PATH: process.env.PATH, LITELLM_LOCAL_MODEL_COST_MAP: "True" },
+		env: { HOME: home, PATH: process.env.PATH, TMPDIR: path.join(home, "tmp"), LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
 	}).toString());
 
 type ArtifactPairMode = "distinct" | "report-reuse" | "patch-reuse" | "both-reused";
 
-function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault = false,
-	artifactPairMode?: ArtifactPairMode) {
-	const artifactRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-lineage-"))); roots.push(artifactRoot);
+function lineage(scenario: string, artifactPairMode?: ArtifactPairMode) {
+	const artifactRoot = nativeScratch("native-lineage-"); roots.push(artifactRoot);
 	const runId = `lineage-${scenario}`; const root = path.join(artifactRoot, runId); fs.mkdirSync(root);
-	const profilePack = path.join(root, "nono", "packages", "jedisct1", "swival");
-	const nonoProfileIdentity = { config: root, pack: profilePack,
-		manifest: { path: path.join(profilePack, "package.json"), ...reviewedProfileArtifacts.manifest },
-		profile: { path: path.join(profilePack, "profiles", "swival.json"), ...reviewedProfileArtifacts.profile,
-			...(unreviewedProfile ? { sha256: "0".repeat(64) } : {}) },
-		defaultPolicy: { ...reviewedDefaultPolicy,
-			...(unreviewedDefault ? { source: "local-file" } : {}) } };
 	const generated = producerOutput(scenario, root);
 	const expectedDecisions: Record<string, string[]> = { keep: ["keep"], rewrite: ["keep_with_changes"], drop: ["drop"],
 		mixed: ["keep_with_changes", "drop"], "projection-collision": ["keep_with_changes", "drop"] };
@@ -101,23 +77,12 @@ function lineage(scenario: string, unreviewedProfile = false, unreviewedDefault 
 		proposed_findings: generated.proposed_findings, verification_state: generated.verification_state,
 		verified_findings: generated.verified_findings, adjudication_discarded: generated.adjudication_discarded };
 	const scope = state.scope; const commit = scope.commit;
-	const route = { version: 1, provider: "lmstudio", model: "offline", reasoningEffort: "low" };
-	fs.writeFileSync(path.join(stateDir, "state.json"), artifactPairMode
-		? JSON.stringify(state) : generated.persisted_state_text ?? JSON.stringify(state));
+	const prepared = completeNativeFixture(root);
+	prepared.write("evidence/native-state/abc12345/state.json", artifactPairMode ? state : JSON.parse(generated.persisted_state_text ?? JSON.stringify(state)));
+	prepared.write("manifest.json", { snapshotCommit: commit, files: scope.tracked_files, scope,
+		sandbox: "agentfs", session: prepared.session, command: prepared.command, audit: { all: true }, route: prepared.route });
 	fs.writeFileSync(path.join(root, "run-meta.json"), JSON.stringify({ runId, artifactDir: root,
 		nativeAuditRequested: true, startedAt: Date.now(), agent: "native-audit", task: "/audit" }));
-	fs.writeFileSync(path.join(root, "completed.json"), JSON.stringify({ exitCode: 0, exitedAt: new Date().toISOString(),
-		shutdown: "verified", boundary: "bubblewrap-pidfd" }));
-	fs.writeFileSync(path.join(root, "manifest.json"), JSON.stringify({ sandbox: "bubblewrap", bwrapVersion: "0.12.0",
-		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, nono, nonoIdentity, nonoProfileIdentity,
-		route, scope, snapshotCommit: commit, audit: { all: true } }));
-	fs.writeFileSync(path.join(root, "request.json"), JSON.stringify({ sandbox: "bubblewrap", bwrapVersion: "0.12.0",
-		sessionSandbox: "builtin", bwrapIdentity, unshareIdentity, nono, nonoIdentity, nonoProfileIdentity,
-		expectedRoute: route }));
-	fs.writeFileSync(path.join(evidence, "native-result.json"), JSON.stringify({ status: "completed", answer: "lineage corpus",
-		sandbox: { external: "bubblewrap", bwrapVersion: "0.12.0", bwrapIdentity, nonoIdentity, nonoProfileIdentity,
-			startup: { executable: "unshare", identity: unshareIdentity }, session: "builtin" },
-		network: "provider-only", scope, route, provider: route.provider, model: route.model, requestedEffort: route.reasoningEffort }));
 	let tool: any;
 	registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any, { artifactRoot } as any);
 	const recover = (action: "status" | "resume") => tool.execute("lineage", { action, id: runId },
@@ -132,7 +97,7 @@ const valid = ["keep", "rewrite", "drop", "mixed", "projection-collision"];
 
 describe("released Swival finding lineage", () => {
 	it("persists actual released Phase 4.5 output before fixture export", () => {
-		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "native-lineage-producer-"))); roots.push(root);
+		const root = nativeScratch("native-lineage-producer-"); roots.push(root);
 		const generated = producerOutput("rewrite", root);
 		expect(generated.producer.lineage_function).toBe("swival.audit._phase45_adjudicate");
 		expect(generated.producer.persistence_function).toBe("swival.audit.AuditRunState.save");
@@ -148,37 +113,22 @@ describe("released Swival finding lineage", () => {
 		expect((await fixture.direct).status).toBe("completed");
 		for (const action of ["status", "resume"] as const) {
 			const recovered = await fixture.recover(action);
-			expect(recovered.isError, recovered.content[0].text).not.toBe(true);
-			expect(recovered.details.results[0].nativeAudit.status).toBe("completed");
+			expect(recovered.isError, "Native synchronous runs are never resurrected from disk").toBe(true);
 		}
 	}, 15_000);
 
 	it("accepts two independently keyed findings with distinct artifact pairs", async () => {
-		const fixture = lineage("keep", false, false, "distinct");
+		const fixture = lineage("keep", "distinct");
 		expect((await fixture.direct).status).toBe("completed");
 	});
 
 	it.each(["report-reuse", "patch-reuse", "both-reused"] as const)(
 		"rejects independently keyed findings with %s at the artifact uniqueness check", async (mode) => {
-			const fixture = lineage("keep", false, false, mode);
+			const fixture = lineage("keep", mode);
 			expect(await fixture.direct).toMatchObject({
 				status: "failed", error: "Native artifact filenames are reused across findings.",
 			});
 		});
-
-	it.each([
-		["profile", true, false],
-		["inherited default", false, true],
-	] as const)("rejects completed evidence with an unreviewed nonempty %s identity",
-		async (_name, unreviewedProfile, unreviewedDefault) => {
-			const fixture = lineage("keep", unreviewedProfile, unreviewedDefault);
-			expect((await fixture.direct).status).not.toBe("completed");
-			for (const action of ["status", "resume"] as const) {
-				const recovered = await fixture.recover(action);
-				expect(recovered.isError).toBe(true);
-				expect(recovered.details.results[0].nativeAudit.status).not.toBe("completed");
-			}
-		}, 15_000);
 
 	it.each(invalid)("rejects impossible lineage state: %s", async (scenario) => {
 		const fixture = lineage(scenario);
@@ -186,7 +136,6 @@ describe("released Swival finding lineage", () => {
 		for (const action of ["status", "resume"] as const) {
 			const recovered = await fixture.recover(action);
 			expect.soft(recovered.isError).toBe(true);
-			expect.soft(recovered.details.results[0].nativeAudit.status).not.toBe("completed");
 		}
 	}, 15_000);
 });

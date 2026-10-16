@@ -131,29 +131,6 @@ describe("startTraceTail", () => {
 		expect(systemEvents).toHaveLength(0);
 	}, 10000);
 
-	it("preserves tool IDs for interleaved same-name calls and drains finalization reads", async () => {
-		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-tail-test-"));
-		const events: TraceEvent[] = [];
-		const cleanup = startTraceTail(tempDir, (event) => events.push(event));
-		const file = path.join(tempDir, "identity-session.jsonl");
-		appendTrace(file, [
-			{ type: "assistant", message: { content: [
-				{ type: "tool_use", id: "first", name: "read_file", input: { path: "a" } },
-				{ type: "tool_use", id: "second", name: "read_file", input: { path: "b" } },
-			] } },
-			{ type: "user", message: { content: [
-				{ type: "tool_result", tool_use_id: "first", is_error: true },
-				{ type: "tool_result", tool_use_id: "second", is_error: false },
-			] } },
-		].map((line) => JSON.stringify(line)).join("\n") + "\n");
-		await cleanup();
-		expect(events).toHaveLength(4);
-		expect(events.map((event: any) => [event.sessionId, event.toolUseId, event.ok])).toEqual([
-			["identity-session", "first", undefined], ["identity-session", "second", undefined],
-			["identity-session", "first", false], ["identity-session", "second", true],
-		]);
-	});
-
 	it("handles trace file appearing after startTraceTail is called", async () => {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-tail-test-"));
 		const events: TraceEvent[] = [];

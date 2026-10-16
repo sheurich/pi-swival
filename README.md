@@ -50,7 +50,7 @@ Swival routes models through `~/.config/swival/config.toml`. Its `bedrock` and `
 
 ### Extension: `swival-subagent`
 
-A Pi tool that dispatches single, parallel, or chained tasks, or one structured native audit. Ordinary delegation preserves Swival's raw `--report` outcome and uses the final reviewer exit for acceptance; native audit requires separate state and coverage evidence.
+A Pi tool that dispatches single, parallel, or chained tasks, or one structured native audit. Ordinary delegation retains its existing report handling; native audit requires separate state and coverage evidence.
 
 Key features beyond pi's example subagent extension:
 
@@ -93,40 +93,33 @@ Bundled in `agents/` for the `swival-subagent` tool:
 
 ### Native audit
 
-Start Pi at the target Git root. For an authorized Daybreak audit, select the released ChatGPT route directly:
+Start Pi at the target Git root and use the structured `audit` API:
 
 ```json
-{
-  "audit": { "paths": ["src/**/*.py"], "all": true, "workers": 4, "patchMaxTurns": 50 },
-  "providerOverride": "chatgpt",
-  "modelOverride": "gpt-daybreak-blue-latest",
-  "reasoningEffortOverride": "xhigh"
-}
+{"audit":{"all":true}}
 ```
 
-This selection does not require a named Swival profile. It does not change stored configuration, Pi model defaults, or ordinary delegation. It requires prior human ChatGPT login and account authorization for the exact model. Native mode never logs in, changes account access, or falls back to another model, provider, profile, or account.
+Consult installation guidance before execution. When it selects a specialist, use its existing configured profile:
 
-Native mode requires Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and the reviewed nono 0.79.0 ARM64 GNU executable (26,141,064 bytes; SHA-256 `667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b`). Before any nono execution, it requires a canonical regular target owned by root or the current user, safe path ancestry and modes, no privilege bits or file capabilities, an ARM64 ELF header, and the exact reviewed bytes and version. It binds the canonical path and identity in evidence, verifies that the released SDK resolves that target, and revalidates it before capability probing, launch, and Session construction. Native mode requires a safe local `jedisct1/swival` pack under the default `HOME/.config` store. `XDG_CONFIG_HOME` must be absent or resolve to that same store; other selections fail before artifacts or executable checks. Native mode requires the exact reviewed `jedisct1/swival@0.1.2` installed bytes for both `package.json` (968 bytes; SHA-256 `c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2`) and `profiles/swival.json` (1,747 bytes; SHA-256 `719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c`). These pins cover the full manifest and policy without a canonicalization fallback. Because the reviewed profile extends `default`, native mode also requires every runtime-visible resolver checkpoint to reach nono's embedded `default`, which the authenticated executable pins. Sibling, user `.jsonc`/`.json`, and installed-pack `install_as` or alias overrides are unsupported, and ambiguous, symlinked, malformed, or oversized resolver inputs fail closed. Native mode validates both bounded regular files directly, does not treat the lockfile as proof, and never lists or pulls the pack. It also pins canonical `unshare` and bubblewrap executables and runs kernel capability checks before provider activity. The reviewed startup is exactly `unshare --user --map-current-user --mount --propagation private --`, followed by bubblewrap. It does not retain setup capabilities, create persistent namespaces, or change host mount propagation. Missing or unverified prerequisites fail closed; ordinary delegation keeps AgentFS. Require a passing real native isolation canary before use. The final namespace must have no shared/slave mount propagation; native execution rejects propagation-capable or unknown layouts before Session/provider activity. Native isolation trusts the current host user, the selected runtime and extension process, and the privileged host operator. It does not protect against those principals modifying files or entering namespaces directly. There is no sandbox fallback.
+```json
+{"audit":{"all":true},"profileOverride":"security-specialist"}
+```
 
-Native mode binds the selected profile, effective client provider/model/endpoint, supported cloud selectors, and safe requested execution options across preparation and execution. Route drift fails before Session construction. It rejects `USE_LITELLM_PROXY` and any case variant of `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY` by presence, including an empty value, before native execution; it neither inspects nor logs proxy values. A native-only transport guard checks primary, auxiliary, and retry calls and blocks model discovery/replacement and Hugging Face text-generation fallback. ChatGPT binds its released environment/default endpoint and rejects conflicting configured bases. Vertex supports only models selected by the released GEMINI handler and rejects unverified dispatch before Session and transport. It rejects ambient endpoint overrides without an explicit configured base. Completion evidence must match the original binding. Credentials and custom user-agent metadata remain runtime-only; the binding proves neither credential ownership nor billing provenance. A profile does not authorize disclosure. Unrepresentable routing fails closed; see the native skill for supported routes.
+The profile name is illustrative, not bundled or reserved. With no specialist selected, native audit uses configured Swival provider/model defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not detect specialization by vendor/model names or probe access with repository content. Inherit effort unless the operator authorizes an override.
 
-Native mode uses an independent committed snapshot outside the source checkout and Git metadata. Staged, unstaged, and untracked content is excluded. A tracked `swival.toml` remains auditable from HEAD, while an inert snapshot working copy prevents project runtime settings from executing. After live pidfd verification of namespace-init death and process-group shutdown, it preserves bounded native state, reports, and patches before removing owned temporary resources. If preservation fails, it retains the remaining snapshot for diagnosis. Unverified shutdown leaves mutable resources untouched.
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Native `async` requires the originating Pi process to stay connected. Pi disconnect cancels the native audit. Terminal results survive restart; without live ownership or valid terminal evidence, disk-only native state is unknown. The wrapper writes a failure fallback to `spawn-error.txt` if completion-marker persistence fails, even after Pi disconnects. The extension never signals or probes a PID recovered from disk.
+Native audit requires Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
 
-Native mode validates the startup-selected Git executable before source discovery and pins its canonical path for local and upstream calls. Repository-owned executable paths and relative `PATH` entries are refused. External installation symlinks are allowed after validation.
+For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks auth-store metadata, never its contents. API-key/local routes forward only the selected credential interface and receive no ChatGPT directory grant. Required encryption, filtering, strict-read isolation, proxies, unknown policy, and incompatible routing fail closed. These native restrictions do not change ordinary delegation.
 
-Bubblewrap recursively mounts the original root and submounts read-only, creates private temporary/dev/shared-memory/proc mounts and PID/IPC namespaces, drops capabilities, and disables nested user namespaces. Canonical source, Git, runtime, and configuration paths remain visible read-only. Only snapshot and evidence receive persistent write grants. The native Session uses `sandbox="builtin"` as an application guard inside this OS boundary. Explicit incompatible AgentFS, nono, strict-read, lifecycle, or protection requirements fail closed. ChatGPT requires prior human login and a valid token; native execution never logs in, refreshes tokens, or writes auth state.
+The adapter imports only committed content into a separate disposable repository outside original source and Git metadata. It excludes staged, unstaged, and untracked content. Source hooks, filters, instructions, project runtime settings, skills, MCP, A2A, autonomous subagents, history, memory, and lifecycle hooks do not execute. The upstream CLI uses `commands=none`, `files=some`, and `network=provider-only`. Verification is source-only judgment; project commands, builds, tests, Python, fetch tools, and PoCs cannot run.
 
-Native audit may edit its snapshot and generate patches; it is not write-free. No patches apply automatically. Commands and autonomous subagents are disabled, and network remains provider-only. The verifier cannot execute project commands or PoCs; its findings are native verifier judgment, not independently reproduced exploit proof.
+The adapter launches upstream AgentFS directly. Its explicit write grants cover the snapshot and, for ChatGPT only, a dedicated auth-store directory inside HOME. The default store is `~/.config/litellm/chatgpt/auth.json`; safe `CHATGPT_TOKEN_DIR` and `CHATGPT_AUTH_FILE` selections are supported. The auth directory never enters Swival `--add-dir` or model-tool roots. Swival runs inside AgentFS with its builtin tool policy, not a second sandbox bootstrap. The adapter collects bounded reports, patches, and state from the writable snapshot after verified shutdown. Upstream also grants temporary, service, and session paths. On macOS, source and Git metadata must not overlap those built-in exceptions, including `/tmp`, `/var/tmp`, `/private/var/folders`, and HOME's `Library`. Aliased locations fail closed before launch. See the [AgentFS reference](skills/swival/references/agentfs.md) for the complete restriction. The adapter claims neither COW-only export, host-read confidentiality, nor provider-process egress confinement. Patches never apply automatically.
 
-Native auxiliary calls and traces omit secret shielding and request filtering upstream. Protected or unknown configurations fail before native launch. Do not turn off controls or fall back to unrestricted network. Requested effort is not guaranteed for every native phase. See the `auditing-with-swival` skill for routing, scope limits, artifacts, and validation.
+Native async is unsupported. Timeout, cancellation, and normal session shutdown stop the live owned group. After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Native work never resumes from disk or signals recovered PIDs. Crash resources and AgentFS session metadata remain retained; native artifacts are not automatically pruned.
 
-Compatibility tightening: command-name allowlists, including `git`, are write-capable. Same-cwd parallel dispatch requires both `files=none` and `commands=none`, or verified fresh AgentFS overlays. The retired custom audit orchestration has no aliases; generic plain-language reviews remain available.
-
-Ordinary delegation adds one fixed plain-text heading to task delivery. Leading slash/bang text stays a prompt even with ambient `oneshot_commands=true`; task metadata remains unchanged. Use the explicit `audit` API for native execution. This blocks unintended command-script dispatch; it does not prevent model prompt injection.
-
-For ordinary single-mode `async: true`, `output` is bound before the detached wrapper starts and is materialized automatically after verified successful completion; no later `status`/`resume` call or live Pi parent is required. Relative output paths remain anchored to the original dispatch `cwd`. The default `outputMode` is `file-only`: completed `status` reports the path and size, while `resume` returns file metadata and a pointer without the body. `outputMode: "inline"` writes the same file and includes the body on `resume`. Rejected, malformed, sandbox-unverified, cancelled, or otherwise failed runs do not export partial output. Output uses a mode-0600 temporary file, symlink checks, and atomic rename; write failures are recorded in the artifact directory and make later `status`/`resume` fail explicitly rather than claiming the file was written. If verification fails after rename, cleanup erases the answer through the held file descriptor and restores mode `0600`. This can leave an empty file; cleanup never deletes a substituted target pathname. Descriptor erasure failures are reported explicitly. Startup failures can retain an empty mode-`0600` temporary file when cleanup cannot verify its live descriptor.
+Completion requires matching committed scope, route/policy, native `phase=done`, mandatory/deep coverage, terminal verification, finding lineage, unique report/patch pairs, and complete diagnostics without lost expansion warnings. Exit zero or an ordinary answer is insufficient. Limits are 4096 entries, 8 MiB per file, and 64 MiB total. See [`auditing-with-swival`](skills/auditing-with-swival/SKILL.md) for options, artifacts, and migration. The retired custom audit orchestration has no aliases. Generic reviews remain separate from native completion evidence.
 
 ## Layout
 
@@ -138,7 +131,7 @@ pi-swival/
 ├── extensions/
 │   ├── index.ts                # swival-subagent tool implementation
 │   ├── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
-│   └── native-audit.ts         # validation, committed snapshot, native evidence
+│   └── native-audit.ts         # CLI preparation, committed snapshot, native evidence
 ├── agents/                     # five bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md
@@ -146,7 +139,7 @@ pi-swival/
 │   └── swival-worker-briefs/   # SKILL.md
 ├── prompts/
 │   └── swival-audit.md         # slash-command-style audit walkthrough
-├── scripts/                    # durable runners, Python native bridge, smoke helpers
+├── scripts/                    # ordinary runner, native preflight/finalizer, smoke helpers
 └── tests/                      # offline unit, dispatch, and native entry-point tests
 ```
 
@@ -159,7 +152,7 @@ The harness covers parsing, dispatch, report acceptance, traces, snapshots, arti
 npm test
 ```
 
-Require Node 22.19+ or Node 24, Pi 1.0.4 or later, uv, and an installed Python 3.13. CI tests Pi 1.0.4 and 1.2.0 against both Node versions using isolated, locked dependency fixtures in `tests/pi-hosts/`. Their overrides keep Pi's internal packages at the selected host version. `./tests/setup.sh` installs local Vitest, TypeScript 5.9.3, and Node types 24.10.1 with `--ignore-scripts`, links the selected Pi peers, and syncs hash-locked Swival 1.0.46 into ignored `tests/.venv` using wheels only. It preserves npm configuration and global installations. Run it directly because npm exports script-approval policy to lifecycle children, which prevents the nested npm install. `npm test` and `npm run typecheck` never install dependencies. Native tests never silently skip missing dependencies.
+The offline harness uses Node 22.19+ or Node 24, selected Pi peers, uv, and installed Python 3.13. Setup links peers and syncs the hash-locked Swival 1.0.46/LiteLLM 1.103.4 fixture into ignored `tests/.venv`. Run setup directly, outside npm's lifecycle. Tests and typechecking never install dependencies. The peer-loader, locks, and typecheck setup are shared test prerequisites; ordinary runtime maintenance changes are not included.
 
 From the package root:
 
@@ -167,12 +160,13 @@ From the package root:
 npm test           # runs the already-installed local Vitest binary
 npm run typecheck  # checks extension types against the selected Pi peers
 npm run smoke      # offline Pi resource-loader check; no model or credentials
-npm run ci         # typecheck + smoke + agentfs canary + vitest
+npm run native-agentfs-integration  # explicit real native bootstrap/export gate
+npm run ci         # typecheck + smoke + ordinary agentfs canary + vitest
 ```
 
 The smoke test creates an isolated working directory and agent directory, uses in-memory settings, and loads only this package through `DefaultResourceLoader`. It checks the extension and `swival-subagent` tool, bundled skills and prompt, and agent frontmatter without starting a session or reading stdin.
 
-GitHub Actions runs these checks on Node 22.19.0 and Node 24 with Pi 1.0.4 and pinned Swival 1.0.46. Its required Linux AgentFS job checks ordinary overlay behavior and a legacy explicit-write layout without a provider. The repeatable `tests/native_bubblewrap_linux.py` regression uses the real registered Pi handler, offline transport, and bubblewrap in a pinned disposable Linux installation. It checks containment, writable snapshot/Git/evidence paths, detached descendants, cancellation, and parent loss. Darwin/macOS native audits remain unsupported. Offline tests do not establish OS isolation or live native provider behavior; live probes require explicit approval, a synthetic repository, and all sandbox prerequisites.
+The unit suite uses synthetic CLI processes, released native phases, denied sockets/DNS, and mocked auth HTTP. It covers standard login/refresh/auth writes, inherited same-route policy-error retries, terminal errors, no fallback, tool denials, timeout/cancellation, descendants, and parent loss. The explicit native AgentFS integration command requires installed binaries and never skips a missing prerequisite. Its synthetic nono registration proves availability, not authenticity. API/local fixtures combine the real released zero-finding producer, resolver, AgentFS and finalizer with HTTP doubles. ChatGPT fixtures test standard refresh persistence and model-tool auth denial with synthetic evidence. These runs do not prove live account access or inference. Other platforms and live providers remain unverified.
 
 The golden fixtures under `tests/fixtures/` are the source of truth for the swival report schema this package depends on. Schema drift breaks the snapshots, not live runs.
 
@@ -207,12 +201,12 @@ Use the example subagent (or a third-party equivalent) when fine-grained tool-ca
 
 ## Known limitations
 
-- Swival's normal one-shot traces arrive at finalization, not as live tool events. The watcher preserves tool/session identities and drains pending reads before artifact persistence.
+- Swival's normal one-shot traces arrive at finalization, not as live tool events. The ordinary watcher retains its existing behavior.
 - Swival receives the task on command-line arguments unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input (keeping it out of `ps aux` and clear of `ARG_MAX`). Project-scope agents cannot use standard input delivery because they are upgraded to `agentfs`. The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) can enable a re-executing sandbox (AgentFS or nono).
 - The agent system prompt body is always passed as `--system-prompt` command-line arguments. Large bodies can hit platform `ARG_MAX` even under `sandbox: builtin`; split long guidance into a skills directory passed via `skillsDir` (or `skillsDirOverride` at dispatch) instead.
 - Parallel tasks share the host working tree (no git worktree isolation). Tasks that mutate overlapping files must be dispatched serially or run with per-task `cwd` pointing at pre-created worktrees.
 - `async: true` is single-mode only. Parallel and chain modes always run synchronously.
-- Artifact directories under `~/.pi/agent/swival-artifacts/` are eligible for pruning after 7 days. Untrusted metadata prevents pruning; identifiable native directories also require metadata and valid shutdown evidence. Unknown or unverified native runs remain retained. Back up reports you need longer.
+- Ordinary artifact directories under `~/.pi/agent/swival-artifacts/` are eligible for pruning after 7 days. Native directories remain retained. Back up reports you need longer.
 - Swival's interactive `/goal` REPL command is not available here — the extension always invokes swival non-interactively.
 
 ## License

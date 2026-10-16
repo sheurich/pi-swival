@@ -30,21 +30,22 @@ if ! command -v agentfs >/dev/null 2>&1; then
   exit 0
 fi
 
-base="$(mktemp -d)"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+temporary="$root/tests/.scratch/tmp"
+mkdir -p "$temporary"
+if [[ "$(cd "$temporary" && pwd -P)" != "$temporary" ]]; then
+  echo "FAIL: canary temporary directory escaped the worktree." >&2
+  exit 1
+fi
+base="$(mktemp -d "$temporary/agentfs-canary.XXXXXX")"
 session="${AGENTFS_CANARY_SESSION:-agentfs-ci-canary-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 run_dir="${HOME}/.agentfs/run/${session}"
 owns_run_dir=false
-native_session="${session}-native"
-native_run_dir="${HOME}/.agentfs/run/${native_session}"
-owns_native_run_dir=false
 
 cleanup() {
   rm -rf "$base"
   if [[ "$owns_run_dir" == true ]]; then
     rm -rf "$run_dir"
-  fi
-  if [[ "$owns_native_run_dir" == true ]]; then
-    rm -rf "$native_run_dir"
   fi
 }
 trap cleanup EXIT
@@ -98,76 +99,3 @@ if [[ ! -e "${run_dir}/delta.db" ]]; then
 fi
 
 echo "PASS: AGENTFS=1 observed, real fixture filesystem untouched, overlay diff present."
-
-# Retain the legacy AgentFS explicit-write layout canary for compatibility.
-# Current native audits use bubblewrap; this does not prove native containment.
-if [[ -e "$native_run_dir" ]]; then
-  echo "FAIL: refusing to reuse a pre-existing native canary session." >&2
-  exit 1
-fi
-if ! python3 - "$base" "$native_session" <<'PY'
-import os
-from pathlib import Path
-import signal
-import subprocess
-import sys
-
-root = Path(sys.argv[1])
-sandbox = root / "sandbox"
-snapshot = root / "snapshot"
-evidence = root / "evidence"
-source = root / "snapshot-source"
-for directory in (sandbox, snapshot, evidence, source / ".git"):
-    directory.mkdir(parents=True, exist_ok=True)
-(source / "code.py").write_text("source-original")
-(source / ".git" / "HEAD").write_text("metadata-original")
-(snapshot / "code.py").write_text("snapshot-original")
-probe = sandbox / "fixture.py"
-probe.write_text('''import os
-from pathlib import Path
-import sys
-assert os.environ.get("AGENTFS") == "1"
-snapshot, evidence, source = map(Path, sys.argv[1:])
-(snapshot / "code.py").write_text("snapshot-changed")
-(evidence / "result.txt").write_text("preserved")
-for target in (source / "code.py", source / ".git" / "HEAD"):
-    try:
-        target.write_text("must-not-reach-host")
-    except OSError:
-        pass
-''')
-argv = ["agentfs", "run", "--no-default-allows", "--allow", str(snapshot),
-        "--allow", str(evidence), "--session", sys.argv[2], "--", "python3",
-        str(probe), str(snapshot), str(evidence), str(source)]
-# Discard child output (zero output budget) and bound its complete process tree.
-with subprocess.Popen(argv, cwd=sandbox, start_new_session=True,
-                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as child:
-    try:
-        code = child.wait(timeout=30)
-    finally:
-        if child.returncode is None:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    assert code == 0, "legacy-layout AgentFS child failed"
-assert (snapshot / "code.py").read_text() == "snapshot-changed"
-assert (evidence / "result.txt").read_text() == "preserved"
-source_unchanged = (source / "code.py").read_text() == "source-original"
-metadata_unchanged = (source / ".git" / "HEAD").read_text() == "metadata-original"
-if sys.platform == "darwin":
-    # Native dispatch rejects this platform; do not turn this observation into
-    # a success claim. Linux CI must pass both negative-write assertions.
-    print("BLOCKED: native Darwin isolation is unsupported; "
-          f"source_unchanged={source_unchanged}, metadata_unchanged={metadata_unchanged}.")
-else:
-    assert source_unchanged, "legacy-layout source write reached host"
-    assert metadata_unchanged, "legacy-layout Git-metadata write reached host"
-    print("PASS: legacy-layout write exceptions persist; source and Git metadata stay unchanged.")
-PY
-then
-  [[ -e "$native_run_dir" ]] && owns_native_run_dir=true
-  echo "FAIL: legacy-layout AgentFS isolation canary failed." >&2
-  exit 1
-fi
-[[ -e "$native_run_dir" ]] && owns_native_run_dir=true

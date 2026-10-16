@@ -4,7 +4,6 @@ import { PassThrough } from "node:stream";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
 
 // writeRunOutput is not exported; exercise it through the tool's `output`
 // param with a mocked swival process so no real subprocess or model request
@@ -13,7 +12,6 @@ vi.mock("node:child_process", () => ({ spawn: vi.fn() }));
 import { spawn } from "node:child_process";
 import registerExtension from "../extensions/index.js";
 
-const mutableFs = createRequire(import.meta.url)("node:fs") as typeof fs;
 let root: string;
 let tool: any;
 const calls: Array<{ args: string[] }> = [];
@@ -131,12 +129,12 @@ it("refuses to write output when an absolute in-repo path points through an exis
 
 it("rolls back output file if chmod fails", async () => {
 	const outputPath = path.join(root, "workspace", "chmod-fail.txt");
-	const originalFchmod = mutableFs.fchmodSync;
-	let calls = 0;
-	const chmodSpy = vi.spyOn(mutableFs, "fchmodSync").mockImplementation(((fd: number, mode: number) => {
-		calls++;
-		if (calls === 2) throw new Error("EPERM: operation not permitted, chmod");
-		return originalFchmod(fd, mode);
+	const originalChmod = fs.promises.chmod;
+	const chmodSpy = vi.spyOn(fs.promises, "chmod").mockImplementation((async (p: any, m: any) => {
+		if (String(p).includes(".tmp-output-")) {
+			throw new Error("EPERM: operation not permitted, chmod");
+		}
+		return originalChmod(p, m);
 	}) as any);
 
 	try {

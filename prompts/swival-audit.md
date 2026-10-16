@@ -1,60 +1,40 @@
 ---
-description: Run one native Swival audit on an isolated committed snapshot of Pi's repository
+description: Run one source-only native Swival audit on Pi's committed repository
 argument-hint: "[relative paths or globs]"
 ---
 
 Audit the configured repository with these requested relative scopes: $ARGUMENTS
 
-Read the `auditing-with-swival` skill. Resolve scope and routing with the operator before launch. Do not clone a different repository, change Pi's cwd, or pass a caller-supplied host path. Start a separate Pi session from the intended Git root if the current cwd is wrong.
+Read the `auditing-with-swival` skill. Confirm scope and the operator's provider and data boundaries. Start Pi from the intended Git root; do not clone another repository or pass a caller-supplied host path.
 
-## Routing
+Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified. Support means a Swival-supported route satisfying native policies on this runtime. Dynamic model-list routes fail when upstream cannot prevent model replacement. Never broaden permissions.
 
-Follow the operator's provider and data boundaries.
-
-- For authorized Daybreak use, select provider `chatgpt`, model `gpt-daybreak-blue-latest`, and effort `xhigh` directly. This does not require a named profile.
-- Daybreak requires prior human ChatGPT login and account authorization for the exact model. Selection does not grant access or choose another account.
-- For other approved routes, use the configured `frontier` profile with `high` unless the operator selects another route. Verify configured profiles with `swival --list-profiles`.
-- Halt if the selected route is unavailable or rejected. Do not silently fall back. Direct overrides do not change stored configuration, host defaults, or ordinary delegation.
-
-Requested effort is not guaranteed for every native phase. Swival 1.0.46 omits effort on auxiliary calls. A prior prompt-only probe does not prove native execution or per-phase effort.
-
-## Launch
-
-Translate only confirmed relative path/glob tokens into the `audit.paths` array. Do not interpolate arguments into a shell command or send them as executable slash-script text. Ask about unsupported prose, exclusions, or threat-model requirements before proceeding.
-
-Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and the reviewed nono 0.79.0 ARM64 GNU artifact identity. Native startup uses the pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix before bubblewrap. Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. Unverified prerequisites fail closed. Require a passing real native-layout isolation canary on Linux before use; offline transport tests do not prove OS isolation. There is no sandbox fallback.
-
-Stop on protected encryption/filtering requirements or any unknown isolation requirement. Do not disable controls, install prerequisites, or use unrestricted network to make launch succeed.
-
-For an authorized Daybreak audit, use exactly one structured invocation with the exact supported route:
+Consult installation guidance before execution. With no specialist selected, use configured Swival defaults, including its active profile:
 
 ```json
-{
-  "audit": {
-    "paths": ["<relative-path-or-glob>"],
-    "all": true,
-    "workers": 4,
-    "patchMaxTurns": 50
-  },
-  "providerOverride": "chatgpt",
-  "modelOverride": "gpt-daybreak-blue-latest",
-  "reasoningEffortOverride": "xhigh",
-  "timeoutMs": 900000
-}
+{"audit":{"all":true}}
 ```
 
-For another approved route, replace the three direct route overrides with its verified `profileOverride` and `reasoningEffortOverride`.
+If installation policy selects a specialist, pass its existing configured profile:
 
-Do not add `agent`, `task`, `cwd`, reviewer/self-review options, permission overrides, or arbitrary arguments. Omit `paths` for the full auditable committed scope. Native worker count does not enable autonomous subagents.
+```json
+{"audit":{"all":true},"profileOverride":"security-specialist"}
+```
 
-Native `async` requires the originating Pi process to stay connected. Pi disconnect cancels the native audit. Keep Pi connected until terminal evidence persists.
+The name is illustrative, not bundled or reserved. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not infer specialization by vendor/model names or send source to probe access. Inherit effort unless an override is explicitly authorized.
 
-## Completion
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-The source checkout and Git metadata must remain unchanged. Native audit can write only to its isolated snapshot and generated evidence. It excludes staged, unstaged, and untracked content. It may create internal worktrees and patch proposals; it has no no-patch mode.
+For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Do not inspect or export auth-store contents. API-key/local routes receive no ChatGPT store or grant. Stop on required encryption, filtering, strict-read isolation, proxies, unknown policy, or incompatible routing.
 
-Report the artifact directory, source commit/tree, selected scope, verified route, requested effort, native coverage, findings, and incomplete phases. An ordinary answer or exit zero is not native completion evidence. Empty scope, missing state, truncation, and partial artifacts are failures, not clean audits.
+Translate confirmed relative path/glob tokens into `audit.paths` on the selected call. `all` requires deep review throughout the selected committed scope. `workers` is 1–8; `patchMaxTurns` is 1–100. Use one structured call.
 
-Preserve reports and patches. Verified shutdown precedes bounded evidence export and temporary-resource deletion. Preservation failure retains the remaining snapshot for diagnosis; unverified shutdown leaves mutable sources untouched. The wrapper writes a `spawn-error.txt` failure fallback if completion-marker persistence fails. Without live ownership or valid terminal evidence, disk-only native state is unknown. Report the artifact path and uncertainty; never signal or probe a PID recovered from disk.
+Native async is unsupported. Omit `paths` for the auditable committed scope. Do not add `task`, `agent`, `cwd`, output routing, reviewer options, permission overrides, or arbitrary arguments. Requested effort is not guaranteed for every auxiliary phase.
 
-The restricted verifier cannot execute project commands or PoCs; label its output as native verifier judgment, not reproduced exploit proof. Compare source status, contents, and Git refs with their initial values. Do not apply patches or start remediation without separate operator approval.
+The original source and Git metadata must remain unchanged. The independent snapshot excludes staged, unstaged, and untracked content. The adapter launches upstream AgentFS directly, explicitly granting write access to the snapshot and, for ChatGPT only, a dedicated auth-store directory inside HOME. Upstream also permits temporary, service, and session paths; source and Git metadata overlapping those exceptions fail closed. The auth directory never enters Swival `--add-dir` or model-tool roots. The adapter collects bounded state, reports, and patch proposals after verified normal shutdown. It provides no host-read confidentiality or provider-process egress guarantee.
+
+Timeout, cancellation, and normal session shutdown stop the live owned group. After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Retain crash resources. Never resume native work from disk, signal recovered PIDs, or install a guardian.
+
+Report the artifact directory, source commit/tree, scope, route, requested effort, coverage, findings, and incomplete phases. Exit zero or a plausible answer is insufficient. Require complete native state, coverage, verification lineage, report/patch pairs, and diagnostics without lost expansions. Missing, truncated, symlinked, oversized, or incomplete evidence cannot attest a clean audit.
+
+The verifier cannot run project commands, Python, builds, tests, fetch tools, or PoCs. Label findings as source-only judgment, not executed exploit reproduction. Compare original source, Git status, and refs with their initial values. Review patches manually; do not apply them or start remediation without separate approval.

@@ -1,841 +1,594 @@
-"""Offline tests against released Swival entry points; every LLM call is stubbed."""
-# Release-pinned private entry points are intentional compatibility assertions.
-# Keep released multi-phase fixtures and transport regressions in one module.
-# pylint: disable=protected-access,missing-function-docstring,too-many-lines
+"""Offline released-CLI, source-only tools, routing, and standard auth fixtures.
 
+All HTTP responses and LLM calls are synthetic. The CLI sandbox bootstrap is
+stubbed here; nativeAgentfs.test.ts separately exercises the real bootstrap.
+"""
+# pylint: disable=protected-access,import-outside-toplevel,missing-function-docstring
+# pylint: disable=too-many-locals,too-many-statements,too-many-public-methods
+import base64
 import contextlib
-from datetime import datetime, timezone
+from copy import deepcopy
 import importlib.util
 import inspect
+import io
 import json
 import os
-import shutil
 from pathlib import Path
+import re
+import shutil
 import socket
 import subprocess
 import sys
-import sysconfig
 import tempfile
-import unittest
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
-# Initialize host Python metadata before tests simulate the supported Linux path.
-sysconfig.get_config_vars()
+os.environ["LITELLM_MODE"] = "PRODUCTION"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-with patch.object(socket, "socket", side_effect=AssertionError("network forbidden")), \
-     patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")), \
-     patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS forbidden")):
-    from swival import audit, agent
+os.environ["NONO_NO_UPDATE_CHECK"] = "1"
+FORBIDDEN = AssertionError("network/auth/inference forbidden")
+with patch.object(socket, "socket", side_effect=FORBIDDEN), \
+     patch.object(socket, "create_connection", side_effect=FORBIDDEN), \
+     patch.object(socket, "getaddrinfo", side_effect=FORBIDDEN):
+    from swival import audit, agent, tools
     from swival.session import Session
-    from swival.worktree import make_isolated_loop_kwargs
+    from swival.worktree import call_llm_text, make_isolated_loop_kwargs
+    import httpx
+    import litellm
+    from litellm.llms.chatgpt import authenticator
 
-SPEC = importlib.util.spec_from_file_location(
-    "native_audit", Path(__file__).resolve().parents[1] / "scripts" / "native_audit.py"
-)
+WORKTREE = Path(__file__).resolve().parents[1]
+TEMP = WORKTREE / "tests" / ".scratch" / "tmp"
+TEMP.mkdir(parents=True, exist_ok=True)
+assert TEMP.resolve() == TEMP
+SPEC = importlib.util.spec_from_file_location("native_audit", WORKTREE / "scripts/native_audit.py")
 bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
 
-def expansion_response(phase, text, messages, expansion, failed_attempts):
-    """Stub expansion outcomes while leaving native parsing and retries intact."""
-    if phase == "finding" and expansion in ("lost", "out-of-scope"):
-        text += ("\n@@ finding @@\ntitle: Second inventory finding\n"
-                 "severity: high\nlocation: code.py:3\n"
-                 "attacker: another caller\ntrigger: another non-admin role\n"
-                 "impact: role access control fails open\nclaim: second inventory claim")
-    if phase == "expansion":
-        second = "Title: Second inventory finding" in messages[-1]["content"]
-        if ((expansion == "lost" and second)
-                or (expansion == "recovered" and not failed_attempts)):
-            failed_attempts.append(True)
-            raise RuntimeError("private expansion diagnostic must not enter evidence")
-        if expansion == "out-of-scope" and second:
-            text = text.replace("type: security_control_failure", "type: out-of-scope")
-    return text
-
-
-# This release-pinned fixture keeps transport guards and phase assertions together.
-# pylint: disable-next=too-many-public-methods
 class NativeEntryTests(unittest.TestCase):
-    """Exercise native dispatch and inherited isolation without transport."""
+    """Run released code without real sockets, auth, or provider calls."""
 
     def setUp(self):
-        # These are API/transport tests, not an assertion of Darwin kernel isolation.
-        self.enterContext(patch.object(sys, "platform", "linux"))
-        self.enterContext(patch.object(bridge, "check_boundary"))
-        # SDK/artifact boundary mock only. Dedicated identity tests exercise the
-        # production validator; this released-pipeline fixture is not live trust proof.
-        self.enterContext(patch.object(
-            bridge, "_revalidate_nono",
-            side_effect=lambda request, **_kwargs: request["nonoIdentity"],
-        ))
-        self.enterContext(patch.object(
-            bridge, "_revalidate_nono_profile", return_value={"pack": "/trusted/profile"}))
-        # unittest owns the context lifetime through enterContext.
-        self.root = Path(self.enterContext(
-            tempfile.TemporaryDirectory(prefix="offline-native-")  # pylint: disable=consider-using-with
-        ))
+        temporary = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            dir=TEMP, prefix="native-python-")
+        self.root = Path(self.enterContext(temporary))
         self.repo = self.root / "snapshot"
         self.evidence = self.root / "evidence"
         self.repo.mkdir()
         self.evidence.mkdir()
-        self.enterContext(patch.dict(os.environ, {
-            "PATH": os.environ["PATH"], "HOME": str(self.root),
-            "XDG_CONFIG_HOME": str(self.root / "config"),
-            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
-        }, clear=True))
+        self.enterContext(patch.dict(os.environ, {"PATH": os.environ["PATH"],
+            "HOME": str(self.root),
+            "XDG_CONFIG_HOME": str(self.root / "config"), "TMPDIR": str(TEMP),
+            "LITELLM_LOCAL_MODEL_COST_MAP": "True", "NONO_NO_UPDATE_CHECK": "1"}, clear=True))
         for name in ("socket", "create_connection", "getaddrinfo"):
-            self.enterContext(patch.object(socket, name,
-                                          side_effect=AssertionError("provider/network forbidden")))
+            self.enterContext(patch.object(socket, name, side_effect=FORBIDDEN))
         for args in (["init", "--template="], ["config", "user.name", "Test"],
                      ["config", "user.email", "test@example.invalid"]):
             self.git(*args)
         (self.repo / "code.py").write_text("def answer(): return 42\n")
         self.git("add", ".")
-        self.git("commit", "-m", "fixture")
+        self.git("commit", "-m", "synthetic fixture")
+        self.enterContext(patch.object(agent, "_MODEL_AUTOFIX", {}))
+        self.routing = {"provider": "chatgpt", "model": "gpt-offline", "reasoningEffort": "xhigh"}
+        self.write_config('max_context_tokens=128000\n')
 
     def git(self, *args):
         return subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-c",
-                               "commit.gpgsign=false", *args], cwd=self.repo,
+            "core.fsmonitor=false",
+                               "-c", "commit.gpgsign=false", *args], cwd=self.repo,
                               capture_output=True, check=True, timeout=5).stdout.decode().strip()
 
     def request(self):
-        config = self.root / "config"
-        pack = config / "nono" / "packages" / "jedisct1" / "swival"
-        profile_identity = {
-            "config": str(config), "pack": str(pack),
-            "manifest": {"path": str(pack / "package.json"),
-                         **bridge.NONO_PROFILE_ARTIFACT_IDENTITIES["manifest"]},
-            "profile": {"path": str(pack / "profiles" / "swival.json"),
-                        **bridge.NONO_PROFILE_ARTIFACT_IDENTITIES["profile"]},
-            # Explicit unit-boundary mock; live validation is covered separately.
-            "defaultPolicy": {
-                "name": "default",
-                "source": "authenticated-nono-0.79.0-embedded-policy",
-                "extends": [],
-                "nonoSha256": bridge.NONO_ARTIFACT_IDENTITY["sha256"],
-            },
-        }
-        request = {"source": str(self.repo), "snapshot": str(self.repo),
-                   "evidence": str(self.evidence),
-                   "routing": {"provider": "lmstudio", "model": "offline-model",
-                               "reasoningEffort": "xhigh"},
-                   "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
-                   "bwrapIdentity": dict(bridge.BWRAP_IDENTITY),
-                   "unshareIdentity": dict(bridge.UNSHARE_IDENTITY),
-                   "nono": "/trusted/nono",
-                   "nonoIdentity": {"path": "/trusted/nono",
-                                    **bridge.NONO_ARTIFACT_IDENTITY},
-                   "nonoProfileIdentity": profile_identity,
-                   "sessionSandbox": "builtin",
-                   "audit": {"paths": [], "all": True, "workers": 1, "patchMaxTurns": 5},
-                   "expectedScope": audit._resolve_scope(str(self.repo), []).to_dict()}
-        _, request["expectedRoute"] = bridge.resolve_native_config(request)
-        return request
+        return {"source": str(self.repo), "routing": dict(self.routing)}
 
-    def test_route_drift_is_rejected_before_session_construction(self):
-        config_dir = self.root / "config" / "swival"
-        config_dir.mkdir(parents=True)
-        config = config_dir / "config.toml"
-        for field, changed in (("model", 'model="offline-B"'),
-                               ("base_url", 'base_url="http://route-b.invalid"'),
-                               ("temperature", "temperature=0.25")):
-            with self.subTest(field=field):
-                config.write_text('[profiles.test]\nprovider="lmstudio"\n'
-                                  'model="offline-A"\nbase_url="http://route-a.invalid"\n')
-                request = self.request()
-                request["routing"] = {"profile": "test"}
-                _, request["expectedRoute"] = bridge.resolve_native_config(request)
-                lines = config.read_text().splitlines()
-                config.write_text("\n".join(line for line in lines
-                                            if not line.startswith(field + "=")) + "\n" + changed)
-                with patch("swival.session.Session") as session:
-                    with self.assertRaisesRegex(bridge.NativeAuditError, "route.*changed"):
-                        bridge.run_native(request)
-                    session.assert_not_called()
-
-    def test_nono_identity_is_revalidated_immediately_before_session_construction(self):
-        request = self.request()
-        reached = []
-
-        def revalidate(actual, **kwargs):
-            self.assertIs(actual, request)
-            self.assertEqual(kwargs, {"host_path": False})
-            reached.append("nono")
-            return actual["nonoIdentity"]
-
-        def construct(**_kwargs):
-            self.assertEqual(reached, ["nono"])
-            reached.append("session")
-            raise AssertionError("synthetic Session stop")
-
-        with patch.object(bridge, "_revalidate_nono", side_effect=revalidate), \
-             patch("swival.session.Session", side_effect=construct):
-            with self.assertRaisesRegex(AssertionError, "Session stop"):
-                bridge.run_native(request)
-        self.assertEqual(reached, ["nono", "session"])
-
-    def test_native_route_binding_materializes_safe_defaults_without_provider(self):
-        request = self.request()
-        with patch.object(agent, "resolve_provider",
-                          side_effect=AssertionError("preflight must not resolve providers")):
-            settings, route = bridge.resolve_native_config(request)
-        self.assertEqual(route["transportModel"], "openai/offline-model")
-        self.assertEqual(route["destination"]["apiBase"], "http://127.0.0.1:1234/v1")
-        self.assertEqual(route["options"]["max_turns"], 100)
-        self.assertEqual(route["options"]["max_output_tokens"], 32768)
-        self.assertEqual(route["options"]["provider_timeout"], 900)
-        self.assertEqual(settings["base_url"], "http://127.0.0.1:1234")
-
-    def test_clean_config_daybreak_override_reaches_released_transport(self):
-        request = self.request()
-        request["routing"] = {"provider": "chatgpt", "model": "gpt-daybreak-blue-latest",
-                              "reasoningEffort": "xhigh"}
-        clean_environment = {
-            "HOME": str(self.root), "XDG_CONFIG_HOME": str(self.root / "config"),
-            "LITELLM_LOCAL_MODEL_COST_MAP": "True",
-        }
-        with patch.dict(os.environ, clean_environment, clear=True), \
-             patch.object(agent, "resolve_provider",
-                          side_effect=AssertionError("preflight must not resolve providers")):
-            settings, route = bridge.resolve_native_config(request)
-            self.assertEqual(route["provider"], "chatgpt")
-            self.assertEqual(route["model"], "gpt-daybreak-blue-latest")
-            self.assertEqual(route["transportModel"], "chatgpt/gpt-daybreak-blue-latest")
-            self.assertEqual(route["reasoningEffort"], "xhigh")
-            self.assertIsNone(route["profile"])
-            self.assertEqual(route["destination"]["apiBase"],
-                             "https://chatgpt.com/backend-api/codex")
-            self.assertEqual(self.released_chatgpt_selection(settings, route),
-                             route["destination"]["apiBase"])
-        self.assertFalse((self.root / "config" / "swival" / "config.toml").exists())
-
-    def test_sensitive_route_inputs_never_enter_binding_or_diagnostics(self):
-        config_dir = self.root / "config" / "swival"
-        config_dir.mkdir(parents=True)
-        config = config_dir / "config.toml"
-        request = self.request()
-        private = "synthetic-never-log-this"
-        for unsafe in (f'base_url="https://user:{private}@route.invalid/v1"',
-                       f'base_url="https://route.invalid/v1?token={private}"',
-                       f'base_url="https://route.invalid/v1#{private}"',
-                       f'extra_body={{tenant="{private}"}}'):
-            with self.subTest(unsafe=unsafe):
-                config.write_text('provider="lmstudio"\nmodel="offline-model"\n' + unsafe)
-                with self.assertRaises(bridge.NativeAuditError) as error:
-                    bridge.resolve_native_config(request)
-                self.assertNotIn(private, str(error.exception))
-        config.write_text(f'api_key="{private}"\nuser_agent="{private}"\n')
-        settings, route = bridge.resolve_native_config(request)
-        self.assertEqual(settings["api_key"], private)
-        self.assertEqual(settings["user_agent"], private)
-        self.assertNotIn(private, json.dumps(route))
-
-    def test_safe_route_binding_matches_released_transport_models_and_endpoints(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        routes = [
-            {"provider": "lmstudio", "model": "offline-model"},
-            {"provider": "generic", "model": "offline/model",
-             "base_url": "http://route.invalid/api"},
-            {"provider": "openrouter", "model": "openrouter/openrouter/auto"},
-            {"provider": "chatgpt", "model": "chatgpt/chatgpt/gpt-offline"},
-            {"provider": "huggingface", "model": "huggingface/offline/model"},
-            {"provider": "bedrock", "model": "bedrock/amazon.offline", "base_url": "us-west-2",
-             "aws_profile": "offline-profile"},
-            {"provider": "vertexai", "model": "gemini-offline", "project": "offline-project",
-             "location": "us-central1"},
+    def cli(self, diagnostic_path=None, all_files=True):
+        """Real CLI parsing and native phases; synthetic bootstrap/transport only."""
+        command = "/audit " + ("--all " if all_files else "") + "--workers 1 --patch-max-turns 5"
+        session = "native-" + "1" * 32
+        argv = [
+            "swival", "--base-dir", str(self.repo), "--sandbox", "builtin",
+            "--network", "provider-only", "--commands", "none", "--files", "some",
+            "--oneshot-commands", "--no-sandbox-auto-session", "--no-instructions",
+            "--no-skills", "--no-metaskills", "--no-mcp", "--no-a2a", "--no-subagents",
+            "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+            *[item for key, value in self.routing.items() for item in
+              ["--" + bridge.OVERRIDE_KEYS.get(key, key).replace("_", "-"), str(value)]],
+            "--report", str(self.repo / "native-cli-report.json"), "--", command,
         ]
-        for settings in routes:
-            with self.subTest(provider=settings["provider"]):
-                route = bridge._route_binding(settings, "offline-profile")
-                provider = "geap" if settings["provider"] == "vertexai" else settings["provider"]
-                self.assertEqual(route["transportModel"],
-                                 agent._resolve_model_str(provider, settings["model"]))
-                response = litellm.ModelResponse(choices=[{
-                    "message": {"role": "assistant", "content": "synthetic"},
-                    "finish_reason": "stop"}])
-                with patch.object(litellm, "completion", return_value=response) as transport:
-                    with bridge._bound_transport(route):
-                        agent.call_llm(settings["base_url"], settings["model"],
-                                       [{"role": "user", "content": "synthetic"}],
-                                       100, None, None, None, None, False, provider=provider,
-                                       aws_profile=settings.get("aws_profile"),
-                                       vertex_project=settings.get("project"),
-                                       vertex_location=settings.get("location"))
-                    self.assertEqual(transport.call_count, 1)
-                    self.assertEqual(transport.call_args.kwargs.get("api_base"),
-                                     route["destination"]["apiBase"])
+        output = io.StringIO()
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output), \
+             contextlib.redirect_stderr(output):
+            try:
+                agent.main()
+            except SystemExit as exc:
+                self.assertIn(exc.code, (None, 0), output.getvalue())
+        text = output.getvalue()
+        self.assertLess(len(text.encode()), 65536)
+        if diagnostic_path is not None:
+            Path(diagnostic_path).write_text(text, encoding="utf-8")
+        losses = sum(int(match[0]) for match in re.findall(
+            r"([0-9]+)/([0-9]+) expansion\(s\) failed, ([0-9]+) finding\(s\) retained", text))
+        return {"status": "completed", "expansionFailures": losses, "command": command,
+            "session": session}
 
-    def test_bound_endpoints_match_released_pure_resolvers_without_credential_reads(self):
-        # These methods do not initialize provider/auth objects. Never call their
-        # constructors: ChatGPT's constructor opens its runtime token directory.
-        # pylint: disable=import-outside-toplevel
-        from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
-        from litellm.llms.chatgpt.authenticator import Authenticator
-        from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
-        from litellm.llms.huggingface.chat.transformation import HuggingFaceChatConfig
-        from litellm.llms.vertex_ai.common_utils import get_vertex_base_url
+    def export_finding(self, export, state_path, state, result):
+        export = Path(export)
+        state_dir = export / "evidence" / "native-state" / state_path.parent.name
+        state_dir.mkdir(parents=True)
+        shutil.copyfile(state_path, state_dir / "state.json")
+        shutil.copytree(self.repo / "audit-findings", export / "evidence" / "audit-findings")
+        report = json.loads((self.repo / "native-cli-report.json").read_text())
+        route = bridge.resolve_native_config(self.request())
+        self.assertEqual(route["reportIdentity"], {"provider": report["provider"],
+            "model": report["model"]})
+        (export / "manifest.json").write_text(json.dumps({
+            "snapshotCommit": state["scope"]["commit"],
+            "files": state["scope"]["tracked_files"], "scope": state["scope"], "route": route,
+            "sandbox": "agentfs", "session": result["session"], "command": result["command"],
+                "audit": {"all": "--all" in result["command"].split()}}))
+        (export / "evidence" / "native-cli-report.json").write_text(json.dumps(report))
+        # Synthetic shutdown/diagnostic envelope only. Terminal adjudication tests
+        # replace diagnostics with the production collector's replayed result.
+        (export / "diagnostics.json").write_text(json.dumps({"closed": True, "bytes": 100,
+            "ambiguous": False, "authPersistenceFailure": False,
+            "adjudicationFailure": False, "adjudicationRepairFailure": False,
+            "expansionFailures": result["expansionFailures"]}))
+        (export / "completed.json").write_text(json.dumps({"exitCode": 0,
+            "exitedAt": "2026-01-01T00:00:00.000Z", "shutdown": "verified",
+                "boundary": "agentfs-cli"}))
 
-        with patch.dict(os.environ, {}, clear=True):
-            settings = {"provider": "chatgpt", "model": "gpt-offline"}
-            route = bridge._route_binding(settings, None)
-            self.assertEqual(route["destination"]["apiBase"], Authenticator.get_api_base(None))
-            self.assertEqual(ChatGPTResponsesAPIConfig.get_complete_url(
-                None, settings["base_url"], {}), route["destination"]["apiBase"] + "/responses")
-            settings = {"provider": "huggingface", "model": "offline/model"}
-            route = bridge._route_binding(settings, None)
-            self.assertEqual(HuggingFaceChatConfig.get_complete_url(
-                None, None, None, "offline/model", {}, {}), route["destination"]["apiBase"])
-            for region in ("us-west-2", "us-gov-west-1", "cn-north-1"):
-                route = bridge._route_binding({"provider": "bedrock", "model": "amazon.offline",
-                                               "base_url": region}, None)
-                # Bypass the credential-cache constructor; only pure endpoint
-                # selection runs, with an explicit region and an empty environment.
-                resolver = object.__new__(BaseAWSLLM)
-                actual, proxy = resolver.get_runtime_endpoint(None, None, region)
-                self.assertEqual((actual, proxy), (route["destination"]["endpoint"],) * 2)
-            for location in ("global", "us", "us-central1"):
-                route = bridge._route_binding({"provider": "vertexai", "model": "gemini-offline",
-                                               "project": "offline-project",
-                                               "location": location}, None)
-                self.assertEqual(get_vertex_base_url(location), route["destination"]["endpoint"])
-
-    def test_endpoint_environment_drift_changes_the_effective_binding(self):
-        for provider, model, variable in (
-                ("chatgpt", "gpt-offline", "CHATGPT_API_BASE"),
-                ("chatgpt", "gpt-offline", "OPENAI_CHATGPT_API_BASE"),
-                ("openrouter", "offline/model", "OPENROUTER_API_BASE"),
-                ("huggingface", "offline/model", "HF_API_BASE"),
-                ("huggingface", "offline/model", "HUGGINGFACE_API_BASE")):
-            with self.subTest(variable=variable), patch.dict(os.environ, {}, clear=True):
-                with patch.dict(os.environ, {variable: "https://route-a.invalid/api"}):
-                    first = bridge._route_binding({"provider": provider, "model": model}, None)
-                with patch.dict(os.environ, {variable: "https://route-b.invalid/api"}):
-                    second = bridge._route_binding({"provider": provider, "model": model}, None)
-                self.assertNotEqual(first, second)
-                self.assertNotEqual(first["destination"], second["destination"])
-
-    def test_native_route_runtime_gate_rejects_unverified_litellm_before_session(self):
-        request = self.request()
-        version = bridge.importlib.metadata.version
-        with patch.object(bridge.importlib.metadata, "version", side_effect=lambda name:
-                          "0.0.0" if name == "litellm" else version(name)), \
-             patch("swival.session.Session") as session:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "Unsupported native runtime"):
-                bridge.run_native(request)
-            session.assert_not_called()
-
-    def test_native_route_binding_rejects_unrepresentable_cloud_and_model_defaults(self):
-        for settings in (
-                {"provider": "bedrock", "model": "amazon.offline"},
-                {"provider": "bedrock", "model": "amazon.offline",
-                 "base_url": "https://bedrock.invalid"},
-                {"provider": "vertexai", "model": "offline-model", "location": "us-central1"},
-                {"provider": "chatgpt", "model": "unverified-chat-mode"},
-                {"provider": "huggingface", "model": "dynamic-provider/offline/model"}):
-            with self.subTest(settings=settings), self.assertRaises(bridge.NativeAuditError):
-                bridge._route_binding(settings, None)
-
-    def test_native_route_rejects_hidden_proxy_and_alternate_bedrock_endpoint_routes(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        request = self.request()
-        with patch.dict(os.environ, {"USE_LITELLM_PROXY": "true"}):
-            with self.assertRaisesRegex(bridge.NativeAuditError, "proxy"):
-                bridge.resolve_native_config(request)
-        proxy_names = ("USE_LITELLM_PROXY", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
-                       "https_proxy", "all_proxy", "hTtP_pRoXy", "hTtPs_PrOxY", "aLl_PrOxY")
-        for name in proxy_names:
-            for value in ("", "http://synthetic-proxy.invalid"):
-                with self.subTest(name=name, value=bool(value)), \
-                     patch.dict(os.environ, {name: value}), \
-                     patch("swival.session.Session") as session, \
-                     patch.object(litellm, "completion") as transport:
-                    with self.assertRaisesRegex(bridge.NativeAuditError,
-                                                "Unsupported native transport proxy requirements"):
-                        bridge.run_native(request)
-                    session.assert_not_called()
-                    transport.assert_not_called()
-        for prefix in ("mantle", "agent", "agentcore", "claude_platform", "openai"):
-            with self.subTest(prefix=prefix), self.assertRaises(bridge.NativeAuditError):
-                bridge._route_binding({"provider": "bedrock", "model": prefix + "/offline-model",
-                                       "base_url": "us-west-2"}, None)
-
-    def released_chatgpt_selection(self, settings, route):
-        """Run the real resolver up to Responses selection, before auth/transport."""
-        # pylint: disable=import-outside-toplevel
-        import litellm
-        from litellm import main
-        from litellm.llms.chatgpt.authenticator import Authenticator
-        from litellm.llms.chatgpt.chat.transformation import ChatGPTConfig
-
-        class StopSelection(BaseException):
-            """Never enter Responses initialization, authentication, or HTTP."""
-
-        selected = {}
-
-        def capture(**kwargs):
-            selected["api_base"] = kwargs["api_base"]
-            raise StopSelection()
-
-        def stub_auth(config, *_args, **_kwargs):
-            config.authenticator = SimpleNamespace(
-                get_api_base=lambda: Authenticator.get_api_base(None),
-                get_access_token=lambda: "synthetic")
-
-        with patch.object(ChatGPTConfig, "__init__", stub_auth), \
-             patch.object(main, "responses_api_bridge_check", side_effect=capture), \
-             patch.object(litellm, "completion", inspect.unwrap(litellm.completion)):
-            original = litellm.completion
-            with self.assertRaises(StopSelection), bridge._bound_transport(route):
-                litellm.completion(model=route["transportModel"], api_base=settings["base_url"],
-                                   messages=[{"role": "user", "content": "synthetic fixture"}])
-            self.assertIs(litellm.completion, original)
-        return selected["api_base"]
-
-    def test_chatgpt_configured_endpoint_cannot_override_released_resolver(self):
-        request = self.request()
-        config = self.root / "config" / "swival" / "config.toml"
-        config.parent.mkdir(parents=True)
-        config.write_text('provider="chatgpt"\nmodel="gpt-offline"\n'
-                          'base_url="https://route-config.invalid/api"\n')
-        request["routing"] = {}
-        with patch.dict(os.environ, {"CHATGPT_API_BASE": "https://route-env.invalid/api"}), \
-             patch("swival.session.Session") as session:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "ChatGPT.*endpoint"):
-                bridge.resolve_native_config(request)
-            with self.assertRaisesRegex(bridge.NativeAuditError, "ChatGPT.*endpoint"):
-                bridge.run_native(request)
-            session.assert_not_called()
-
-    def test_chatgpt_downstream_endpoint_matches_binding_and_restores_hooks(self):
-        for environment, endpoint in (
-                ({}, "https://chatgpt.com/backend-api/codex"),
-                ({"OPENAI_CHATGPT_API_BASE": "https://route-legacy.invalid/api"},
-                 "https://route-legacy.invalid/api"),
-                ({"CHATGPT_API_BASE": "https://route-primary.invalid/api/",
-                  "OPENAI_CHATGPT_API_BASE": "https://route-legacy.invalid/api"},
-                 "https://route-primary.invalid/api/")):
-            with self.subTest(endpoint=endpoint), patch.dict(os.environ,
-                    {"LITELLM_LOCAL_MODEL_COST_MAP": "True", **environment}, clear=True):
-                settings = {"provider": "chatgpt", "model": "chatgpt/gpt-offline",
-                            "base_url": endpoint}
-                route = bridge._route_binding(settings, "offline-profile")
-                self.assertEqual(self.released_chatgpt_selection(settings, route),
-                                 route["destination"]["apiBase"])
-                self.assertEqual(route["destination"]["apiBase"], endpoint)
-
-    def test_chatgpt_guard_blocks_downstream_environment_drift(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        with patch.dict(os.environ, {"CHATGPT_API_BASE": "https://route-a.invalid/api"}):
-            settings = {"provider": "chatgpt", "model": "gpt-offline"}
-            route = bridge._route_binding(settings, None)
-            with patch.object(litellm, "completion") as transport:
-                with self.assertRaisesRegex(bridge.NativeAuditError, "route guard failed"):
-                    with bridge._bound_transport(route):
-                        with patch.dict(os.environ, {
-                                "CHATGPT_API_BASE": "https://route-b.invalid/api"}):
-                            with self.assertRaisesRegex(bridge.NativeAuditError,
-                                                        "ChatGPT.*changed"):
-                                litellm.completion(model=route["transportModel"],
-                                                   api_base=settings["base_url"])
-                        with self.assertRaisesRegex(bridge.NativeAuditError,
-                                                    "no further transport"):
-                            litellm.completion(model=route["transportModel"],
-                                               api_base=settings["base_url"])
-                self.assertIs(litellm.completion, transport)
-                transport.assert_not_called()
-
-    def test_vertex_released_endpoint_defaults_reject_ambient_overrides(self):
-        # pylint: disable=import-outside-toplevel,too-many-locals
-        import litellm
-        from litellm import main
-
-        settings = {"provider": "vertexai", "model": "gemini-offline",
-                    "project": "offline-project", "location": "us-central1"}
-        with patch.dict(os.environ, {}, clear=True), patch.object(litellm, "api_base", None):
-            route = bridge._route_binding(dict(settings), None)
-            with patch.dict(os.environ, {"VERTEXAI_API_BASE": "https://ambient.invalid/api"}):
-                with self.assertRaisesRegex(bridge.NativeAuditError, "Vertex.*endpoint"):
-                    bridge._route_binding(dict(settings), None)
-            for source in ("environment", "global"):
-                with self.subTest(source=source), contextlib.ExitStack() as stack:
-                    stack.enter_context(patch.object(litellm, "completion"))
-                    with self.assertRaisesRegex(bridge.NativeAuditError, "Vertex.*endpoint"):
-                        with bridge._bound_transport(route):
-                            if source == "environment":
-                                stack.enter_context(patch.dict(os.environ, {
-                                    "VERTEXAI_API_BASE": "https://ambient.invalid/api"}))
-                            else:
-                                stack.enter_context(patch.object(litellm, "api_base",
-                                                                "https://ambient.invalid/api"))
-                            litellm.completion(model=route["transportModel"], api_base=None,
-                                               vertex_project=settings["project"],
-                                               vertex_location=settings["location"])
-            with patch.object(litellm, "api_base", "https://ambient.invalid/api"):
-                with self.assertRaisesRegex(bridge.NativeAuditError, "Vertex.*endpoint"):
-                    with bridge._bound_transport(route):
-                        self.fail("A global override must fail before Session construction")
-            settings["base_url"] = "https://configured.invalid/v1"
-            with patch.dict(os.environ, {"VERTEXAI_API_BASE": "https://ambient.invalid/api"}), \
-                 patch.object(litellm, "api_base", "https://global.invalid/api"):
-                explicit = bridge._route_binding(settings, None)
-                self.assertEqual(main.get_vertex_ai_model_route(settings["model"], {}),
-                                 main.VertexAIModelRoute.GEMINI)
-                ctx = SimpleNamespace(acompletion=False, api_base=settings["base_url"],
-                    custom_llm_provider="vertex_ai", custom_prompt_dict={}, headers={},
-                    litellm_params={}, logger_fn=None, logging=None, messages=[],
-                    model=settings["model"], model_response=None, stream=False, timeout=1,
-                    optional_params={"vertex_project": settings["project"],
-                        "vertex_location": settings["location"], "vertex_credentials": "synthetic"})
-                with patch.object(main, "_dispatch_client_http", return_value=None), \
-                     patch.object(main, "_get_encoding", return_value=None), \
-                     patch.object(main.vertex_chat_completion, "completion",
-                                  return_value="stub") as sdk, \
-                     patch.object(litellm, "completion", side_effect=lambda **_kw:
-                                  main._complete_vertex_ai(ctx)):
-                    with bridge._bound_transport(explicit):
-                        litellm.completion(model=explicit["transportModel"],
-                            api_base=settings["base_url"], vertex_project=settings["project"],
-                            vertex_location=settings["location"])
-                    self.assertEqual(sdk.call_args.kwargs["api_base"],
-                                     explicit["destination"]["apiBase"])
-
-    def test_vertex_unverified_dispatch_is_rejected_before_session(self):
-        from litellm import main  # pylint: disable=import-outside-toplevel
-
-        request = self.request()
-        config = self.root / "config" / "swival" / "config.toml"
-        config.parent.mkdir(parents=True)
-        config.write_text('provider="vertexai"\nproject="offline-project"\n'
-                          'location="us-central1"\nbase_url="https://route-config.invalid/api"\n')
-        for model in ("offline-model", "chat-bison", "claude-offline", "mistral-offline",
-                      "bge-offline", "openai-offline", "1234567890"):
-            with self.subTest(model=model), patch("swival.session.Session") as session:
-                self.assertNotEqual(main.get_vertex_ai_model_route(model, {}),
-                                    main.VertexAIModelRoute.GEMINI)
-                request["routing"] = {"model": model}
-                with self.assertRaisesRegex(bridge.NativeAuditError, "Vertex.*dispatch"):
-                    bridge.resolve_native_config(request)
-                with self.assertRaisesRegex(bridge.NativeAuditError, "Vertex.*dispatch"):
-                    bridge.run_native(request)
-                session.assert_not_called()
-
-    def test_vertex_call_boundary_rejects_legacy_dispatch_and_latches_swallowed_errors(self):
-        # pylint: disable=import-outside-toplevel
-        import litellm
-        from litellm import main
-
-        settings = {"provider": "vertexai", "model": "gemini-offline",
-                    "project": "offline-project", "location": "us-central1",
-                    "base_url": "https://route-config.invalid/api"}
-        route = bridge._route_binding(settings, None)
-        ctx = SimpleNamespace(acompletion=False, api_base=settings["base_url"],
-            custom_llm_provider="vertex_ai", custom_prompt_dict={}, headers={},
-            litellm_params={}, logger_fn=None, logging=None, messages=[],
-            model="offline-model", model_response=None, stream=False, timeout=1,
-            optional_params={"vertex_project": settings["project"],
-                "vertex_location": settings["location"], "vertex_credentials": "synthetic"})
-        self.assertEqual(main.get_vertex_ai_model_route(ctx.model, {}),
-                         main.VertexAIModelRoute.NON_GEMINI)
-        with patch.object(main, "_dispatch_client_http", return_value=None), \
-             patch.object(main, "_get_encoding", return_value=None), \
-             patch.object(main.vertex_ai_non_gemini, "completion", return_value="stub") as sdk, \
-             patch.object(litellm, "completion", side_effect=lambda **_kw:
-                          main._complete_vertex_ai(ctx)) as transport:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "route guard failed"):
-                with bridge._bound_transport(route):
-                    # A stale binding can match completion arguments yet select
-                    # the released legacy SDK. Check again on every transport.
-                    route["model"] = ctx.model
-                    route["transportModel"] = "vertex_ai/" + ctx.model
-                    try:
-                        litellm.completion(model=route["transportModel"],
-                            api_base=settings["base_url"], vertex_project=settings["project"],
-                            vertex_location=settings["location"])
-                    except bridge.NativeAuditError:
-                        pass
-                    route["model"] = "gemini-offline"
-                    route["transportModel"] = "vertex_ai/gemini-offline"
-                    with self.assertRaisesRegex(bridge.NativeAuditError, "no further transport"):
-                        litellm.completion(model=route["transportModel"],
-                            api_base=settings["base_url"], vertex_project=settings["project"],
-                            vertex_location=settings["location"])
-            self.assertIs(litellm.completion, transport)
-            transport.assert_not_called()
-            sdk.assert_not_called()
-
-    def test_vertex_cold_preflight_import_is_offline_and_restores_environment(self):
-        config = self.root / "config" / "swival" / "config.toml"
-        config.parent.mkdir(parents=True)
-        config.write_text('provider="vertexai"\nmodel="gemini-offline"\n'
-                          'project="offline-project"\nlocation="us-central1"\n')
-        # Test a cold whole preflight with Swival's documented flag side effect,
-        # then cold LiteLLM imports after config import with synthetic flag resets.
-        # Failed helper imports must restore absent/present values too.
-        payload = r'''
-import builtins
-import importlib.util
-import json
-import os
-from pathlib import Path
-import sys
-
-counts = {"network": 0, "dotenv": 0, "credentials": 0, "sdk_auth": 0}
-def deny(kind):
-    counts[kind] += 1
-    raise AssertionError("Forbidden cold preflight access: " + kind)
-def audit_event(event, args):
-    if event.startswith("socket."):
-        deny("network")
-    if event == "open" and isinstance(args[0], (str, bytes)):
-        name = os.fsdecode(args[0])
-        if Path(name).name.startswith(".env"):
-            deny("dotenv")
-        if any(part in name for part in ("/.aws/", "/.ssh/", "/.gnupg/",
-                                         "/.config/litellm/chatgpt/", "/.config/gcloud/")):
-            deny("credentials")
-def profile(frame, event, _arg):
-    if event != "call":
-        return
-    module = frame.f_globals.get("__name__", "")
-    name = frame.f_code.co_name
-    if module.startswith("dotenv.") and name in ("load_dotenv", "find_dotenv", "dotenv_values"):
-        deny("dotenv")
-    if module == "litellm.llms.chatgpt.authenticator" and name == "__init__":
-        deny("sdk_auth")
-    if module.startswith(("google.auth", "google.oauth2")) and name in (
-            "default", "load_credentials_from_file", "__init__"):
-        deny("sdk_auth")
-    if module.startswith(("vertexai.", "google.cloud.aiplatform")) and name == "__init__":
-        deny("sdk_auth")
-sys.addaudithook(audit_event)
-sys.setprofile(profile)
-assert "litellm" not in sys.modules
-spec = importlib.util.spec_from_file_location("cold_bridge", sys.argv[1])
-bridge = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(bridge)
-flags = ("LITELLM_MODE", "LITELLM_LOCAL_MODEL_COST_MAP")
-before = {name: os.environ.get(name) for name in flags}
-if sys.argv[3] != "whole":
-    # Swival has an existing offline-map setdefault. Keep the whole-process
-    # proof separate, then reset only synthetic flags for helper restoration.
-    from swival import config
-    assert "litellm" not in sys.modules
-    for name, value in before.items():
-        if value is None:
-            os.environ.pop(name, None)
-        else:
-            os.environ[name] = value
-original_import = builtins.__import__
-blocked = []
-if sys.argv[3] == "failure":
-    def fail_import(name, *args, **kwargs):
-        if name == "litellm.llms.vertex_ai.common_utils":
-            assert os.environ["LITELLM_MODE"] == "PRODUCTION"
-            assert os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] == "True"
-            blocked.append(True)
-            raise ImportError("synthetic metadata import failure")
-        return original_import(name, *args, **kwargs)
-    builtins.__import__ = fail_import
-try:
-    request = {"source": sys.argv[2], "routing": {}}
-    if sys.argv[3] == "failure":
-        try:
-            bridge.resolve_native_config(request)
-        except bridge.NativeAuditError:
-            pass
-        else:
-            raise AssertionError("Import failure must reject preflight")
-        assert blocked
-    else:
-        _, route = bridge.resolve_native_config(request)
-        assert route["provider"] == "vertexai"
-        from litellm.llms.vertex_ai.common_utils import get_vertex_ai_model_route, VertexAIModelRoute
-        assert get_vertex_ai_model_route(route["model"], {}) == VertexAIModelRoute.GEMINI
-    after = {name: os.environ.get(name) for name in flags}
-    expected = dict(before)
-    if sys.argv[3] == "whole":
-        expected["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    assert after == expected, (expected, after)
-    assert not any(counts.values()), counts
-finally:
-    builtins.__import__ = original_import
-    sys.setprofile(None)
-print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts}))
-'''
-        for import_mode, flags in (("whole", {}), ("success", {}),
-                ("success", {"LITELLM_MODE": "DEV",
-                "LITELLM_LOCAL_MODEL_COST_MAP": "false"}), ("failure", {}),
-                ("failure", {"LITELLM_MODE": "DEV", "LITELLM_LOCAL_MODEL_COST_MAP": "false"})):
-            with self.subTest(mode=import_mode, flags=flags):
-                result = subprocess.run([sys.executable, "-I", "-B", "-c", payload,
-                    str(Path(bridge.__file__).resolve()), str(self.repo), import_mode],
-                    env={"PATH": os.environ["PATH"], "HOME": str(self.root),
-                         "XDG_CONFIG_HOME": str(self.root / "config"), **flags},
-                    cwd=self.repo, capture_output=True, timeout=15, check=False)
-                self.assertEqual(result.returncode, 0, result.stderr.decode())
-                self.assertEqual(json.loads(result.stdout)["denied_access_counts"],
-                                 {"network": 0, "dotenv": 0, "credentials": 0, "sdk_auth": 0})
-
-    def test_native_transport_blocks_huggingface_text_generation_fallback(self):
-        # pylint: disable=import-outside-toplevel
-        import huggingface_hub
-        import litellm
-
-        settings = {"provider": "huggingface", "model": "offline/model"}
-        route = bridge._route_binding(settings, None)
-        bad = litellm.BadRequestError("not a chat model", llm_provider="huggingface",
-                                      model=route["transportModel"])
-        with patch.object(litellm, "completion", side_effect=bad) as transport, \
-             patch.object(agent, "_call_huggingface_text_generation",
-                          wraps=agent._call_huggingface_text_generation) as fallback, \
-             patch.object(huggingface_hub, "HfApi") as discovery, \
-             patch.object(huggingface_hub, "InferenceClient") as sdk:
-            sdk.return_value.text_generation.return_value = "synthetic response"
-            with self.assertRaisesRegex(bridge.NativeAuditError, "HuggingFace.*fallback"):
-                with bridge._bound_transport(route):
-                    agent.call_llm(settings["base_url"], settings["model"],
-                        [{"role": "user", "content": "synthetic fixture"}],
-                        100, None, None, None, None, False, provider="huggingface", max_retries=1)
-            self.assertEqual(transport.call_count, 1)
-            self.assertIs(litellm.completion, transport)
-            self.assertIs(agent._call_huggingface_text_generation, fallback)
-            fallback.assert_not_called()
-            discovery.assert_not_called()
-            sdk.assert_not_called()
-
-    def test_native_huggingface_fallback_violation_latches_swallowed_errors(self):
-        # pylint: disable=import-outside-toplevel
-        import huggingface_hub
-        import litellm
-
-        settings = {"provider": "huggingface", "model": "offline/model"}
-        route = bridge._route_binding(settings, None)
-        bad = litellm.BadRequestError("not a chat model", llm_provider="huggingface",
-                                      model=route["transportModel"])
-        with patch.object(litellm, "completion", side_effect=bad) as transport, \
-             patch.object(huggingface_hub, "InferenceClient") as sdk:
-            sdk.return_value.text_generation.return_value = "synthetic response"
-            with self.assertRaisesRegex(bridge.NativeAuditError, "route guard failed"):
-                with bridge._bound_transport(route):
-                    try:
-                        agent.call_llm(settings["base_url"], settings["model"],
-                            [{"role": "user", "content": "synthetic fixture"}],
-                            100, None, None, None, None, False,
-                            provider="huggingface", max_retries=1)
-                    except bridge.NativeAuditError:
-                        pass
-            self.assertIs(litellm.completion, transport)
-            sdk.assert_not_called()
-
-    def test_native_transport_guard_cannot_attest_swallowed_route_failures(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        _, route = bridge.resolve_native_config(self.request())
-        with patch.object(litellm, "completion") as transport:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "route"):
-                with bridge._bound_transport(route):
-                    try:
-                        litellm.completion(model="openai/alternate",
-                                           api_base="http://drift.invalid")
-                    except bridge.NativeAuditError:
-                        pass
-            transport.assert_not_called()
-
-    def test_native_transport_blocks_vertex_location_replacement(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        route = bridge._route_binding({"provider": "vertexai", "model": "gemini-offline",
-                                       "project": "offline-project",
-                                       "location": "us-central1"}, None)
-        with patch.dict(litellm.model_cost, {
-                "vertex_ai/gemini-offline": {"supported_regions": ["europe-west1"]}}), \
-             patch.object(litellm, "completion") as transport:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "location changed"):
-                with bridge._bound_transport(route):
-                    litellm.completion(model=route["transportModel"],
-                                       vertex_project="offline-project",
-                                       vertex_location="us-central1")
-            transport.assert_not_called()
-
-    def test_native_transport_blocks_not_found_discovery_and_replacement(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        settings, route = bridge.resolve_native_config(self.request())
-        missing = litellm.NotFoundError("offline missing model", llm_provider="openai",
-                                       model=route["transportModel"])
-        with patch.object(litellm, "completion", side_effect=missing) as transport, \
-             patch.object(agent, "_list_server_models", return_value=["alternate"]) as listing:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "discovery/replacement"):
-                with bridge._bound_transport(route):
-                    agent.call_llm(settings["base_url"], settings["model"],
-                                   [{"role": "user", "content": "synthetic"}],
-                                   100, None, None, None, None, False, max_retries=1)
-            self.assertIs(litellm.completion, transport)
-            self.assertIs(agent._list_server_models, listing)
-            self.assertEqual(transport.call_count, 1)
-            self.assertEqual(transport.call_args.kwargs["model"], route["transportModel"])
-            listing.assert_not_called()
-
-    def test_native_transport_rejects_cached_autofix_and_destination_drift(self):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        settings, route = bridge.resolve_native_config(self.request())
-        key = (settings["base_url"], route["transportModel"])
-        with patch.object(litellm, "completion") as transport:
-            with self.assertRaisesRegex(Exception, "route changed"):
-                with bridge._bound_transport(route), patch.dict(
-                        agent._MODEL_AUTOFIX, {key: "openai/alternate"}):
-                    agent.call_llm(settings["base_url"], settings["model"],
-                                   [{"role": "user", "content": "synthetic"}],
-                                   100, None, None, None, None, False, max_retries=1)
-            with self.assertRaisesRegex(bridge.NativeAuditError, "destination changed"):
-                with bridge._bound_transport(route):
-                    litellm.completion(model=route["transportModel"],
-                                       api_base="http://drift.invalid")
-            transport.assert_not_called()
-
-    def test_released_session_ask_native_pipeline_with_stubbed_llm_and_no_provider(self):
-        self.assertTrue(callable(getattr(bridge, "run_native", None)))
+    def test_released_zero_finding_cli(self):
         calls = []
-
-        def call_llm(_api, model, messages, *_args, **kwargs):
-            self.assertEqual(model, "offline-model")
-            self.assertEqual(kwargs.get("provider"), "lmstudio")
-            # Auxiliary phases preserve the model/provider, but omit effort.
-            self.assertNotIn("reasoning_effort", kwargs)
+        def completion(_api, _model, messages, *_args, **_kwargs):
             text = audit._PHASE1_WORKED_EXAMPLE if not calls else "@@ none @@"
             calls.append(messages)
             return {"role": "assistant", "content": text}, "stop", False, 0, None
-
-        with patch.object(agent, "resolve_provider", return_value=(
-            "offline-model", "http://offline.invalid", None, 128000, {"provider": "lmstudio"}
-        )), patch.object(agent, "call_llm", side_effect=call_llm), patch(
-            "swival.sandbox_nono.check_wrapper_available"
-        ), patch("swival.sandbox_nono.build_block_net_wrapper", return_value=["offline-nono"]):
-            result = bridge.run_native(self.request())
-        self.assertEqual(result["status"], "completed", result)
-        self.assertGreater(len(calls), 0)
-        states = list((self.repo / ".swival" / "audit").glob("*/state.json"))
+        with patch.object(agent, "resolve_provider", return_value=("gpt-offline", None, None,
+            128000, {"provider": "chatgpt"})), \
+             patch.object(agent, "call_llm", side_effect=completion), \
+             patch("swival.sandbox_nono.check_wrapper_available"), \
+             patch("swival.sandbox_nono.build_block_net_wrapper", return_value=["offline-nono"]):
+            self.cli()
+        states = list((self.repo / ".swival/audit").glob("*/state.json"))
         self.assertEqual(len(states), 1)
         state = json.loads(states[0].read_text())
         self.assertEqual(state["phase"], "done")
-        self.assertEqual(state["scope"]["commit"], self.git("rev-parse", "HEAD"))
-        self.assertEqual(state["reviewed_files"], ["code.py"])
+        self.assertEqual(state["verified_findings"], [])
         self.assertEqual(state["deep_reviewed_files"], ["code.py"])
-        self.assertEqual(result["requestedEffort"], "xhigh")
-        self.assertFalse((self.evidence / "report.json").exists())
 
-    # Keep the released finding-to-artifact sequence in one fixture.
-    # pylint: disable-next=too-many-statements,too-many-locals
+    def test_released_tool_and_isolated_loop_denials(self):
+        session = Session(base_dir=str(self.repo), files="some", commands="none",
+            network="provider-only",
+            no_instructions=True, no_skills=True, memory=False, history=False,
+                subagents=False, lifecycle_enabled=False)
+        with patch.object(agent, "resolve_provider", return_value=("gpt-offline", None, None,
+            128000, {"provider": "chatgpt"})), \
+             patch("swival.sandbox_nono.check_wrapper_available"), \
+             patch("swival.sandbox_nono.build_block_net_wrapper", return_value=["offline-nono"]):
+            session._setup()
+        self.addCleanup(session.close)
+        context = session._make_input_context(session._make_per_run_state(system_content="offline"))
+        isolated = make_isolated_loop_kwargs(context, self.root / "worktree", files_mode=None,
+            network_mode=None)
+        self.assertEqual(isolated["files_mode"], "some")
+        self.assertEqual(isolated["network_mode"], "provider-only")
+        self.assertFalse(isolated["shell_allowed"])
+        self.assertEqual(isolated["command_policy"].mode, "none")
+        with patch.object(subprocess, "Popen",
+            side_effect=AssertionError("model execution forbidden")):
+            for name, args in [("run_command", {"command": ["id"]}), ("run_python",
+                {"code": "print(42)"}),
+                               ("run_shell_command", {"command": "id"}), ("fetch_url",
+                                   {"url": "https://offline.invalid"})]:
+                result = tools.dispatch(name, args, str(self.repo), **{k: v for k,
+                    v in isolated.items() if k != "base_dir"})
+                self.assertTrue(result.startswith("error:"), name)
+
+    def test_chatgpt_not_found_never_replaces_model(self):
+        self.assertGreater(len(set(agent._list_server_models("chatgpt", None, None))), 1)
+        failure = litellm.NotFoundError("synthetic missing model", llm_provider="chatgpt",
+            model="gpt-offline")
+        with patch.object(litellm, "completion", side_effect=failure) as completion:
+            with self.assertRaises(agent.AgentError):
+                agent.call_llm(None, "gpt-offline", [{"role": "user", "content": "synthetic"}],
+                               100, None, None, None, None, False, provider="chatgpt",
+                                   max_retries=1)
+        self.assertEqual({call.kwargs["model"] for call in completion.call_args_list},
+            {"chatgpt/gpt-offline"})
+        self.assertFalse(agent._MODEL_AUTOFIX)
+
+    def test_chatgpt_retry_preserves_route(self):
+        reply = litellm.ModelResponse(model="chatgpt/gpt-offline",
+            choices=[{"message": {"role": "assistant", "content": "synthetic"},
+                "finish_reason": "stop"}])
+        failure = litellm.ServiceUnavailableError("synthetic retry", llm_provider="chatgpt",
+            model="gpt-offline")
+        with patch.object(litellm, "completion", side_effect=[failure,
+            reply]) as completion, patch.object(agent.time, "sleep"):
+            agent.call_llm(None, "gpt-offline", [{"role": "user", "content": "synthetic"}],
+                           100, None, None, None, None, False, provider="chatgpt", max_retries=2)
+        self.assertEqual(completion.call_count, 2)
+        self.assertEqual({call.kwargs["model"] for call in completion.call_args_list},
+            {"chatgpt/gpt-offline"})
+        self.assertEqual({call.kwargs.get("api_base") for call in completion.call_args_list},
+            {None})
+
+    def write_config(self, text):
+        directory = Path(os.environ["XDG_CONFIG_HOME"]) / "swival"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.toml").write_text(text)
+
+    def test_configured_defaults_and_specialist_precedence(self):
+        self.write_config('provider="openrouter"\nmodel="example/default"\n'
+            'active_profile="ordinary"\nmax_context_tokens=128000\n'
+            '[profiles.ordinary]\nprovider="chatgpt"\nmodel="chatgpt/gpt-active"\n'
+            '[profiles.specialist]\nprovider="openrouter"\nmodel="example/specialist"\n'
+            'reasoning_effort="high"\n')
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-key"}), \
+             patch.object(agent, "resolve_provider", side_effect=FORBIDDEN), \
+             patch.object(authenticator, "Authenticator", side_effect=FORBIDDEN):
+            default = bridge.resolve_native_config({"source": str(self.repo)})
+            self.assertEqual(default["model"], "chatgpt/gpt-active")
+            self.assertEqual(default["selection"]["profileSource"], "active")
+            route = bridge.resolve_native_config({"source": str(self.repo),
+                "routing": {"profile": "specialist"}})
+            self.assertEqual(route["version"], 2)
+            self.assertEqual((route["provider"], route["model"], route["reasoningEffort"]),
+                ("openrouter", "example/specialist", "high"))
+            self.assertEqual(route["selection"], {"profileSource": "explicit",
+                "explicitFields": ["profile"]})
+            selected = bridge.resolve_native_config({"source": str(self.repo),
+                "routing": {"profile": "specialist", "model": "example/override",
+                    "reasoningEffort": "xhigh"}})
+            self.assertEqual(selected["model"], "example/override")
+            self.assertEqual(selected["reasoningEffort"], "xhigh")
+        self.assertFalse(agent._MODEL_AUTOFIX)
+
+    def test_default_api_and_explicit_local_endpoint(self):
+        for endpoint in (None, "http://127.0.0.1:8444/v1"):
+            with self.subTest(endpoint=endpoint):
+                self.write_config('provider="openrouter"\nmodel="example/concrete"\n'
+                    'max_context_tokens=128000\n' +
+                    (f'base_url="{endpoint}"\n' if endpoint else ''))
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key"}):
+                    route = bridge.resolve_native_config({"source": str(self.repo)})
+                self.assertEqual(route["provider"], "openrouter")
+                self.assertEqual(route["endpoint"], endpoint)
+                self.assertEqual(route["selection"]["profileSource"], None)
+                self.assertNotIn("synthetic-dedicated-key", json.dumps(route))
+
+    def test_selection_and_capability_failures_are_precise(self):
+        chatgpt = 'provider="chatgpt"\nmodel="gpt-offline"'
+        api = 'provider="openrouter"\nmodel="concrete"'
+        cases = [
+            ('', {}, "ROUTE_INCOMPLETE"),
+            ('provider="chatgpt"', {}, "ROUTE_INCOMPLETE"),
+            ('model="gpt-offline"', {}, "ROUTE_INCOMPLETE"),
+            (chatgpt, {"profile": "missing"}, "PROFILE_UNAVAILABLE"),
+            ('[profiles.test]\nmodel="gpt-offline"', {"profile": "test"}, "PROFILE_UNAVAILABLE"),
+            ('[profiles.test]\n' + chatgpt, {"profile": ""}, "PROFILE_UNAVAILABLE"),
+            ('provider="unfamiliar"\nmodel="concrete"', {}, "CONFIG_INVALID"),
+            ('provider="generic"\nmodel="concrete"', {}, "MODEL_REPLACEMENT_UNCONTROLLABLE"),
+            ('provider="lmstudio"\nmodel="concrete"', {}, "MODEL_REPLACEMENT_UNCONTROLLABLE"),
+            ('provider="llamacpp"\nmodel="concrete"', {}, "MODEL_REPLACEMENT_UNCONTROLLABLE"),
+            ('provider="google"\nmodel="concrete"', {}, "MODEL_REPLACEMENT_UNCONTROLLABLE"),
+            ('provider="bedrock"\nmodel="concrete"', {}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
+            ('provider="command"\nmodel="concrete"', {}, "COMMAND_EXECUTION_REQUIRED"),
+            (api + '\nbase_url="https://offline.invalid/' + 'x' * 48 + '"',
+                {}, "CONFIG_INVALID"),
+            ('provider="openrouter"\nmodel="openrouter/auto"', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            ('provider="openrouter"\nmodel="openrouter/openrouter/auto:floor"',
+                {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            ('api_key="synthetic-secret"\n[profiles.test]\nprovider="openrouter"\nmodel="concrete"',
+                {"profile": "test"}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
+            ('base_url="https://offline.invalid/v1"\n[profiles.test]\n' + chatgpt,
+                {"profile": "test"}, "ENDPOINT_REQUIREMENT_UNSUPPORTED"),
+            (api + '\napi_key="synthetic-secret"', {}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
+            (chatgpt + '\nreasoning_effort="invalid"', {}, "CONFIG_INVALID"),
+            (chatgpt + '\nbase_url="https://user:synthetic-secret@offline.invalid"',
+                {}, "CONFIG_INVALID"),
+        ]
+        for config, routing, reason in cases:
+            with self.subTest(reason=reason, routing=routing):
+                self.write_config(config)
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-key"}), \
+                     self.assertRaisesRegex(bridge.NativeAuditError, reason):
+                    bridge.resolve_native_config({"source": str(self.repo), "routing": routing})
+        with patch.object(bridge.importlib.metadata, "version", return_value="unsupported"):
+            with self.assertRaisesRegex(bridge.NativeAuditError, "RUNTIME_UNSUPPORTED"):
+                bridge.resolve_native_config(self.request())
+
+    def test_nonpropagated_policy_fields_are_value_free(self):
+        for key, value in {"encrypt_secrets": "true", "llm_filter": '"synthetic-secret"',
+            "secret_shield": "true", "extra_body": '{ routing="synthetic-secret" }',
+            "prompt_cache": "false", "sanitize_thinking": "true", "show_thinking": "true",
+            "sandbox_strict_read": "true", "sandbox_session": '"synthetic-secret"',
+            "reasoning_effort_all_phases": "true", "retries_all_phases": "true",
+            "retries": "1"}.items():
+            with self.subTest(field=key):
+                self.write_config(f'provider="chatgpt"\nmodel="gpt-offline"\n{key}={value}\n')
+                with self.assertRaises(bridge.NativeAuditError) as raised:
+                    bridge.resolve_native_config({"source": str(self.repo)})
+                self.assertEqual(getattr(raised.exception, "reason", None), "POLICY_NOT_PROPAGATED")
+                self.assertEqual(getattr(raised.exception, "field", None), key)
+                self.assertNotIn("synthetic-secret", str(raised.exception))
+
+    def test_unknown_policy_field_names_are_not_returned(self):
+        self.write_config('provider="chatgpt"\nmodel="gpt-offline"\n'
+            'nono_synthetic_private_field=true\n')
+        with self.assertRaises(bridge.NativeAuditError) as raised:
+            bridge.resolve_native_config({"source": str(self.repo)})
+        self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertNotIn("synthetic_private_field", json.dumps(raised.exception.response()))
+
+    def representative(self, provider, endpoint=None):
+        self.write_config(f'provider="{provider}"\nmodel="example/concrete"\n'
+            'max_context_tokens=128000\nreasoning_effort="xhigh"\n' +
+            (f'base_url="{endpoint}"\n' if endpoint else ''))
+        self.routing = {}
+        self.enterContext(patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key"}))
+        return bridge.resolve_native_config(self.request())
+
+    def test_released_default_active_and_explicit_profile_dispatch(self):
+        config = ('provider="openrouter"\nmodel="example/default"\nmax_context_tokens=128000\n'
+            '[profiles.ordinary]\nprovider="chatgpt"\nmodel="chatgpt/gpt-active"\n'
+            '[profiles.specialist]\nprovider="openrouter"\nmodel="example/specialist"\n'
+            'reasoning_effort="high"\n')
+        for active, routing, expected in (
+                (False, {}, ("openrouter", "example/default")),
+                (True, {}, ("chatgpt", "chatgpt/gpt-active")),
+                (True, {"profile": "specialist"}, ("openrouter", "example/specialist"))):
+            self.write_config(('active_profile="ordinary"\n' if active else '') + config)
+            self.routing = routing
+            calls = []
+            with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-selected-key"}), \
+                 patch.object(agent, "call_llm", side_effect=zero_finding_reply(calls)), \
+                 patch("swival.sandbox_nono.check_wrapper_available"), \
+                 patch("swival.sandbox_nono.build_block_net_wrapper",
+                       return_value=["offline-nono"]):
+                self.cli()
+            self.assertTrue(calls)
+            self.assertEqual(set(calls), {expected})
+            self.assertFalse(agent._MODEL_AUTOFIX)
+            shutil.rmtree(self.repo / ".swival")
+
+    def test_released_api_and_local_full_finding_phases(self):
+        for endpoint in (None, "http://127.0.0.1:8444/v1"):
+            with self.subTest(endpoint=endpoint):
+                self.representative("openrouter", endpoint)
+                self.released_finding("# Synthetic source-only report\n",
+                    commit_source=endpoint is None)
+                shutil.rmtree(self.repo / ".swival")
+                shutil.rmtree(self.repo / "audit-findings")
+                self.assertFalse((self.root / ".config/litellm/chatgpt").exists())
+                self.assertFalse(agent._MODEL_AUTOFIX)
+
+    def test_released_terminal_errors_timeouts_and_notfound_keep_selected_route(self):
+        for provider, endpoint in (("chatgpt", None), ("openrouter", None),
+                ("openrouter", "http://127.0.0.1:8444/v1")):
+            route = self.representative(provider, endpoint)
+            model, api_base, key, _context, kwargs = agent.resolve_provider(provider,
+                route["model"], None, endpoint, 128000, False)
+            self.assertEqual(model, route["model"])
+            self.assertEqual(api_base, endpoint)
+            expected_model = agent._resolve_model_str(provider, model)
+            for error_type in (litellm.AuthenticationError, litellm.PermissionDeniedError,
+                    litellm.ContentPolicyViolationError, litellm.Timeout,
+                    litellm.APIConnectionError, litellm.NotFoundError):
+                with self.subTest(provider=provider, endpoint=endpoint,
+                        failure=error_type.__name__):
+                    extra = {}
+                    if error_type is litellm.PermissionDeniedError:
+                        extra["response"] = httpx.Response(403, request=httpx.Request(
+                            "POST", "https://offline.invalid"))
+                    failure = error_type("synthetic selected-route failure",
+                        llm_provider=provider, model=model, **extra)
+                    with patch.object(litellm, "completion", side_effect=failure) as completion, \
+                         patch.object(agent.time, "sleep"):
+                        with self.assertRaises(agent.AgentError):
+                            agent.call_llm(api_base, model,
+                                [{"role": "user", "content": "synthetic"}],
+                                100, None, None, None, None, False, api_key=key,
+                                provider=kwargs["provider"], max_retries=1)
+                    self.assertGreater(completion.call_count, 0)
+                    self.assertEqual({call.kwargs["model"] for call in completion.call_args_list},
+                        {expected_model})
+                    self.assertEqual({call.kwargs.get("api_base")
+                        for call in completion.call_args_list}, {endpoint})
+                    self.assertFalse(agent._MODEL_AUTOFIX)
+            reply = litellm.ModelResponse(model=expected_model, choices=[{
+                "message": {"role": "assistant", "content": "synthetic"}, "finish_reason": "stop"}])
+            transient = litellm.ServiceUnavailableError("synthetic transient",
+                llm_provider=provider, model=model)
+            with patch.object(litellm, "completion",
+                    side_effect=[transient, reply]) as completion, \
+                 patch.object(agent.time, "sleep"):
+                agent.call_llm(api_base, model, [{"role": "user", "content": "synthetic"}],
+                    100, None, None, None, None, False, api_key=key,
+                    provider=provider, max_retries=2)
+            self.assertEqual(completion.call_count, 2)
+            self.assertEqual({call.kwargs["model"] for call in completion.call_args_list},
+                {expected_model})
+            self.assertEqual({call.kwargs.get("api_base") for call in completion.call_args_list},
+                {endpoint})
+
+    def test_offline_recognized_policy_error_then_success_inherits_same_route_native_retries(self):
+        """Characterize inherited retry success, not immediate refusal-stop or a done audit."""
+        self.assert_offline_policy_error_retries(exhausted=False)
+
+    def test_offline_recognized_policy_error_exhaustion_remains_terminal_without_fallback(self):
+        self.assert_offline_policy_error_retries(exhausted=True)
+
+    def assert_offline_policy_error_retries(self, *, exhausted):
+        self.enterContext(patch.object(authenticator, "Authenticator", side_effect=FORBIDDEN))
+        for provider, endpoint in (("chatgpt", None), ("openrouter", None),
+                ("openrouter", "http://127.0.0.1:8444/v1")):
+            route = self.representative(provider, endpoint)
+            for error_type in (litellm.BadRequestError, litellm.APIError):
+                for entry in ("primary", "auxiliary"):
+                    with self.subTest(provider=provider, endpoint=endpoint,
+                            error=error_type.__name__, entry=entry, exhausted=exhausted):
+                        self.assert_offline_policy_error_case(route, error_type, entry,
+                            exhausted=exhausted)
+
+    def assert_offline_policy_error_case(self, route, error_type, entry, *, exhausted):
+        options = route["options"]
+        self.assertEqual(options["retries"], 5)
+        self.assertEqual(inspect.signature(agent.call_llm).parameters["max_retries"].default,
+            options["retries"])
+        model, api_base, key, _context, kwargs = agent.resolve_provider(route["provider"],
+            route["model"], None, route["endpoint"], options["max_context_tokens"], False)
+        self.assertEqual((model, api_base, kwargs["provider"]),
+            (route["model"], route["endpoint"], route["provider"]))
+        llm_kwargs = {**kwargs, "api_key": key, "max_retries": options["retries"],
+            "provider_timeout": options["provider_timeout"],
+            "reasoning_effort": route["reasoningEffort"]}
+        loop_kwargs = {"api_base": api_base, "model_id": model,
+            "max_output_tokens": options["max_output_tokens"], "top_p": options["top_p"],
+            "seed": options["seed"], "llm_kwargs": llm_kwargs}
+        expected_model = agent._resolve_model_str(route["provider"], model)
+        messages = [{"role": "user", "content": "synthetic policy retry fixture"}]
+        original = deepcopy(messages)
+        extra = {"status_code": 400, "request": httpx.Request(
+            "POST", "https://offline.invalid")} if error_type is litellm.APIError \
+            else {}
+        failure = error_type(message="Invalid prompt: your prompt was flagged as "
+            "potentially violating our usage policy", llm_provider=route["provider"],
+            model=model, **extra)
+        self.assertTrue(agent._is_prompt_rejection(failure))
+        sentinel = "synthetic inherited same-route success"
+        reply = litellm.ModelResponse(model=expected_model, choices=[{
+            "message": {"role": "assistant", "content": sentinel},
+            "finish_reason": "stop"}])
+        requests = []
+        def completion(**request):
+            requests.append(deepcopy(request))
+            if exhausted or len(requests) == 1:
+                raise failure
+            return reply
+        def invoke():
+            if entry == "auxiliary":
+                # Use the real helper: it omits max_retries and keeps upstream's
+                # default, which equals the admitted native retry setting.
+                return call_llm_text(loop_kwargs, messages,
+                    temperature=options["temperature"])[0]
+            result = agent.call_llm(api_base, model, messages,
+                options["max_output_tokens"], options["temperature"],
+                options["top_p"], options["seed"], None, False, **llm_kwargs)
+            self.assertEqual(result[3], 1)
+            return agent._msg_get(result[0], "content")
+        with patch.object(litellm, "completion", side_effect=completion), \
+             patch.object(agent.time, "sleep") as sleep:
+            if exhausted:
+                with self.assertRaises(agent.AgentError) as raised:
+                    invoke()
+                self.assertEqual(raised.exception._provider_retries,
+                    options["retries"] - 1)
+            else:
+                self.assertEqual(invoke(), sentinel)
+        expected_attempts = options["retries"] if exhausted else 2
+        self.assertEqual(len(requests), expected_attempts)
+        self.assertEqual(sleep.call_count, expected_attempts - 1)
+        self.assertEqual(messages, original)
+        self.assertEqual(requests[0]["messages"], original)
+        self.assertEqual(requests[0]["model"], expected_model)
+        self.assertEqual(requests[0].get("api_base"), route["endpoint"])
+        for request in requests[1:]:
+            self.assertEqual(request, requests[0])
+        self.assertFalse(agent._MODEL_AUTOFIX)
+
+    def test_explicit_local_endpoint_uses_mock_http_without_remote_dispatch(self):
+        endpoint = "http://127.0.0.1:8444/v1"
+        route = self.representative("openrouter", endpoint)
+        model, api_base, key, _context, kwargs = agent.resolve_provider(route["provider"],
+            route["model"], None, endpoint, 128000, False)
+        requests = []
+        def response(request, **_kwargs):
+            requests.append(request)
+            return httpx.Response(200, request=request, json={"id": "synthetic",
+                "object": "chat.completion",
+                "created": 1, "model": model, "choices": [{"index": 0, "message": {
+                    "role": "assistant", "content": "synthetic local reply"},
+                    "finish_reason": "stop"}]})
+        with patch.object(httpx.Client, "send", side_effect=response):
+            message, _finish, _tokens, _cost, _usage = agent.call_llm(api_base, model,
+                [{"role": "user", "content": "synthetic"}], 100, None, None, None, None, False,
+                api_key=key, provider=kwargs["provider"], max_retries=1)
+        self.assertEqual(agent._msg_get(message, "content"), "synthetic local reply")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(str(requests[0].url), endpoint + "/chat/completions")
+        self.assertEqual(json.loads(requests[0].content)["model"], model)
+        self.assertFalse(agent._MODEL_AUTOFIX)
+
+    def test_dynamic_singleton_is_rejected_before_any_dispatch(self):
+        self.write_config('provider="generic"\nmodel="selected"\n'
+            'base_url="http://127.0.0.1:8444/v1"\nmax_context_tokens=128000\n')
+        with patch.object(agent, "_list_server_models", return_value=["replacement"]) as listing, \
+             patch.object(agent, "resolve_provider", side_effect=FORBIDDEN) as resolver, \
+             patch.object(litellm, "completion", side_effect=FORBIDDEN) as completion:
+            with self.assertRaisesRegex(bridge.NativeAuditError,
+                    "MODEL_REPLACEMENT_UNCONTROLLABLE"):
+                bridge.resolve_native_config({"source": str(self.repo)})
+        listing.assert_not_called()
+        resolver.assert_not_called()
+        completion.assert_not_called()
+
+    def auth_fixture(self, responses):
+        token_dir = self.root / "synthetic-auth"
+        self.enterContext(patch.dict(os.environ, {"CHATGPT_TOKEN_DIR": str(token_dir)}))
+        calls = []
+        def handler(request):
+            calls.append(request)
+            response = responses[len(calls) - 1]
+            if isinstance(response, BaseException):
+                raise response
+            return httpx.Response(200, json=response)
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        self.addCleanup(client.close)
+        self.enterContext(patch.object(authenticator, "_get_httpx_client", return_value=client))
+        self.enterContext(patch.object(authenticator.time, "time", return_value=100))
+        auth = authenticator.Authenticator()
+        return auth, calls
+
+    def test_standard_chatgpt_refresh_and_auth_write(self):
+        token = synthetic_jwt()
+        auth, calls = self.auth_fixture([{"access_token": token, "id_token": token,
+            "refresh_token": "synthetic-new-refresh"}])
+        auth._write_auth_file({"access_token": "synthetic-expired", "expires_at": 1,
+            "refresh_token": "synthetic-old-refresh"})
+        self.assertEqual(auth.get_access_token(), token)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(auth._read_auth_file()["refresh_token"], "synthetic-new-refresh")
+        self.assertEqual(auth.get_account_id(), "synthetic-account")
+
+    def test_standard_chatgpt_login_and_auth_write(self):
+        token = synthetic_jwt()
+        auth, calls = self.auth_fixture([{"device_auth_id": "synthetic-device",
+            "user_code": "synthetic-code", "interval": 1},
+            {"authorization_code": "synthetic-authorization",
+                "code_challenge": "synthetic-challenge", "code_verifier": "synthetic-verifier"},
+            {"access_token": token, "id_token": token, "refresh_token": "synthetic-refresh"}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(auth.get_access_token(), token)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(auth._read_auth_file()["account_id"], "synthetic-account")
+
+    def test_standard_chatgpt_auth_error_and_cancellation_propagate(self):
+        auth, _calls = self.auth_fixture([RuntimeError("synthetic auth failure")])
+        with self.assertRaises(authenticator.GetDeviceCodeError):
+            auth.get_access_token()
+        self.assertFalse(Path(auth.auth_file).exists())
+        with patch.object(authenticator, "_get_httpx_client", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                auth.get_access_token()
+
     def released_finding(self, report_response, export=None, expansion="complete",
-                         commit_source=True, transport_guard=False):
+                         commit_source=True, recovery="complete"):
         """Real released phases and edit_file with offline transport and OS stubs."""
+        triage_failure = recovery == "triage-promoted"
         source = ('def authorize(role):\n'
                   '    """Role access-control decision: allow only admin."""\n'
                   '    return True\n')
@@ -847,6 +600,25 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
         calls = []
         edits = []
         failed_attempts = []
+        adjudication_errors = []
+        malformed_calls = []
+        repair_calls = []
+        title = "Role authorization accepts non-admin"
+        if recovery in ("reviewer-error", "consolidate-error"):
+            # Exact titles from the parent Rich probe split each fixed marker at width 80.
+            title = "Synthetic " + "x" * (35 if recovery == "reviewer-error" else 32)
+        route = bridge.resolve_native_config(self.request())
+        released_auxiliary = audit._call_audit_llm
+
+        def auxiliary(context, messages, **kwargs):
+            task = kwargs.get("trace_task", "")
+            if triage_failure and "phase 2 triage" in task:
+                raise agent.AgentError("synthetic triage infrastructure failure")
+            if ((recovery == "reviewer-error" and "phase 4.5 review" in task)
+                    or (recovery == "consolidate-error" and "phase 4.5 consolidate" in task)):
+                adjudication_errors.append(task)
+                raise agent.AgentError("synthetic-terminal-adjudication-value-never-export")
+            return released_auxiliary(context, messages, **kwargs)
 
         responses = {
             "You are preparing a compact repository profile": ("profile", (
@@ -855,7 +627,7 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
                 "summary: synthetic role access-control fixture")),
             "You are performing phase 2 security triage": ("triage", audit._PHASE2_WORKED_EXAMPLE),
             "You are performing phase 3 deep security review": ("finding", (
-                "@@ finding @@\ntitle: Role authorization accepts non-admin\n"
+                f"@@ finding @@\ntitle: {title}\n"
                 "severity: high\nlocation: code.py:3\n"
                 "attacker: any caller of the role access-control decision\n"
                 "trigger: non-admin role passed to authorize\n"
@@ -877,7 +649,7 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
                 "severity: high\nreason: the named role access-control decision "
                 "unconditionally accepts non-admin roles")),
             "You are finalizing one security finding": ("ruling", (
-                "@@ ruling @@\ntitle: Role authorization accepts non-admin\n"
+                f"@@ ruling @@\ntitle: {title}\n"
                 "type: security_control_failure\nseverity: high\n"
                 "threat_model: the role access-control decision accepts roles "
                 "its documented contract requires it to reject\n"
@@ -887,18 +659,31 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
         }
 
         def call_llm(_api, model, messages, *_args, **kwargs):
-            self.assertEqual(model, "offline-model")
-            self.assertEqual(kwargs.get("provider"), "lmstudio")
+            self.assertEqual(model, route["model"])
+            self.assertEqual(kwargs.get("provider"), route["provider"])
+            self.assertEqual(_api, route["endpoint"])
             system = messages[0]["content"]
             # Agent loops inherit effort; plain auxiliary calls omit it.
             if system.startswith(("You are verifying", "You are fixing")):
                 self.assertEqual(kwargs.get("reasoning_effort"), "xhigh")
             else:
                 self.assertNotIn("reasoning_effort", kwargs)
-            response = next((value for prefix, value in responses.items()
-                             if system.startswith(prefix)), None)
+            target = "ruling" if recovery.endswith("consolidation") else "adjudication"
+            if system == audit._RECORD_REPAIR_SYSTEM:
+                repair_calls.append(target)
+                prefix = ("You are finalizing one security finding" if target == "ruling"
+                          else "You are adjudicating one already-reproduced")
+                response = ("repair", responses[prefix][1] if recovery.startswith("repaired-")
+                            else "synthetic-malformed-adjudication-value-never-export")
+            else:
+                response = next((value for prefix, value in responses.items()
+                                 if system.startswith(prefix)), None)
             self.assertIsNotNone(response, "Unexpected LLM phase; no transport fallback")
             phase, text = response
+            if phase == target and (recovery.startswith(("malformed-", "repaired-")) or
+                    (recovery == "reviewer-retry-recovered" and not malformed_calls)):
+                malformed_calls.append(phase)
+                text = "synthetic-malformed-adjudication-value-never-export"
             text = expansion_response(phase, text, messages, expansion, failed_attempts)
             if phase == "patch":
                 tool_results = [m for m in messages if agent._msg_get(m, "role") == "tool"]
@@ -923,29 +708,44 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
                     "stop", False, 0, None)
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(agent, "resolve_provider", return_value=(
-                "offline-model", "http://127.0.0.1:1234", None, 128000, {"provider": "lmstudio"}
-            )))
-            if transport_guard:
-                transport = self.stub_bound_completion(stack, call_llm)
-            else:
-                stack.enter_context(patch.object(agent, "call_llm", side_effect=call_llm))
+            stack.enter_context(patch.object(agent, "call_llm", side_effect=call_llm))
+            stack.enter_context(patch.object(audit, "_call_audit_llm", side_effect=auxiliary))
             stack.enter_context(patch("swival.sandbox_nono.check_wrapper_available"))
             stack.enter_context(patch("swival.sandbox_nono.build_block_net_wrapper",
                                       return_value=["offline-nono"]))
-            result = bridge.run_native(self.request())
-            if transport_guard:
-                self.assertIs(sys.modules["litellm"].completion, transport)
+            result = self.cli(Path(export) / "released-diagnostics.txt" if export else None,
+                              all_files=not triage_failure)
+        self.assertEqual(len(adjudication_errors), {"reviewer-error": 6,
+            "consolidate-error": 1}.get(recovery, 0))
+        self.assertFalse(agent._MODEL_AUTOFIX)
         if not export and commit_source:
-            self.assertEqual(result["status"],
-                             "partial" if expansion == "lost" else "completed", result)
-            self.assertEqual(result.get("unrecoveredExpansionFailures", 0),
+            self.assertEqual(result["status"], "completed", result)
+            self.assertEqual(result.get("expansionFailures", 0),
                              1 if expansion == "lost" else 0)
         self.assertNotIn("private expansion diagnostic", json.dumps(result))
         states = list((self.repo / ".swival" / "audit").glob("*/state.json"))
         self.assertEqual(len(states), 1)
         state = json.loads(states[0].read_text())
         self.assertEqual(state["phase"], "done", state["verification_state"])
+        malformed_count = {"malformed-reviewers": 6, "malformed-consolidation": 1,
+            "repaired-reviewers": 3, "repaired-consolidation": 1,
+            "reviewer-retry-recovered": 1}.get(recovery, 0)
+        self.assertEqual(len(malformed_calls), malformed_count)
+        self.assertEqual(len(repair_calls), malformed_count)
+        self.assertEqual(state["metrics"]["repair_failures"],
+                         0 if recovery.startswith("repaired-") else malformed_count)
+        self.assertEqual(state["metrics"]["repair_successes"],
+                         malformed_count if recovery.startswith("repaired-") else 0)
+        if malformed_count:
+            record = "ruling" if recovery.endswith("consolidation") else "verdict"
+            self.assertEqual(state["metrics"]["parse_failures_" + record], malformed_count)
+        if recovery == "reviewer-retry-recovered":
+            self.assertEqual(state["metrics"]["phase45_lens_retries"], 1)
+            self.assertEqual(calls.count("adjudication"), 4)
+        if triage_failure:
+            self.assertTrue(set(state["scope"]["mandatory_files"]).issubset(
+                state["deep_reviewed_files"]))
+            self.assertEqual(state["candidate_files"], state["deep_reviewed_files"])
         self.assertEqual(len(state["verified_findings"]), 1)
         self.assertEqual(len(state["verification_state"]), 1)
         self.assertEqual(next(iter(state["verification_state"].values()))["status"], "verified")
@@ -959,43 +759,7 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
             self.assertTrue(failed_attempts)
         if export:
             self.export_finding(export, states[0], state, result)
-        (self.evidence / "native-result.json").write_text(json.dumps(result))
         return state
-
-    def stub_bound_completion(self, stack, response):
-        import litellm  # pylint: disable=import-outside-toplevel
-
-        _, route = bridge.resolve_native_config(self.request())
-        attempts = []
-
-        def completion(**kwargs):
-            self.assertIsNot(litellm.completion, transport,
-                             "Every phase/retry must traverse the guard")
-            self.assertEqual(kwargs["model"], route["transportModel"])
-            self.assertEqual(kwargs["api_base"], route["destination"]["apiBase"])
-            attempts.append(kwargs)
-            if len(attempts) == 1:
-                raise litellm.ServiceUnavailableError("offline transient retry",
-                                                     llm_provider="openai", model=kwargs["model"])
-            message, stop, *_ = response(None, "offline-model", kwargs["messages"],
-                                        **{**{key: value for key, value in kwargs.items()
-                                              if key not in ("model", "messages")},
-                                           "provider": "lmstudio"})
-            tools = [{"id": tool.id, "type": tool.type, "function": vars(tool.function)}
-                     for tool in (message.tool_calls or [])]
-            return litellm.ModelResponse(model=kwargs["model"], choices=[{
-                "message": {"role": "assistant", "content": message.content,
-                            "tool_calls": tools or None}, "finish_reason": stop}],
-                usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-
-        transport = stack.enter_context(patch.object(litellm, "completion", side_effect=completion))
-        stack.enter_context(patch.object(agent.time, "sleep"))
-        self.addCleanup(lambda: self.assertGreater(transport.call_count, 1))
-        return transport
-
-    def test_released_primary_auxiliary_and_retry_calls_share_bound_transport(self):
-        self.released_finding("# Synthetic bound-transport report\n", transport_guard=True)
-
     def assert_finding_artifacts(self, state, report_response):
         entry = next(iter(state["artifact_state"].values()))
         self.assertEqual(entry["status"], "written")
@@ -1004,56 +768,6 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
         patch_text = (findings / entry["patch_filename"]).read_text()
         self.assertIn('-    return True', patch_text)
         self.assertIn('+    return role == "admin"', patch_text)
-
-    def export_finding(self, export, state_path, state, result):
-        export = Path(export)
-        state_dir = export / "evidence" / "native-state" / state_path.parent.name
-        state_dir.mkdir(parents=True)
-        shutil.copyfile(state_path, state_dir / "state.json")
-        shutil.copytree(self.repo / "audit-findings", export / "evidence" / "audit-findings")
-        (export / "manifest.json").write_text(json.dumps({
-            "scope": state["scope"], "snapshotCommit": state["scope"]["commit"],
-            "audit": {"all": True}, "route": result["route"],
-            "sandbox": "bubblewrap", "bwrapVersion": "0.12.0",
-            "bwrapIdentity": bridge.BWRAP_IDENTITY,
-            "unshareIdentity": bridge.UNSHARE_IDENTITY,
-            "nono": result["sandbox"]["nonoIdentity"]["path"],
-            "nonoIdentity": result["sandbox"]["nonoIdentity"],
-            "nonoProfileIdentity": result["sandbox"]["nonoProfileIdentity"],
-            "sessionSandbox": "builtin"
-        }))
-        (export / "request.json").write_text(json.dumps({
-            "expectedRoute": result["route"], "sandbox": "bubblewrap",
-            "bwrapVersion": "0.12.0", "bwrapIdentity": bridge.BWRAP_IDENTITY,
-            "unshareIdentity": bridge.UNSHARE_IDENTITY,
-            "nono": result["sandbox"]["nonoIdentity"]["path"],
-            "nonoIdentity": result["sandbox"]["nonoIdentity"],
-            "nonoProfileIdentity": result["sandbox"]["nonoProfileIdentity"],
-            "sessionSandbox": "builtin",
-        }))
-        (export / "completed.json").write_text(json.dumps({
-            "exitCode": 0 if result["status"] == "completed" else 1,
-            "exitedAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-                "+00:00", "Z"),
-            "shutdown": "verified", "boundary": "bubblewrap-pidfd",
-        }))
-        (export / "evidence" / "native-result.json").write_text(json.dumps(result))
-
-    def test_released_finding_verification_patch_and_report(self):
-        self.released_finding("# Synthetic role access-control report\n\nSource judgment.\n")
-
-    def test_released_two_inventory_findings_preserve_unrecovered_expansion_loss(self):
-        self.released_finding("# Synthetic role access-control report\n", expansion="lost")
-
-    def test_released_analytical_retry_recovers_expansion_failure(self):
-        self.released_finding("# Synthetic role access-control report\n", expansion="recovered")
-
-    def test_released_out_of_scope_expansion_is_a_legitimate_discard(self):
-        self.released_finding("# Synthetic role access-control report\n", expansion="out-of-scope")
-
-    # Check real released input builders and HEAD-derived worktrees, not a
-    # substitute content loader. LLM and agent-loop boundaries remain offline.
-    # pylint: disable-next=too-many-locals,too-many-statements
     def assert_released_committed_config(self):
         original = self.git("show", "HEAD:swival.toml") + "\n"
         self.assertIn("committed-content-sentinel", original)
@@ -1140,112 +854,97 @@ print(json.dumps({"cold": True, "restored": True, "denied_access_counts": counts
         self.assertEqual(self.git("show-ref"), before[0])
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=no"), before[1])
 
-    def test_released_committed_config_is_auditable_while_runtime_copy_is_inert(self):
-        (self.repo / "swival.toml").write_text(
-            '# committed-content-sentinel\n[audit]\nforce_review=["code.py"]\n')
-        self.git("add", "swival.toml")
-        self.git("commit", "-m", "tracked config fixture")
-        (self.repo / "swival.toml").write_text("# Native audit runtime configuration is inert.\n")
-        self.assert_released_committed_config()
+    def test_released_finding_report(self):
+        self.released_finding("# Synthetic source-only report\n")
 
-    def test_expansion_observer_is_bounded_and_restored_on_error(self):
-        with patch.object(audit, "_ui_warning") as warning:
-            with self.assertRaisesRegex(bridge.NativeAuditError, "expansion evidence limit"):
-                with bridge._expansion_failures(1) as failures:
-                    audit._ui_warning(None, "expansion failed for code.py: private diagnostic")
-                    audit._ui_warning(None, "  code.py: 1/2 expansion(s) failed, "
-                                      "1 finding(s) retained")
-                    self.assertEqual(failures, [1])
-                    audit._ui_warning(None, "  other.py: 1/2 expansion(s) failed, "
-                                      "1 finding(s) retained")
-            self.assertIs(audit._ui_warning, warning)
+    def test_released_lost_expansion_is_visible_without_hooks(self):
+        self.released_finding("# Synthetic source-only report\n", expansion="lost")
 
-    def test_released_empty_report_exhausts_four_model_responses(self):
-        state = self.released_finding("")
-        self.assertEqual(state["metrics"]["empty_response_retries"], 4)
+    def test_released_recovered_expansion_is_not_loss(self):
+        self.released_finding("# Synthetic source-only report\n", expansion="recovered")
 
-    def test_released_whitespace_report_is_written_but_not_substantive(self):
-        self.released_finding(" \n\t")
+    def test_released_terminal_reviewer_errors_still_write_successful_artifacts(self):
+        self.released_finding("# Synthetic source-only report\n", recovery="reviewer-error")
 
-    def test_non_linux_bubblewrap_is_blocked_before_session_or_provider(self):
-        with patch.object(sys, "platform", "darwin"), patch(
-            "swival.session.Session",
-            side_effect=AssertionError("unsupported platform must not spawn")
-        ), self.assertRaisesRegex(bridge.NativeAuditError, "bubblewrap/platform"):
-            bridge.run_native(self.request())
+    def test_released_terminal_consolidation_error_still_writes_successful_artifacts(self):
+        self.released_finding("# Synthetic source-only report\n", recovery="consolidate-error")
 
-    def test_unstubbed_socket_connection_and_dns_fail_closed(self):
-        for function, args in ((socket.socket, ()),
-                               (socket.create_connection, (("offline.invalid", 443),)),
-                               (socket.getaddrinfo, ("offline.invalid", 443))):
-            with self.assertRaisesRegex(AssertionError, "provider/network forbidden"):
-                function(*args)
+    def test_released_exhausted_adjudication_format_repair_still_writes_artifacts(self):
+        for mode in ("malformed-reviewers", "malformed-consolidation"):
+            with self.subTest(mode=mode):
+                self.released_finding("# Synthetic source-only report\n", recovery=mode,
+                                      commit_source=mode == "malformed-reviewers")
+                shutil.rmtree(self.repo / ".swival")
+                shutil.rmtree(self.repo / "audit-findings")
 
-    def test_native_empty_scope_does_not_initialize_session_or_provider(self):
-        self.assertTrue(callable(getattr(bridge, "run_native", None)))
-        request = self.request()
-        request["audit"]["paths"] = ["missing.py"]
-        with patch("swival.session.Session",
-                   side_effect=AssertionError("no Session for empty scope")):
-            result = bridge.run_native(request)
-        self.assertEqual(result["status"], "empty_scope")
+    def test_released_successful_adjudication_format_repair_writes_artifacts(self):
+        for mode in ("repaired-reviewers", "repaired-consolidation", "reviewer-retry-recovered"):
+            with self.subTest(mode=mode):
+                self.released_finding("# Synthetic source-only report\n", recovery=mode,
+                                      commit_source=mode == "repaired-reviewers")
+                shutil.rmtree(self.repo / ".swival")
+                shutil.rmtree(self.repo / "audit-findings")
 
-    def test_native_verifier_and_patch_inherit_restricted_parent_modes(self):
-        session = Session(base_dir=str(self.repo), files="some", commands="none",
-                          network="provider-only", no_instructions=True, no_skills=True,
-                          memory=False, history=False,
-                          subagents=False, lifecycle_enabled=False)
-        with patch.object(agent, "resolve_provider", return_value=(
-            "offline-model", None, None, 128000, {"provider": "lmstudio"}
-        )), patch("swival.sandbox_nono.check_wrapper_available"), patch(
-            "swival.sandbox_nono.build_block_net_wrapper", return_value=["offline-nono"]
-        ):
-            session._setup()
-        state = session._make_per_run_state(system_content="offline")
-        context = session._make_input_context(state)
-        isolated = make_isolated_loop_kwargs(context, self.root / "worktree",
-                                            files_mode=None, network_mode=None)
-        self.assertEqual(isolated["files_mode"], "some")
-        self.assertEqual(isolated["network_mode"], "provider-only")
-        self.assertFalse(isolated["shell_allowed"])
-        self.assertEqual(isolated["command_policy"].mode, "none")
-        self.assertNotIn("subagent_manager", isolated)
-        session.close()
+    def test_released_triage_promotion_preserves_full_deep_review(self):
+        self.released_finding("# Synthetic source-only report\n", recovery="triage-promoted")
 
+
+def zero_finding_reply(captured):
+    """Bind each CLI run's request capture without sharing mutable defaults."""
+    def completion(_api, model, _messages, *_args, **kwargs):
+        captured.append((kwargs["provider"], model))
+        text = audit._PHASE1_WORKED_EXAMPLE if len(captured) == 1 else "@@ none @@"
+        return {"role": "assistant", "content": text}, "stop", False, 0, None
+    return completion
+
+
+def synthetic_jwt():
+    claims = {"exp": 10000,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "synthetic-account"}}
+    encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"synthetic.{encoded}.synthetic"
+
+
+def expansion_response(phase, text, messages, expansion, failed_attempts):
+    """Stub expansion outcomes while leaving native parsing and retries intact."""
+    if phase == "finding" and expansion in ("lost", "out-of-scope"):
+        text += ("\n@@ finding @@\ntitle: Second inventory finding\n"
+                 "severity: high\nlocation: code.py:3\n"
+                 "attacker: another caller\ntrigger: another non-admin role\n"
+                 "impact: role access control fails open\nclaim: second inventory claim")
+    if phase == "expansion":
+        second = "Title: Second inventory finding" in messages[-1]["content"]
+        if ((expansion == "lost" and second)
+                or (expansion == "recovered" and not failed_attempts)):
+            failed_attempts.append(True)
+            raise RuntimeError("private expansion diagnostic must not enter evidence")
+        if expansion == "out-of-scope" and second:
+            text = text.replace("type: security_control_failure", "type: out-of-scope")
+    return text
 
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--export-finding":
-        fixture = NativeEntryTests("test_released_finding_verification_patch_and_report")
+        fixture = NativeEntryTests("test_released_finding_report")
         try:
             fixture.setUp()
-            reports = {"complete": "# Synthetic role access-control report\n",
-                       "empty": "", "whitespace": " \n\t"}
-            mode = sys.argv[3]
-            fixture.released_finding(reports.get(mode, reports["complete"]), export=sys.argv[2],
-                                     expansion=mode if mode in ("lost", "recovered", "out-of-scope")
-                                     else "complete")
+            reports = {"complete": "# Synthetic report\n", "empty": "", "whitespace": " \n\t"}
+            export_mode = sys.argv[3]
+            fixture.released_finding(reports.get(export_mode, reports["complete"]),
+                export=sys.argv[2], expansion=(export_mode if export_mode in (
+                    "lost", "recovered", "out-of-scope") else "complete"),
+                recovery=(export_mode if export_mode in ("reviewer-error", "consolidate-error",
+                    "malformed-reviewers", "malformed-consolidation", "repaired-reviewers",
+                    "repaired-consolidation", "reviewer-retry-recovered", "triage-promoted")
+                    else "complete"))
         finally:
             fixture.doCleanups()
     elif len(sys.argv) == 3 and sys.argv[1] == "--check-content":
-        fixture = NativeEntryTests(
-            "test_released_committed_config_is_auditable_while_runtime_copy_is_inert")
+        fixture = NativeEntryTests("test_released_finding_report")
         try:
             fixture.setUp()
             fixture.repo = Path(sys.argv[2])
             fixture.assert_released_committed_config()
             print("Released committed config phases passed")
-        finally:
-            fixture.doCleanups()
-    elif sys.argv[1:] == ["--run-finding"]:
-        fixture = NativeEntryTests("test_released_finding_verification_patch_and_report")
-        try:
-            fixture.setUp()
-            incoming = json.loads(sys.stdin.read(64 * 1024))
-            fixture.repo = Path(incoming["snapshot"])
-            fixture.evidence = Path(incoming["evidence"])
-            fixture.request = lambda: incoming
-            fixture.released_finding("# Synthetic role access-control report\n",
-                                     expansion="lost", commit_source=False)
         finally:
             fixture.doCleanups()
     else:

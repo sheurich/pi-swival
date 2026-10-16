@@ -117,8 +117,20 @@ describe("test peer bootstrap", () => {
 	it("reports every missing required peer", async () => {
 		const root = tempDir("missing peer");
 		const host = packageAt(root, "@earendil-works/pi-coding-agent");
-		const { resolvePeerPackages } = await import("../scripts/test-peer-bootstrap.mjs");
+		const { REQUIRED_PEERS, resolvePeerPackages } = await import("../scripts/test-peer-bootstrap.mjs");
+		const missingPeers = REQUIRED_PEERS.filter((peer) => peer !== "@earendil-works/pi-coding-agent");
+		for (const name of missingPeers) {
+			const directory = packageAt(root, name);
+			writeFileSync(join(directory, "package.json"), JSON.stringify({ name, exports: {} }));
+		}
 
-		await expect(resolvePeerPackages(host)).rejects.toThrow("Missing Pi host peers");
+		const failure = await resolvePeerPackages(host).then(() => "", (error) => String(error));
+		expect(failure).toContain("Missing Pi host peers");
+		for (const name of missingPeers) expect(failure).toContain(name);
+		for (const name of missingPeers) packageAt(root, name, true);
+		const resolved = await resolvePeerPackages(host);
+		for (const name of REQUIRED_PEERS) {
+			expect(resolved[name]).toBe(realpathSync(join(root, "node_modules", ...name.split("/"))));
+		}
 	});
 });

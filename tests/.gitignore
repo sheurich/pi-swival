@@ -1,4 +1,5 @@
 node_modules/
 .venv/
 __pycache__/
+.scratch/
 # The committed package-lock.json makes the standalone test harness reproducible.

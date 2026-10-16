@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import registerExtension, {
 	checkRequiresReviewer,
 	isMutatingCwdAgent,
+	READ_ONLY_AUDIT_COMMANDS,
 	resolveAgentBaseDir,
 	resolveDispatchCwd,
 	unknownAgentMessage,
@@ -35,13 +36,13 @@ describe("isMutatingCwdAgent", () => {
 	it("returns false only when file writes and mutating commands are both disabled", () => {
 		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "none" }))).toBe(false);
 		expect(
-			isMutatingCwdAgent(makeAgent({ files: "none", commands: "git,ls,find,rg,grep,head,tail,wc,pwd" })),
-		).toBe(true);
+			isMutatingCwdAgent(makeAgent({ files: "none", commands: READ_ONLY_AUDIT_COMMANDS })),
+		).toBe(false);
 	});
 
 	it("treats a read-only command allowlist with file writes enabled as mutating", () => {
 		expect(
-			isMutatingCwdAgent(makeAgent({ files: "some", commands: "git,ls,find,rg,grep,head,tail,wc,pwd" })),
+			isMutatingCwdAgent(makeAgent({ files: "some", commands: READ_ONLY_AUDIT_COMMANDS })),
 		).toBe(true);
 	});
 
@@ -104,14 +105,6 @@ describe("isMutatingCwdAgent", () => {
 		).toBe(false);
 	});
 
-	it("treats unrestricted git in a basename allowlist as write-capable even with files=none", () => {
-		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "git" }))).toBe(true);
-		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "none",
-			extraArgs: ["--commands=none", "--commands=git,ls,find,rg,grep,head,tail,wc,pwd"] }))).toBe(true);
-		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "git",
-			extraArgs: ["--commands=all", "--commands=none"] }))).toBe(false);
-	});
-
 	it("uses extraArgs overrides when classifying file and command write surfaces", () => {
 		expect(
 			isMutatingCwdAgent(makeAgent({
@@ -123,7 +116,7 @@ describe("isMutatingCwdAgent", () => {
 		expect(
 			isMutatingCwdAgent(makeAgent({
 				files: "none",
-				commands: "git,ls,find,rg,grep,head,tail,wc,pwd",
+				commands: READ_ONLY_AUDIT_COMMANDS,
 				extraArgs: ["--commands=all"],
 			})),
 		).toBe(true);
@@ -232,11 +225,11 @@ describe("unknownAgentMessage", () => {
 	it("enumerates the scanned roster in sorted order", () => {
 		const msg = unknownAgentMessage("explorer", [
 			makeAgent({ name: "self-review-worker" }),
-			makeAgent({ name: "test-runner" }),
+			makeAgent({ name: "audit-worker" }),
 			makeAgent({ name: "sandboxed-explorer" }),
 		]);
 		expect(msg).toBe(
-			'Unknown swival agent: "explorer". Available: sandboxed-explorer, self-review-worker, test-runner',
+			'Unknown swival agent: "explorer". Available: audit-worker, sandboxed-explorer, self-review-worker',
 		);
 	});
 

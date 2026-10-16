@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { isDeepStrictEqual } from "node:util";
 import type { RunMeta } from "./index.js";
+import { canonicalFuturePath } from "./paths.js";
 
 export interface NativeAuditOptions {
 	paths: string[];
@@ -24,6 +25,7 @@ const NATIVE_FIELDS = new Set([
 ]);
 
 export function validateNativeAuditParams(params: Record<string, unknown>): NativeAuditOptions {
+	if (params.async === true) throw new Error("Native async is unsupported; native audits are synchronous.");
 	for (const key of Object.keys(params)) {
 		if (!NATIVE_FIELDS.has(key)) throw new Error(`Native audit cannot be combined with ${key}.`);
 	}
@@ -55,6 +57,249 @@ export function validateNativeAuditParams(params: Record<string, unknown>): Nati
 		patchMaxTurns: integer("patchMaxTurns", 50, 100) };
 }
 
+export function buildNativeAuditArgs(snapshot: string, route: Record<string, any>, audit: NativeAuditOptions): string[] {
+	const args = ["--base-dir", snapshot, "--sandbox", "builtin", "--network", "provider-only",
+		"--commands", "none", "--files", "some", "--oneshot-commands",
+		"--no-sandbox-auto-session", "--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp",
+		"--no-a2a", "--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+		"--provider", route.provider, "--model", route.model, "--report", path.join(snapshot, "native-cli-report.json")];
+	if (route.endpoint != null) args.push("--base-url", route.endpoint);
+	if (route.reasoningEffort != null) args.push("--reasoning-effort", route.reasoningEffort);
+	for (const [key, value] of Object.entries(route.options ?? {})) {
+		if (value != null) args.push(`--${key.replaceAll("_", "-")}`, String(value));
+	}
+	const request = ["/audit", ...audit.paths, ...(audit.all ? ["--all"] : []), "--workers", String(audit.workers),
+		"--patch-max-turns", String(audit.patchMaxTurns)].join(" ");
+	return [...args, "--", request];
+}
+
+/** The auth directory is an OS-runtime grant, never a Swival model-tool root. */
+export function buildNativeAgentfsArgs(cli: string, snapshot: string, authDirectory: string | undefined,
+	session: string, swivalArgs: string[]): string[] {
+	return ["run", "--no-default-allows", "--allow", snapshot, ...(authDirectory ? ["--allow", authDirectory] : []),
+		"--session", session, "--", cli, ...swivalArgs];
+}
+
+export interface NativeAuthStore { directory: string; filename: string }
+
+/** Compare directory identities as well as spelling on case-insensitive filesystems. */
+async function pathIsWithin(location: string, root: string): Promise<boolean> {
+	let identity;
+	try { identity = await fs.stat(root); }
+	catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+	for (let current = path.resolve(location); ; current = path.dirname(current)) {
+		if (current === path.resolve(root)) return true;
+		if (identity) {
+			try {
+				const stat = await fs.stat(current);
+				if (stat.dev === identity.dev && stat.ino === identity.ino) return true;
+			} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+		}
+		if (path.dirname(current) === current) return false;
+	}
+}
+
+/** Validate metadata only; never read, copy, or export an authentication record. */
+export async function prepareNativeAuthStore(input: NodeJS.ProcessEnv,
+	forbiddenRoots: string[]): Promise<NativeAuthStore> {
+	const home = input.HOME;
+	const filename = input.CHATGPT_AUTH_FILE ?? "auth.json";
+	if (!home || !path.isAbsolute(home) || path.normalize(home) !== home ||
+		!(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/).test(filename)) {
+		throw new Error("Native auth requires an absolute home and a safe auth filename basename.");
+	}
+	const directory = input.CHATGPT_TOKEN_DIR ?? path.join(home, ".config", "litellm", "chatgpt");
+	const relative = path.relative(home, directory);
+	if (!path.isAbsolute(directory) || path.normalize(directory) !== directory || directory.length > 4096 || directory.split(path.sep).length > 64 ||
+		/[\x00-\x1f\x7f\\]/.test(directory) || !relative || path.isAbsolute(relative) ||
+		relative.split(path.sep).includes("..") ||
+		[home, path.join(home, ".config"), path.join(home, ".config", "litellm")].includes(directory)) {
+		throw new Error("Native auth requires a dedicated directory inside home, outside source and artifact scope.");
+	}
+	for (const broad of [home, path.join(home, ".config"), path.join(home, ".config", "litellm")]) {
+		if (broad.toLowerCase() === directory.toLowerCase() || await pathIsWithin(broad, directory)) {
+			throw new Error("Native auth refuses a broad directory grant.");
+		}
+	}
+	// Reserve future runtime state before creating an otherwise empty auth store.
+	const authPath = await canonicalFuturePath(directory);
+	const reservedRoots = [...forbiddenRoots, path.join(home, ".agentfs"), path.join(home, ".pi"),
+		input.XDG_CACHE_HOME ?? path.join(home, ".cache"), ...(input.TMPDIR ? [input.TMPDIR] : []),
+		...agentfsDarwinWriteRoots(home, "")];
+	for (const root of reservedRoots) {
+		const reserved = await canonicalFuturePath(root);
+		const foldedAuth = authPath.toLowerCase(); const foldedRoot = reserved.toLowerCase();
+		if (await pathIsWithin(authPath, reserved) || await pathIsWithin(reserved, authPath) ||
+			foldedAuth === foldedRoot || foldedAuth.startsWith(foldedRoot + path.sep) ||
+			foldedRoot.startsWith(foldedAuth + path.sep)) {
+			throw new Error("Native auth directory overlaps source, artifact, or runtime scope.");
+		}
+	}
+	let current = path.parse(directory).root;
+	for (const component of directory.slice(current.length).split(path.sep)) {
+		current = path.join(current, component);
+		let stat;
+		try { stat = await fs.lstat(current); }
+		catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT" ||
+				!(current.startsWith(home + path.sep))) throw error;
+			await fs.mkdir(current, { mode: 0o700 });
+			stat = await fs.lstat(current);
+		}
+		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Native auth refuses symlinked or non-directory paths.");
+		if ((current === home || current.startsWith(home + path.sep)) &&
+			(stat.uid !== process.getuid?.() || (stat.mode & 0o022))) {
+			throw new Error("Native auth directory ownership or write permissions are unsafe.");
+		}
+	}
+	const entries = await fs.opendir(directory);
+	try {
+		for await (const entry of entries) {
+			if (entry.name !== filename) throw new Error("Native auth requires a dedicated single-store directory.");
+			const stat = await fs.lstat(path.join(directory, filename));
+			if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 65536 ||
+				stat.uid !== process.getuid?.() || (stat.mode & 0o022) || !(stat.mode & 0o200)) {
+				throw new Error("Native auth refuses ambiguous auth file metadata.");
+			}
+		}
+	} finally { await entries.close().catch(() => {}); }
+	return { directory, filename };
+}
+
+/** Forward only the selected upstream credential interface, never execution hooks. */
+export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, provider?: string): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	const credentials = provider === "chatgpt" ? ["CHATGPT_TOKEN_DIR", "CHATGPT_AUTH_FILE", "CHATGPT_API_KEY"] :
+		provider === "openrouter" ? ["OPENROUTER_API_KEY"] : [];
+	for (const key of ["HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", ...credentials]) {
+		if (input[key] !== undefined) env[key] = input[key];
+	}
+	return { ...env, PATH: searchPath, LITELLM_MODE: "PRODUCTION", LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1",
+		NO_COLOR: "1", TERM: "dumb", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
+		GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };
+}
+
+/** Preflight needs credential/requirement presence, never credential values or auth paths. */
+export function nativePreflightEnvironment(input: NodeJS.ProcessEnv, searchPath: string): NodeJS.ProcessEnv {
+	const env = nativeEnvironment(input, searchPath);
+	for (const key of Object.keys(input)) {
+		if (["http_proxy", "https_proxy", "all_proxy"].includes(key.toLowerCase()) ||
+			["USE_LITELLM_PROXY", "SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD",
+				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
+				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE"].includes(key)) {
+			env[key] = input[key] ? "present" : "";
+		}
+	}
+	return env;
+}
+
+export interface NativeRoute {
+	version: 2;
+	runtime: { swival: string; litellm: string };
+	provider: string;
+	model: string;
+	endpoint: string | null;
+	profile: string | null;
+	reasoningEffort: string | null;
+	options: Record<string, number | null>;
+	selection: { profileSource: "active" | "explicit" | null; explicitFields: string[] };
+	reportIdentity: { provider: string; model: string };
+}
+
+const routeIdentifier = (value: unknown, limit = 160): value is string => typeof value === "string" &&
+	value.length > 0 && value.length <= limit && /^[A-Za-z0-9][A-Za-z0-9_./:-]*$/.test(value) &&
+	!/[A-Za-z0-9]{40,}|(?:^|\/)\.\.?(?:\/|$)/.test(value);
+const routeOptions = new Set(["max_output_tokens", "max_turns", "provider_timeout", "retries",
+	"temperature", "top_p", "seed", "max_context_tokens"]);
+const explicitRouteFields = new Set(["profile", "provider", "model", "baseUrl", "reasoningEffort",
+	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout"]);
+const routeFailure = () => new Error("Native audit configuration preflight failed: invalid or unsupported metadata. No native worker/provider was started.");
+
+export function parseNativeRoute(value: unknown): NativeRoute {
+	if (!isPlainRecord(value) || value.version !== 2 ||
+		!hasOnlyFields(value, new Set(["version", "runtime", "provider", "model", "endpoint", "profile",
+			"reasoningEffort", "options", "selection", "reportIdentity"])) ||
+		!isDeepStrictEqual(value.runtime, { swival: "1.0.46", litellm: "1.103.4" }) ||
+		!routeIdentifier(value.provider, 40) || !routeIdentifier(value.model) ||
+		!(value.profile === null || routeIdentifier(value.profile, 80)) ||
+		!(value.reasoningEffort === null || ["none", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value.reasoningEffort)) ||
+		!isPlainRecord(value.options) || !isPlainRecord(value.selection) || !isPlainRecord(value.reportIdentity)) throw routeFailure();
+	if (value.endpoint !== null) {
+		if (typeof value.endpoint !== "string" || value.endpoint.length > 512 ||
+			!/^https?:\/\/[A-Za-z0-9.:[\]-]+(?::[0-9]+)?(?:\/[A-Za-z0-9_./-]*)?$/.test(value.endpoint) ||
+			/[A-Za-z0-9]{40,}/.test(value.endpoint)) throw routeFailure();
+		try {
+			const endpoint = new URL(value.endpoint);
+			if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash ||
+				(endpoint.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname))) throw routeFailure();
+		} catch { throw routeFailure(); }
+	}
+	const selection = value.selection;
+	if (!hasOnlyFields(selection, new Set(["profileSource", "explicitFields"])) ||
+		![null, "active", "explicit"].includes(selection.profileSource) ||
+		!Array.isArray(selection.explicitFields) || selection.explicitFields.length > explicitRouteFields.size ||
+		selection.explicitFields.some((field: unknown) => typeof field !== "string" || !explicitRouteFields.has(field)) ||
+		new Set(selection.explicitFields).size !== selection.explicitFields.length ||
+		(value.profile === null) !== (selection.profileSource === null) ||
+		(selection.profileSource === "explicit") !== selection.explicitFields.includes("profile") ||
+		!hasOnlyFields(value.reportIdentity, new Set(["provider", "model"])) ||
+		value.reportIdentity.provider !== value.provider || value.reportIdentity.model !== value.model) throw routeFailure();
+	const options: Record<string, number | null> = {};
+	for (const [key, option] of Object.entries(value.options)) {
+		if (!routeOptions.has(key) || !(option === null || typeof option === "number" && Number.isFinite(option) && Math.abs(option) <= Number.MAX_SAFE_INTEGER)) throw routeFailure();
+		options[key] = option;
+	}
+	return { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: value.provider,
+		model: value.model, endpoint: value.endpoint, profile: value.profile, reasoningEffort: value.reasoningEffort,
+		options, selection: { profileSource: selection.profileSource, explicitFields: [...selection.explicitFields] },
+		reportIdentity: { provider: value.reportIdentity.provider, model: value.reportIdentity.model } };
+}
+
+const preflightReasons: Record<string, string> = {
+	PROFILE_UNAVAILABLE: "Selected profile is unavailable; no fallback.",
+	ROUTE_INCOMPLETE: "Configured provider and model are required; no implicit route or fallback.",
+	CREDENTIAL_INTERFACE_UNSUPPORTED: "Selected route needs an unsupported credential interface or grant.",
+	CREDENTIAL_UNAVAILABLE: "Selected provider credential is unavailable; no fallback.",
+	MODEL_REPLACEMENT_UNCONTROLLABLE: "This runtime can replace the selected model after model-not-found; no launch.",
+	ROUTE_SELECTOR_UNSUPPORTED: "Automatic or multi-model selection is unsupported; select a concrete model.",
+	COMMAND_EXECUTION_REQUIRED: "Selected provider requires command execution, incompatible with commands-none.",
+	CONFIG_INVALID: "Native configuration is invalid or contains unknown requirements.",
+	RUNTIME_UNSUPPORTED: "Native runtime is unsupported; require Swival 1.0.46 and LiteLLM 1.103.4.",
+	TRANSPORT_REQUIREMENT_UNSUPPORTED: "Unsupported native transport proxy requirements.",
+	ENDPOINT_REQUIREMENT_UNSUPPORTED: "Selected or ambient endpoint requirements are unsupported; no fallback.",
+	PROJECT_ROUTING_UNSUPPORTED: "Project-supplied native routing is unsupported.",
+};
+const policyFields = new Set(["encrypt_secrets", "secret_shield", "llm_filter", "extra_body", "user_agent", "prompt_cache",
+	"sanitize_thinking", "show_thinking", "sandbox_strict_read", "sandbox_session", "lifecycle_fail_closed",
+	"reasoning_effort_all_phases", "retries_all_phases", "retries", "network", "files", "sandbox", "max_context_tokens",
+	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity"]);
+
+export function parseNativePreflight(output: string, success: boolean): { route: NativeRoute; scope?: unknown } {
+	let value: unknown;
+	try { value = JSON.parse(output); } catch { throw routeFailure(); }
+	if (isPlainRecord(value) && value.ok === false && hasOnlyFields(value, new Set(["ok", "reason", "field"]))) {
+		let message = typeof value.reason === "string" && Object.hasOwn(preflightReasons, value.reason) ? preflightReasons[value.reason] : undefined;
+		if (value.reason === "POLICY_NOT_PROPAGATED" && typeof value.field === "string" && policyFields.has(value.field)) {
+			message = `Required policy ${value.field} is not propagated to every native phase.`;
+		} else if (value.field !== undefined && !["api_key", ...policyFields].includes(value.field)) message = undefined;
+		if (message) throw new Error(`Native audit configuration preflight failed: ${message} No native worker/provider was started.`);
+		throw routeFailure();
+	}
+	if (!success || !isPlainRecord(value)) throw routeFailure();
+	const { scope, ...route } = value;
+	return { route: parseNativeRoute(route), ...(scope === undefined ? {} : { scope }) };
+}
+
+function nativePreflight(executable: string, cwd: string, request: string, env: NodeJS.ProcessEnv) {
+	return new Promise<{ route: NativeRoute; scope?: unknown }>((resolve, reject) => {
+		const child = execFile(executable, ["-I", "-B", path.join(scriptRoot, "native_audit.py"), "--preflight"],
+			{ cwd, env, timeout: 10_000, maxBuffer: 64 * 1024, encoding: "utf8", shell: false }, (error, stdout) => {
+				try { resolve(parseNativePreflight(stdout, !error)); } catch (failure) { reject(failure); }
+			});
+		child.stdin?.on("error", () => {}); child.stdin?.end(request);
+	});
+}
+
 /** Fixed Git plumbing only. No checkout, archive, source hook, filter, or lazy fetch. */
 export function gitEnvironment(): NodeJS.ProcessEnv {
 	const env = { ...process.env };
@@ -82,6 +327,7 @@ const runGit = (trusted: TrustedGit, cwd: string, args: string[], input?: Buffer
 export interface SnapshotManifest {
 	sourceRoot: string;
 	sourceGitDir: string;
+	sourceWorktreeGitDir: string;
 	sourceCommit: string;
 	sourceTree: string;
 	snapshotCommit: string;
@@ -93,14 +339,39 @@ export async function sourceIdentity(cwd: string, trusted: TrustedGit) {
 	const git = (dir: string, args: string[]) => runGit(trusted, dir, args);
 	const sourceRoot = (await git(cwd, ["rev-parse", "--show-toplevel"])).toString().trim();
 	const sourceGitDir = (await git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).toString().trim();
-	return { sourceRoot: await fs.realpath(sourceRoot), sourceGitDir: await fs.realpath(sourceGitDir) };
+	const sourceWorktreeGitDir = (await git(cwd, ["rev-parse", "--absolute-git-dir"])).toString().trim();
+	return { sourceRoot: await fs.realpath(sourceRoot), sourceGitDir: await fs.realpath(sourceGitDir),
+		sourceWorktreeGitDir: await fs.realpath(sourceWorktreeGitDir) };
+}
+
+/** AgentFS v0.6.4 cli/src/sandbox/darwin.rs:98–157, commit 3a5ed2b88e5d. */
+export function agentfsDarwinWriteRoots(home: string, session: string): string[] {
+	return ["/private/tmp", "/tmp", "/var/tmp", "/private/var/folders", "/dev", "/private/var/db/mds",
+		path.join(home, "Library"), "/Library/Preferences", "/Library/Keychains",
+		path.join(home, ".agentfs", "run", session)];
+}
+
+export async function assertNativeSourceIsolation(protectedRoots: string[], writableRoots: string[]): Promise<void> {
+	const protectedPaths = await Promise.all(protectedRoots.map((root) => fs.realpath(root)));
+	for (const writable of writableRoots) {
+		const target = await canonicalFuturePath(writable);
+		for (const source of protectedPaths) {
+			if (await pathIsWithin(source, target) || await pathIsWithin(target, source)) {
+				throw new Error("Native source/Git overlaps an upstream built-in writable path. Use a repository outside AgentFS write exceptions.");
+			}
+		}
+	}
 }
 
 const secretPath = (file: string) => file.split("/").some((part) =>
 	/^\.env(?:\.|$)|\.(?:pem|key)$/i.test(part) || [".ssh", ".aws", ".gnupg", ".git-credentials"].includes(part));
-const unsafePath = (file: string) => /[\x00-\x1f\x7f\\]/.test(file) || path.isAbsolute(file) ||
-	file.split("/").some((part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git") ||
-	file === "audit-findings" || file.startsWith("audit-findings/") || file.startsWith(".swival/audit/");
+const unsafePath = (file: string) => {
+	const folded = file.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+	return /[\x00-\x1f\x7f\\]/.test(file) || path.isAbsolute(file) ||
+		file.split("/").some((part) => !part || part === "." || part === ".." || part.toLowerCase() === ".git") ||
+		["audit-findings", ".swival/audit", "native-cli-report.json"]
+			.some((reserved) => folded === reserved || folded.startsWith(reserved + "/"));
+};
 
 export async function createCommittedSnapshot(cwd: string, destination: string,
 	selectedGit?: TrustedGit): Promise<SnapshotManifest> {
@@ -108,8 +379,8 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 	const git = (dir: string, args: string[], input?: Buffer | string) => runGit(trusted, dir, args, input);
 	const identity = await sourceIdentity(cwd, trusted);
 	const dest = path.resolve(destination);
-	for (const source of [identity.sourceRoot, identity.sourceGitDir]) {
-		if (dest === source || dest.startsWith(source + path.sep) || source.startsWith(dest + path.sep)) {
+	for (const source of [identity.sourceRoot, identity.sourceGitDir, identity.sourceWorktreeGitDir]) {
+		if (await pathIsWithin(dest, source) || await pathIsWithin(source, dest)) {
 			throw new Error("Native audit snapshot must be outside source checkout and Git metadata.");
 		}
 	}
@@ -169,80 +440,20 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 }
 
 export interface NativeRuntime {
-	python?: string; unshare?: string; bwrap?: string; nono?: string; git?: string; searchPath?: string;
+	python?: string;
+	cli?: string;
+	agentfs?: string;
+	nono?: string;
+	git?: string;
+	searchPath?: string;
+	environment?: NodeJS.ProcessEnv;
 }
-const PINNED_UNSHARE_IDENTITY = Object.freeze({
-	path: "/usr/bin/unshare",
-	version: "unshare from util-linux 2.41.5",
-	package: "util-linux",
-	packageVersion: "2.41.5-0+deb13u1",
-	architecture: "arm64",
-	sha256: "285119fd3989039d50f8904b619b2abb8b795cb56753eb0235c8c031eb880a21",
-});
-const PINNED_BWRAP_IDENTITY = Object.freeze({
-	path: "/usr/bin/bwrap",
-	version: "bubblewrap 0.12.0",
-	package: "bubblewrap",
-	packageVersion: "0.12.0-1~deb13u1",
-	architecture: "arm64",
-	sha256: "b3b829e18a7d43ee589dc37e351cb9480ff7301b493d8227b8c754294638b976",
-});
-// Reviewed regular member of the authenticated 0.79.0 ARM64 GNU release archive
-// with SHA-256 c4a4f4b9ae318574d30d352127a34dcc919c4d6682ee8fbd30bb8d2bd2e0e85d.
-const PINNED_NONO_ARTIFACT_IDENTITY = Object.freeze({
-	version: "0.79.0",
-	architecture: "aarch64-unknown-linux-gnu",
-	bytes: 26141064,
-	sha256: "667fdaea93f77c9f8f45b04a80f4e2fb7e7d7fb104fa1da189ea38f41fbcf57b",
-});
-const pinnedNonoIdentity = (value: unknown, executable?: string): value is Record<string, unknown> => {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const identity = value as Record<string, unknown>;
-	if (Object.keys(identity).sort().join(",") !== "architecture,bytes,path,sha256,version") return false;
-	if (typeof identity.path !== "string" || !path.isAbsolute(identity.path) ||
-		path.resolve(identity.path) !== identity.path || (executable !== undefined && identity.path !== executable)) return false;
-	return Object.entries(PINNED_NONO_ARTIFACT_IDENTITY).every(([key, expected]) => identity[key] === expected);
-};
-// Nono 0.79.0 copies these reviewed jedisct1/swival@0.1.2 subjects
-// byte-for-byte. Native evidence accepts no alternate policy serialization.
-const PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES = Object.freeze({
-	manifest: Object.freeze({ bytes: 968,
-		sha256: "c4873794dd83781a1309f4bbb5ca37c285d19728dcfc5be4c90edc748165dbd2" }),
-	profile: Object.freeze({ bytes: 1747,
-		sha256: "719a0a2396377cc9d05b2a9d4d2f39d8c0f07ba5080ff96e1619806794bf338c" }),
-});
-const PINNED_NONO_DEFAULT_POLICY_IDENTITY = Object.freeze({
-	name: "default",
-	source: "authenticated-nono-0.79.0-embedded-policy",
-	extends: Object.freeze([]),
-	nonoSha256: PINNED_NONO_ARTIFACT_IDENTITY.sha256,
-});
-const localNonoFileIdentity = (value: unknown, expectedPath: string,
-	expected: Readonly<{ bytes: number; sha256: string }>): boolean => {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const identity = value as Record<string, unknown>;
-	return Object.keys(identity).sort().join(",") === "bytes,path,sha256" && identity.path === expectedPath &&
-		identity.bytes === expected.bytes && identity.sha256 === expected.sha256;
-};
-const localNonoProfileIdentity = (value: unknown): value is Record<string, unknown> => {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-	const identity = value as Record<string, any>;
-	if (Object.keys(identity).sort().join(",") !== "config,defaultPolicy,manifest,pack,profile" ||
-		typeof identity.config !== "string" || typeof identity.pack !== "string" ||
-		!path.isAbsolute(identity.config) || path.resolve(identity.config) !== identity.config ||
-		identity.pack !== path.join(identity.config, "nono", "packages", "jedisct1", "swival")) return false;
-	return localNonoFileIdentity(identity.manifest, path.join(identity.pack, "package.json"),
-		PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES.manifest) &&
-		localNonoFileIdentity(identity.profile, path.join(identity.pack, "profiles", "swival.json"),
-			PINNED_NONO_PROFILE_ARTIFACT_IDENTITIES.profile) &&
-		isDeepStrictEqual(identity.defaultPolicy, PINNED_NONO_DEFAULT_POLICY_IDENTITY);
-};
 const scriptRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../scripts");
 export interface NativeTerminal {
 	exitCode: number;
 	exitedAt: string;
 	shutdown: "not-started" | "verified" | "unverified";
-	boundary?: "bubblewrap-pidfd";
+	boundary?: "agentfs-cli";
 	stopped?: string;
 	shutdownFailure?: string;
 	preservationFailure?: string;
@@ -251,20 +462,15 @@ export interface NativeTerminal {
 	retainedResources?: string[];
 }
 export interface NativeOwnership {
-	/** Authority from a live ChildProcess or its inherited IPC channel, never disk. */
+	/** Live child process-group authority only. Never reconstruct it from disk. */
 	signal: (signal: NodeJS.Signals | 0) => unknown;
-	/** Live trusted supervisor proof, never a persisted PID or payload report. */
-	verify?: () => Promise<boolean>;
-}
-interface NativeFinalizationOptions {
-	runDir: string;
-	ownership?: NativeOwnership;
-	startupBarrier?: () => Promise<void>;
-	closeLogs?: (shutdown: NativeTerminal["shutdown"]) => Promise<void> | void;
+	verify: () => Promise<boolean>;
 }
 const nativeLifecycle = createRequire(import.meta.url)(path.join(scriptRoot, "native-audit-lifecycle.cjs")) as {
 	readNativeTerminal: (runDir: string) => NativeTerminal | undefined;
-	finalizeNativeAudit: (options: NativeFinalizationOptions,
+	regularBytes: (root: string, target: string, limit: number) => Buffer;
+	finalizeNativeAudit: (options: { runDir: string; ownership?: NativeOwnership;
+		closeLogs?: (shutdown: string) => Promise<void>; cancellationReason?: () => string | undefined },
 		outcome: { exitCode: number; stopped?: string }) => Promise<NativeTerminal>;
 };
 export const { readNativeTerminal, finalizeNativeAudit } = nativeLifecycle;
@@ -277,24 +483,49 @@ const executable = (name: string): string | undefined => {
 	return undefined;
 };
 
-/** Capture installation paths at registration, never from model arguments. */
+/** Capture installation paths and environment at registration, never from tool arguments. */
 export function captureNativeRuntime(configuredPython?: string): NativeRuntime {
+	const cli = executable("swival");
 	let python = configuredPython;
-	if (!python) {
-		const entry = executable("swival");
-		if (entry) {
-			try {
-				const contents = fsSync.readFileSync(entry, "utf8");
+	if (!python && cli) {
+		try {
+			const stat = fsSync.statSync(cli);
+			if (stat.isFile() && stat.size < 64 * 1024) {
+				const contents = fsSync.readFileSync(cli, "utf8");
 				if (contents.includes("from swival.agent import main")) python = contents.split("\n")[0].slice(2);
-			} catch { /* unavailable installation */ }
-		}
+			}
+		} catch { /* unavailable installation */ }
 	}
 	if (!python || !path.isAbsolute(python) || !/^python(?:\d+(?:\.\d+)*)?$/.test(path.basename(python))) python = undefined;
-	const unshareEntry = executable("unshare");
-	let unshare: string | undefined;
-	try { if (unshareEntry) unshare = fsSync.realpathSync(unshareEntry); } catch { /* unavailable installation */ }
-	return { python, unshare, bwrap: executable("bwrap"), nono: executable("nono"),
-		git: executable("git"), searchPath: process.env.PATH };
+	return { python, cli, agentfs: executable("agentfs"), nono: executable("nono"), git: executable("git"),
+		searchPath: process.env.PATH, environment: { ...process.env } };
+}
+
+/** Check every symlink hop before Git or Python can load repository-controlled code. */
+async function assertTrustedRuntimePath(location: string, roots: string[]): Promise<void> {
+	const identities = await Promise.all(roots.map((root) => fs.stat(root)));
+	let current = path.parse(location).root;
+	let pending = location.slice(current.length).split(path.sep);
+	let links = 0;
+	while (pending.length) {
+		const component = pending.shift()!;
+		if (!component || component === ".") continue;
+		if (component === "..") { current = path.dirname(current); continue; }
+		current = path.join(current, component);
+		if (roots.some((root) => current === root || current.startsWith(root + path.sep))) {
+			throw new Error("Native audit refuses repository-owned runtime paths.");
+		}
+		const stat = await fs.lstat(current);
+		if (identities.some((root) => stat.dev === root.dev && stat.ino === root.ino)) {
+			throw new Error("Native audit refuses repository-owned runtime paths.");
+		}
+		if (stat.isSymbolicLink()) {
+			if (++links > 40) throw new Error("Native runtime symlink limit exceeded.");
+			const target = await fs.readlink(current);
+			current = path.isAbsolute(target) ? path.parse(target).root : path.dirname(current);
+			pending = [...target.slice(path.isAbsolute(target) ? current.length : 0).split(path.sep), ...pending];
+		}
+	}
 }
 
 /** Validate startup selections without executing Git or any repository code. */
@@ -319,77 +550,72 @@ async function resolveTrustedGit(cwd: string, runtime: NativeRuntime): Promise<T
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 	}
-	const owned = (location: string) => roots.some((root) => location === root || location.startsWith(root + path.sep));
 	const search: string[] = [];
 	for (const entry of (runtime.searchPath ?? "").split(path.delimiter)) {
 		if (!path.isAbsolute(entry)) throw new Error("Native audit refuses relative executable search paths.");
-		if (owned(path.resolve(entry))) throw new Error("Native audit refuses repository-owned executable search paths.");
 		try {
-			const resolved = await fs.realpath(entry);
-			if (owned(resolved)) throw new Error("Native audit refuses repository-owned executable search paths.");
-			search.push(resolved);
+			await assertTrustedRuntimePath(entry, roots);
+			search.push(await fs.realpath(entry));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
+	await assertTrustedRuntimePath(runtime.git, roots);
 	const executablePath = await fs.realpath(runtime.git);
-	if (owned(path.resolve(runtime.git)) || owned(executablePath)) {
-		throw new Error("Native audit refuses repository-supplied Git executables.");
-	}
 	await fs.access(executablePath, fsSync.constants.X_OK);
 	if (!(await fs.stat(executablePath)).isFile()) throw new Error("Unsupported native Git executable.");
 	return { executable: executablePath, env: { ...gitEnvironment(), PATH: search.join(path.delimiter) } };
 }
 
-export async function canonicalFuturePath(target: string): Promise<string> {
-	let parent = path.resolve(target);
-	const suffix: string[] = [];
-	while (true) {
-		try { return path.join(await fs.realpath(parent), ...suffix.reverse()); }
-		catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			suffix.push(path.basename(parent));
-			const next = path.dirname(parent);
-			if (next === parent) throw error;
-			parent = next;
-		}
-	}
+
+export interface NativeAuditLaunch {
+	route: NativeRoute;
+	meta: RunMeta;
+	proc: ChildProcess;
+	completion: Promise<NativeTerminal>;
+	cancel: (reason?: string) => void;
 }
 
 export async function prepareNativeAudit(
 	cwd: string, params: Record<string, unknown>, audit: NativeAuditOptions, runtime: NativeRuntime,
 	artifactDir: string, runId: string, maxTimeoutMs: number, signal?: AbortSignal,
-): Promise<{ meta: RunMeta; proc: ChildProcess }> {
+): Promise<NativeAuditLaunch> {
 	const checkCancelled = () => { if (signal?.aborted) throw new Error("Native audit was cancelled before launch."); };
+	validateNativeAuditParams(params);
 	checkCancelled();
-	if (!runtime.python) throw new Error("Native audit requires a verifiable installed Swival Python interpreter.");
+	if (!runtime.python || !runtime.cli || !runtime.agentfs || !runtime.nono) {
+		throw new Error("Native audit requires installed Swival CLI, Python, AgentFS and nono. No fallback.");
+	}
 	const trustedGit = await resolveTrustedGit(cwd, runtime);
 	const identity = await sourceIdentity(cwd, trustedGit);
-	if (await fs.realpath(cwd) !== identity.sourceRoot) throw new Error("Native audit must start from the configured repository root cwd.");
-	const pinRuntime = async (bin: string | undefined, virtualenv = false) => {
-		if (!bin) return undefined;
-		if (!path.isAbsolute(bin)) throw new Error("Native audit requires absolute startup runtime executables.");
+	if (await fs.realpath(cwd) !== identity.sourceRoot) throw new Error("Native audit requires repository-root cwd.");
+	const protectedRoots = [identity.sourceRoot, identity.sourceGitDir, identity.sourceWorktreeGitDir];
+	const input = runtime.environment ?? process.env;
+	const session = `native-${randomBytes(16).toString("hex")}`;
+	if (!input.HOME || !path.isAbsolute(input.HOME)) throw new Error("Native audit requires an absolute home.");
+	if (process.platform === "darwin") {
+		await assertNativeSourceIsolation(protectedRoots, agentfsDarwinWriteRoots(input.HOME, session));
+	}
+	const pin = async (bin: string, virtualenv = false) => {
+		if (!path.isAbsolute(bin)) throw new Error("Native runtime paths must be absolute.");
+		await assertTrustedRuntimePath(bin, protectedRoots);
 		const target = await fs.realpath(bin);
-		// Python selects its virtualenv through the interpreter entry. Preserve
-		// that basename under a canonical parent, while validating its target.
 		const entry = path.join(await fs.realpath(path.dirname(bin)), path.basename(bin));
-		for (const location of [bin, path.resolve(bin), entry, target]) {
-			if ([identity.sourceRoot, identity.sourceGitDir].some((root) =>
-				location === root || location.startsWith(root + path.sep))) {
-				throw new Error("Native audit refuses repository-supplied runtime executables.");
-			}
-		}
 		await fs.access(entry, fsSync.constants.X_OK);
 		if (!(await fs.stat(entry)).isFile()) throw new Error("Unsupported native runtime executable.");
 		return virtualenv ? entry : target;
 	};
-	const python = (await pinRuntime(runtime.python, true))!;
-	const unshare = await pinRuntime(runtime.unshare);
-	const bwrap = await pinRuntime(runtime.bwrap);
-	const nono = await pinRuntime(runtime.nono);
+	const python = await pin(runtime.python, true);
+	const cli = await pin(runtime.cli);
+	const agentfs = await pin(runtime.agentfs);
+	const nono = await pin(runtime.nono);
+	const cliStat = await fs.stat(cli);
+	if (cliStat.size > 64 * 1024 || (await fs.readFile(cli, "utf8")).split("\n")[0] !== `#!${python}`) {
+		throw new Error("Native CLI must use the preflighted installed Python interpreter.");
+	}
 	const runDir = await canonicalFuturePath(artifactDir);
-	for (const source of [identity.sourceRoot, identity.sourceGitDir]) {
-		if (runDir === source || runDir.startsWith(source + path.sep) || source.startsWith(runDir + path.sep)) {
+	for (const source of protectedRoots) {
+		if (await pathIsWithin(runDir, source) || await pathIsWithin(source, runDir)) {
 			throw new Error("Native artifact root must be outside source checkout and Git metadata.");
 		}
 	}
@@ -397,147 +623,158 @@ export async function prepareNativeAudit(
 	if (!Number.isInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > maxTimeoutMs) {
 		throw new Error(`Native timeoutMs must be an integer from 1 to ${maxTimeoutMs}.`);
 	}
+	const preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	const routing: Record<string, unknown> = {};
 	for (const field of NATIVE_FIELDS) {
 		if (field.endsWith("Override") && params[field] !== undefined) routing[field.slice(0, -8)] = params[field];
 	}
-	const request: Record<string, any> = { source: identity.sourceRoot, sourceGitDir: identity.sourceGitDir,
-		routing, audit, timeoutMs, python, unshare, bwrap, nono, sandbox: "bubblewrap", sessionSandbox: "builtin" };
-	const preflight = async () => JSON.parse((await boundedExec(python, ["-I", "-B",
-		path.join(scriptRoot, "native_audit.py"), "--preflight"], identity.sourceRoot, JSON.stringify(request),
-		{ ...trustedGit.env, PATH: request.runtimePath ?? trustedGit.env.PATH },
-		10_000, 64 * 1024)).toString());
-	// Do not create workers, snapshots, or artifact directories until protected
-	// and unknown requirements have been rejected without a provider transport.
-	let route: Record<string, unknown>;
-	try { route = await preflight(); }
-	catch { throw new Error("Native audit configuration preflight failed: protected, unknown, or unsupported requirements. No native worker/provider was started."); }
-	request.expectedRoute = route;
+	const request: Record<string, any> = { source: identity.sourceRoot, routing, audit };
+	const preflight = () => nativePreflight(python, identity.sourceRoot, JSON.stringify(request), preflightEnv);
+	const { route } = await preflight();
 	checkCancelled();
-	if (!unshare || !bwrap || !nono) throw new Error("Native audit requires pinned util-linux unshare, bubblewrap, and nono for provider-only policy; ordinary delegation remains available. No fallback.");
-	if (process.platform !== "linux") throw new Error("Native audit requires verified Linux unshare and bubblewrap isolation; ordinary delegation remains available. No fallback.");
-	let unshareIdentity: Record<string, unknown>;
+	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider);
+	const authStore = route.provider === "chatgpt" ? await prepareNativeAuthStore(input, [...protectedRoots, runDir]) : undefined;
+	if (authStore) {
+		env.CHATGPT_TOKEN_DIR = authStore.directory;
+		env.CHATGPT_AUTH_FILE = authStore.filename;
+	}
+	if (!(await boundedExec(agentfs, ["--version"], cwd, undefined, env, 5000, 16384)).toString().match(/(?:^|\s)v?0\.6\.4(?:\s|$)/)) {
+		throw new Error("Native audit requires tested AgentFS 0.6.4. No fallback.");
+	}
+	await boundedExec(nono, ["--version"], cwd, undefined, env, 5000, 16384);
+	if ((await boundedExec(agentfs, ["ps"], cwd, undefined, env, 5000, 65536)).toString().includes(session)) {
+		throw new Error("Refusing a reused native AgentFS session.");
+	}
 	try {
-		unshareIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
-			path.join(scriptRoot, "native_audit.py"), "--validate-unshare"], cwd,
-			JSON.stringify({ unshare }), trustedGit.env, 10_000, 16 * 1024)).toString());
-	} catch {
-		throw new Error("Native audit requires the pinned root-owned util-linux unshare package and executable identity; no fallback.");
-	}
-	if (!isDeepStrictEqual(unshareIdentity, PINNED_UNSHARE_IDENTITY)) {
-		throw new Error("Native audit unshare identity did not match the reviewed installation; no fallback.");
-	}
-	request.unshareIdentity = unshareIdentity;
-	let bwrapIdentity: Record<string, unknown>;
-	try {
-		bwrapIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
-			path.join(scriptRoot, "native_audit.py"), "--validate-bwrap"], cwd,
-			JSON.stringify({ bwrap }), trustedGit.env, 10_000, 16 * 1024)).toString());
-	} catch {
-		throw new Error("Native audit requires the pinned root-owned bubblewrap package and executable identity; no fallback.");
-	}
-	if (!isDeepStrictEqual(bwrapIdentity, PINNED_BWRAP_IDENTITY)) {
-		throw new Error("Native audit bubblewrap identity did not match the reviewed installation; no fallback.");
-	}
-	request.bwrapIdentity = bwrapIdentity;
-	request.bwrapVersion = "0.12.0";
-	let nonoIdentity: Record<string, unknown>;
-	try {
-		nonoIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
-			path.join(scriptRoot, "native_audit.py"), "--validate-nono"], cwd,
-			JSON.stringify({ nono }), trustedGit.env, 10_000, 16 * 1024)).toString());
-	} catch {
-		throw new Error("Native audit requires the reviewed nono 0.79.0 ARM64 GNU executable identity; no fallback.");
-	}
-	if (!pinnedNonoIdentity(nonoIdentity, nono)) {
-		throw new Error("Native audit nono identity did not match the reviewed artifact; no fallback.");
-	}
-	request.nonoIdentity = nonoIdentity;
-	let nonoProfileIdentity: Record<string, unknown>;
-	try {
-		nonoProfileIdentity = JSON.parse((await boundedExec(python, ["-I", "-B",
-			path.join(scriptRoot, "native_audit.py"), "--validate-nono-profile"], cwd,
-			JSON.stringify({}), trustedGit.env, 10_000, 16 * 1024)).toString());
-	} catch {
-		throw new Error("Native audit requires the safe local jedisct1/swival nono profile in the default store; no pull or fallback.");
-	}
-	if (!localNonoProfileIdentity(nonoProfileIdentity)) {
-		throw new Error("Native audit local nono profile identity is unsupported; no pull or fallback.");
-	}
-	request.nonoProfileIdentity = nonoProfileIdentity;
-	const visible = [identity.sourceRoot, identity.sourceGitDir, scriptRoot,
-		path.dirname(path.dirname(python)), path.dirname(path.dirname(await fs.realpath(python))),
-		path.dirname(trustedGit.executable), path.dirname(nono), nonoProfileIdentity.pack as string];
-	for (const target of [path.join(os.homedir(), ".config", "swival"),
-		process.env.CHATGPT_TOKEN_DIR ?? path.join(os.homedir(), ".config", "litellm", "chatgpt")]) {
-		try { visible.push(await fs.realpath(target)); }
-		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-	}
-	request.readOnlyPaths = [...new Set(await Promise.all(visible.map((target) => fs.realpath(target))))]
-		.sort((a, b) => a.split(path.sep).length - b.split(path.sep).length || a.localeCompare(b));
-	try {
-		await boundedExec(python, ["-I", "-B", path.join(scriptRoot, "native_audit.py"), "--probe"], cwd,
-			JSON.stringify(request), trustedGit.env, 10_000, 64 * 1024);
-	} catch {
-		throw new Error("Native bubblewrap capability check failed. Require a propagation-free Linux environment (no shared/slave mounts), PID namespaces, pidfds, and disabled nested user namespaces. No provider started.");
-	}
+		await fs.lstat(path.join(env.HOME ?? os.homedir(), ".agentfs", "run", session));
+		throw new Error("Refusing a pre-existing native AgentFS session.");
+	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 	checkCancelled();
-	await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
-	request.snapshot = path.join(runDir, "snapshot");
-	request.evidence = path.join(runDir, "evidence");
-	const meta: RunMeta = { runId, agent: "native-audit", task: "/audit (structured committed scope)",
-		startedAt: Date.now(), pid: undefined, artifactDir: runDir, stdoutFile: path.join(runDir, "stdout.txt"),
-		stderrFile: path.join(runDir, "stderr.txt"), nativeAuditRequested: true };
+	await fs.mkdir(path.dirname(runDir), { recursive: true, mode: 0o700 });
+	await fs.mkdir(runDir, { mode: 0o700 });
+	const snapshot = path.join(runDir, "snapshot");
+	let args: string[];
+	const meta: RunMeta = { runId, agent: "native-audit", task: "/audit (committed source-only scope)",
+		startedAt: Date.now(), pid: undefined, artifactDir: runDir, stdoutFile: path.join(runDir, "diagnostics.json"),
+		stderrFile: path.join(runDir, "diagnostics.json"), nativeAuditRequested: true };
 	try {
-		const runtimeBin = path.join(runDir, "runtime-bin");
-		await fs.mkdir(runtimeBin, { mode: 0o700 });
-		await fs.symlink(trustedGit.executable, path.join(runtimeBin, "git"));
-		await fs.symlink(nono, path.join(runtimeBin, "nono"));
-		request.runtimePath = [runtimeBin, trustedGit.env.PATH].join(path.delimiter);
-		const manifest = await createCommittedSnapshot(identity.sourceRoot, request.snapshot, trustedGit);
+		const manifest = await createCommittedSnapshot(cwd, snapshot, trustedGit);
+		request.snapshot = snapshot;
+		const { scope, route: secondRoute } = await preflight();
+		if (!isDeepStrictEqual(route, secondRoute)) throw new Error("Native route changed during preparation. No fallback.");
+		if (!isPlainRecord(scope) || !scope.mandatory_files?.length) throw new Error("No auditable committed files in scope.");
 		checkCancelled();
-		const scoped = await preflight();
-		checkCancelled();
-		const { scope, ...secondRoute } = scoped;
-		if (!isDeepStrictEqual(route, secondRoute)) throw new Error("Native route changed after preflight; no fallback.");
-		request.expectedScope = scope;
-		await fs.mkdir(request.evidence, { mode: 0o700 });
-		await fs.mkdir(path.join(runDir, "sandbox"), { mode: 0o700 });
-		request.readOnlyPaths.push(runtimeBin);
+		const config = path.join(runDir, "config");
+		await fs.mkdir(path.join(config, "swival"), { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(config, "swival", "config.toml"), "# Inert native configuration.\n", { mode: 0o600 });
+		// Upstream checks the operator's installed nono profile. Do not copy it,
+		// replace its policy, or claim authenticity from an availability check.
+		const originalConfig = input.XDG_CONFIG_HOME ?? path.join(input.HOME ?? os.homedir(), ".config");
+		await fs.symlink(path.join(originalConfig, "nono"), path.join(config, "nono"));
+		env.XDG_CONFIG_HOME = config;
+		const bin = path.join(runDir, "runtime-bin"); await fs.mkdir(bin, { mode: 0o700 });
+		for (const [name, target] of [["git", trustedGit.executable], ["agentfs", agentfs], ["nono", nono]]) {
+			await fs.symlink(target, path.join(bin, name));
+		}
+		env.PATH = [bin, trustedGit.env.PATH].join(path.delimiter);
+		args = buildNativeAuditArgs(snapshot, route, audit);
+		await fs.mkdir(path.join(runDir, "evidence"), { mode: 0o700 });
 		await fs.writeFile(path.join(runDir, "manifest.json"), JSON.stringify({ ...manifest,
-			sandbox: "bubblewrap", bwrapVersion: request.bwrapVersion,
-			bwrapIdentity: request.bwrapIdentity, unshareIdentity: request.unshareIdentity,
-			nono: request.nono, nonoIdentity: request.nonoIdentity,
-			nonoProfileIdentity: request.nonoProfileIdentity, sessionSandbox: "builtin",
-			scope: scoped.scope, audit, route }, null, 2), { mode: 0o600 });
-		await fs.writeFile(path.join(runDir, "request.json"), JSON.stringify(request), { mode: 0o600 });
+			sandbox: "agentfs", session, authStore, route, scope, audit, command: args.at(-1) }, null, 2), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
 		checkCancelled();
 	} catch (error) {
 		await fs.rm(runDir, { recursive: true, force: true });
 		throw error;
 	}
-	let proc: ChildProcess;
-	try {
-		proc = spawn(process.execPath, [path.join(scriptRoot, "native-audit-runner.cjs"), runDir], {
-			cwd: path.join(runDir, "sandbox"), shell: false, detached: true,
-			stdio: ["ignore", "ignore", "ignore", "ipc"],
-		});
-	} catch {
-		await recordNativeAuditFailure(meta, "Native runner failed to start.");
-		throw new Error(`Native runner failed to start. Artifacts: ${runDir}.`);
-	}
+	const proc = spawn(agentfs, buildNativeAgentfsArgs(cli, snapshot, authStore?.directory, session, args), {
+		cwd: snapshot, env, shell: false, detached: true,
+		stdio: ["ignore", "pipe", "pipe"] });
 	meta.pid = proc.pid;
-	return { meta, proc };
-}
-
-/** Called only after wrapper exit, with authority retained from its live channel. */
-export function recordNativeAuditFailure(meta: RunMeta, stopped: string, ownership?: NativeOwnership,
-	startupBarrier?: () => Promise<void>): Promise<NativeTerminal> {
-	return finalizeNativeAudit({ runDir: meta.artifactDir, ownership, startupBarrier }, { exitCode: 1, stopped });
+	const diagnostics = { bytes: 0, closed: false, expansionFailures: 0, ambiguous: false,
+		authPersistenceFailure: false, adjudicationFailure: false, adjudicationRepairFailure: false };
+	const pending = ["", ""];
+	const streamState = pending.map(() => ({ adjudicating: false, terminalPrefix: false }));
+	let stopped: string | undefined;
+	let finalization: Promise<NativeTerminal> | undefined;
+	let settle!: (terminal: NativeTerminal) => void;
+	let fail!: (error: unknown) => void;
+	const completion = new Promise<NativeTerminal>((resolve, reject) => { settle = resolve; fail = reject; });
+	const closed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
+	const consumeLine = (line: string, index: number) => {
+		// LiteLLM 1.103.4 prints this fixed header before its device-code challenge.
+		if (line.trim() === "Sign in with ChatGPT using device code:") {
+			cancel("Native ChatGPT login is required. Authenticate with upstream Swival outside Pi, then rerun the audit.");
+		}
+		if (line.includes("Failed to write ChatGPT auth file")) {
+			diagnostics.authPersistenceFailure = true;
+			cancel("Native ChatGPT auth-state persistence failed; completion is refused.");
+		}
+		const text = line.trim();
+		const state = streamState[index];
+		// Rich wraps these fixed markers between words, even on non-TTY streams.
+		if (/\b(?:reviewer|consolidate)\s+error:/.test(line) ||
+			(state.terminalPrefix && text.startsWith("error:"))) diagnostics.adjudicationFailure = true;
+		state.terminalPrefix = /\b(?:reviewer|consolidate)\s*$/.test(line);
+		if (text.startsWith("phase 4.5: adjudicating ")) state.adjudicating = true;
+		if (text.startsWith("phase 4.5 complete.")) state.adjudicating = false;
+		// Parallel output cannot associate later reviewer recovery with an exhausted repair.
+		if (state.adjudicating && text === "repair failed") diagnostics.adjudicationRepairFailure = true;
+		if (!line.includes("expansion(s) failed")) return;
+		const match = /^\s*.+: ([0-9]+)\/([0-9]+) expansion\(s\) failed, ([0-9]+) finding\(s\) retained\s*$/.exec(line);
+		if (!match || !(Number(match[1]) > 0 && Number(match[1]) < Number(match[2]) &&
+			Number(match[3]) > 0 && Number(match[3]) <= Number(match[2]) - Number(match[1]))) diagnostics.ambiguous = true;
+		else diagnostics.expansionFailures += Number(match[1]);
+	};
+	const finish = (code: number) => {
+		if (finalization) return;
+		clearTimeout(timer);
+		finalization = finalizeNativeAudit({ runDir, cancellationReason: () => stopped,
+			ownership: proc.pid ? { signal: (value) => process.kill(-proc.pid!, value), verify: async () =>
+				!(await boundedExec(agentfs, ["ps"], runDir, undefined, env, 5000, 65536)).toString().includes(session) } : undefined,
+			closeLogs: async (shutdown) => {
+				let drainTimer: ReturnType<typeof setTimeout> | undefined;
+				try {
+					if (shutdown !== "verified") throw new Error("Shutdown not verified");
+					await Promise.race([closed, new Promise<never>((_, reject) => {
+						drainTimer = setTimeout(() => reject(new Error("Diagnostic drain timeout")), 2000);
+					})]);
+					diagnostics.closed = true;
+				} finally {
+					clearTimeout(drainTimer);
+					for (const [index, line] of pending.entries()) if (line) consumeLine(line, index);
+					proc.stdout?.destroy(); proc.stderr?.destroy();
+					if (shutdown !== "verified") proc.unref();
+					await fs.writeFile(path.join(runDir, "diagnostics.json"), JSON.stringify(diagnostics), { mode: 0o600 });
+				}
+			},
+		}, { exitCode: code, stopped });
+		void finalization.then(settle, fail).finally(() => signal?.removeEventListener("abort", abort));
+	};
+	const cancel = (reason = "Native audit was cancelled.") => { stopped ??= reason; finish(1); };
+	const timer = setTimeout(() => cancel(`Native audit timed out after ${timeoutMs}ms.`), timeoutMs as number);
+	const abort = () => cancel();
+	for (const [index, stream] of [proc.stdout!, proc.stderr!].entries()) {
+		stream.setEncoding("utf8");
+		stream.on("data", (chunk: string) => {
+			diagnostics.bytes += Buffer.byteLength(chunk);
+			if (diagnostics.bytes > 2 * 1024 * 1024) { cancel("Native diagnostics exceeded the 2 MiB cap."); return; }
+			pending[index] += chunk;
+			const lines = pending[index].split("\n"); pending[index] = lines.pop()!;
+			for (const line of lines) consumeLine(line, index);
+			if (pending[index].length > 65536) { diagnostics.ambiguous = true; cancel("Native diagnostic line exceeded its bound."); }
+		});
+		stream.on("error", () => cancel("Native diagnostic I/O failed."));
+	}
+	proc.once("error", () => cancel("Native CLI failed to start."));
+	proc.once("exit", (code) => finish(code ?? 1));
+	signal?.addEventListener("abort", abort, { once: true });
+	if (signal?.aborted) cancel();
+	return { route, meta, proc, completion, cancel };
 }
 
 export interface NativeAuditResult {
+	route?: NativeRoute;
 	status: "completed" | "failed" | "partial" | "empty_scope";
 	answer?: string;
 	error?: string;
@@ -545,16 +782,7 @@ export interface NativeAuditResult {
 }
 
 async function regularJson(file: string, root: string): Promise<Record<string, any>> {
-	let current = path.resolve(file);
-	const anchor = path.resolve(root);
-	if (!current.startsWith(anchor + path.sep)) throw new Error("Uncontained native evidence.");
-	while (current !== anchor) {
-		if ((await fs.lstat(current)).isSymbolicLink()) throw new Error("Symlinked native evidence.");
-		current = path.dirname(current);
-	}
-	const stat = await fs.lstat(file);
-	if (!stat.isFile() || stat.size > 8 * 1024 * 1024) throw new Error("Unsupported native evidence.");
-	return JSON.parse(await fs.readFile(file, "utf8"));
+	return JSON.parse(nativeLifecycle.regularBytes(root, file, 8 * 1024 * 1024).toString("utf8"));
 }
 
 type ReleasedFindingRecord = {
@@ -737,48 +965,34 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 		if (!completed) return { status: "failed", error: "Native audit state is unknown: no valid terminal evidence." };
 		const failures = [completed.stopped, completed.shutdownFailure, completed.preservationFailure,
 			completed.cleanupFailure, completed.persistenceFailure].filter(Boolean);
-		if (failures.length || completed.shutdown !== "verified" || completed.boundary !== "bubblewrap-pidfd") {
-			return { status: "failed", error: [...failures,
-				...(completed.retainedResources?.length ? [`Retained resources: ${completed.retainedResources.join(", ")}.`] : [])]
-				.join(" ") || "Native shutdown was not verified." };
+		if (failures.length || completed.shutdown !== "verified" || completed.boundary !== "agentfs-cli") {
+			return { status: "failed", error: failures.join(" ") || "Native shutdown was not verified; resources are retained." };
 		}
-		const result = await regularJson(path.join(artifactDir, "evidence", "native-result.json"), artifactDir);
-		if (result.status === "empty_scope") return { status: "empty_scope", error: "No auditable committed files in scope." };
-		const expansionLoss = Number.isSafeInteger(result.unrecoveredExpansionFailures) &&
-			result.unrecoveredExpansionFailures > 0;
-		if ((exitCode !== 0 || completed.exitCode !== 0) && !(result.status === "partial" && expansionLoss)) {
-			return { status: "failed", error: "Native pipeline exited unsuccessfully." };
-		}
-		if (!["completed", "partial"].includes(result.status) || result.sandbox?.external !== "bubblewrap" ||
-			result.sandbox?.bwrapVersion !== "0.12.0" ||
-			!isDeepStrictEqual(result.sandbox?.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
-			!pinnedNonoIdentity(result.sandbox?.nonoIdentity) ||
-			!localNonoProfileIdentity(result.sandbox?.nonoProfileIdentity) ||
-			result.sandbox?.session !== "builtin" || result.network !== "provider-only") {
-			return { status: "failed", error: "Native runtime/sandbox completion evidence is missing." };
-		}
+		if (exitCode !== 0 || completed.exitCode !== 0) return { status: "failed", error: "Native CLI exited unsuccessfully." };
 		const manifest = await regularJson(path.join(artifactDir, "manifest.json"), artifactDir);
-		const request = await regularJson(path.join(artifactDir, "request.json"), artifactDir);
-		if (manifest.sandbox !== "bubblewrap" || manifest.bwrapVersion !== "0.12.0" ||
-			manifest.sessionSandbox !== "builtin" || request.sandbox !== "bubblewrap" ||
-			request.bwrapVersion !== "0.12.0" || request.sessionSandbox !== "builtin" ||
-			!isDeepStrictEqual(manifest.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
-			!isDeepStrictEqual(request.bwrapIdentity, PINNED_BWRAP_IDENTITY) ||
-			!isDeepStrictEqual(manifest.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
-			!isDeepStrictEqual(request.unshareIdentity, PINNED_UNSHARE_IDENTITY) ||
-			typeof request.nono !== "string" ||
-			!pinnedNonoIdentity(request.nonoIdentity, request.nono) || manifest.nono !== request.nono ||
-			!localNonoProfileIdentity(request.nonoProfileIdentity) ||
-			!isDeepStrictEqual(manifest.nonoIdentity, request.nonoIdentity) ||
-			!isDeepStrictEqual(result.sandbox?.nonoIdentity, request.nonoIdentity) ||
-			!isDeepStrictEqual(manifest.nonoProfileIdentity, request.nonoProfileIdentity) ||
-			!isDeepStrictEqual(result.sandbox?.nonoProfileIdentity, request.nonoProfileIdentity) ||
-			!isDeepStrictEqual(result.sandbox?.startup,
-				{ executable: "unshare", identity: PINNED_UNSHARE_IDENTITY }) ||
-			manifest.route?.version !== 1 || !isDeepStrictEqual(manifest.route, request.expectedRoute) ||
-			!isDeepStrictEqual(manifest.route, result.route) || result.provider !== manifest.route.provider ||
-			result.model !== manifest.route.model || result.requestedEffort !== manifest.route.reasoningEffort) {
-			return { status: "failed", error: "Native route completion evidence does not match preflight." };
+		const report = await regularJson(path.join(artifactDir, "evidence", "native-cli-report.json"), artifactDir);
+		const diagnostics = await regularJson(path.join(artifactDir, "diagnostics.json"), artifactDir);
+		if (diagnostics.closed !== true || !Number.isSafeInteger(diagnostics.bytes) || diagnostics.bytes < 1 ||
+			diagnostics.bytes > 2 * 1024 * 1024 || diagnostics.ambiguous !== false ||
+			diagnostics.authPersistenceFailure !== false || typeof diagnostics.adjudicationFailure !== "boolean" ||
+			typeof diagnostics.adjudicationRepairFailure !== "boolean" ||
+			!Number.isSafeInteger(diagnostics.expansionFailures) || diagnostics.expansionFailures < 0) {
+			return { status: "failed", error: "Native diagnostics are missing, truncated, or ambiguous." };
+		}
+		if (diagnostics.adjudicationFailure) return { status: "partial", error: "Native audit has terminal adjudication failures." };
+		if (diagnostics.adjudicationRepairFailure) return { status: "partial",
+			error: "Native adjudication completeness cannot be verified after exhausted format repair." };
+		if (diagnostics.expansionFailures > 0) return { status: "partial", error: "Native audit lost findings to unrecovered expansion failures." };
+		const route = parseNativeRoute(manifest.route);
+		if (manifest.sandbox !== "agentfs" || !/^native-[a-f0-9]{32}$/.test(manifest.session) ||
+			report.version !== 1 || report.task !== manifest.command || report.provider !== route.reportIdentity.provider ||
+			report.model !== route.reportIdentity.model ||
+			report.result?.outcome !== "success" || report.result.exit_code !== 0 ||
+			report.sandbox?.mode !== "builtin" || report.sandbox.session !== undefined ||
+			report.network !== "provider-only" || report.settings?.commands !== "none" || report.settings.files !== "some" ||
+			report.settings.instructions_status !== "disabled" || !Array.isArray(report.settings.skills_discovered) ||
+			report.settings.skills_discovered.length || typeof report.result.answer !== "string" || !report.result.answer.trim()) {
+			return { status: "failed", error: "Native CLI route, policy, or result evidence does not match preparation." };
 		}
 		const scope = manifest.scope;
 		const statesDir = path.join(artifactDir, "evidence", "native-state");
@@ -786,18 +1000,20 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 		if (entries.length !== 1 || !/^[a-f0-9]{8}$/.test(entries[0])) throw new Error("Expected one new native audit state.");
 		const statePath = path.join(statesDir, entries[0], "state.json");
 		const state = await regularJson(statePath, artifactDir);
-		if (scope.commit !== manifest.snapshotCommit || JSON.stringify(state.scope) !== JSON.stringify(scope) ||
-			JSON.stringify(result.scope) !== JSON.stringify(scope)) throw new Error("Native snapshot/scope identity mismatch.");
+		if (scope.commit !== manifest.snapshotCommit || !isDeepStrictEqual(state.scope, scope) ||
+			!stringList(scope.tracked_files) || !stringList(manifest.files) ||
+			!scope.tracked_files.every((file: string) => manifest.files.includes(file))) {
+			throw new Error("Native snapshot/scope identity mismatch.");
+		}
 		const mandatory = scope.mandatory_files;
 		if (!Array.isArray(mandatory) || !mandatory.length) return { status: "empty_scope", error: "No auditable committed files in scope." };
-		if (expansionLoss) {
-			return { status: "partial", error: "Native audit lost findings to unrecovered expansion failures.", statePath };
-		}
-		if (result.status !== "completed") return { status: "partial", error: "Native pipeline is incomplete.", statePath };
 		const covers = (wanted: unknown, actual: unknown) => Array.isArray(wanted) && Array.isArray(actual) &&
 			wanted.every((file) => actual.includes(file));
 		if (state.phase !== "done" || !covers(mandatory, state.reviewed_files) ||
-			!Array.isArray(state.candidate_files) ||
+			!isPlainRecord(state.metrics) || !isPlainRecord(state.truncated_files) ||
+			!Number.isSafeInteger(state.metrics.phase1_profile_failures ?? 0) ||
+			(state.metrics.phase1_profile_failures ?? 0) < 0 ||
+			!stringList(state.candidate_files) ||
 			!covers(state.candidate_files, state.deep_reviewed_files) ||
 			(manifest.audit?.all && !covers(mandatory, state.deep_reviewed_files)) ||
 			Object.keys(state.truncated_files ?? {}).length || (state.metrics?.phase1_profile_failures ?? 0) > 0) {
@@ -864,6 +1080,6 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 				}
 			}
 		}
-		return { status: "completed", answer: typeof result.answer === "string" ? result.answer : "Native audit completed.", statePath };
+		return { status: "completed", answer: report.result.answer, statePath };
 	} catch { return { status: "failed", error: "Native audit lacks valid state, scope, or report/patch evidence." }; }
 }

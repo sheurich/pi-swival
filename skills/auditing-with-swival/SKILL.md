@@ -1,126 +1,84 @@
 ---
 name: auditing-with-swival
-description: Run one native Swival security audit on an isolated committed snapshot. Use for repository audits, native audit evidence, findings, and patch proposals through swival-subagent.
+description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent.
 ---
 
 # Auditing with Swival
 
-Use `swival-subagent` with an `audit` object. The extension invokes the released `Session.ask(..., parse_commands=True)` API with exactly one native `/audit`. Do not send slash commands or bucket prose through `task`.
+Use the structured `audit` API from Pi at the target Git repository root. The adapter invokes one upstream CLI `/audit` request. It validates coverage and artifacts so the operator does not need to reconstruct completion from console output. The offline fixtures exercise released phases and rejected incomplete states. The operator still reviews findings and every patch.
 
-Generic delegation adds one fixed plain-text heading and never interprets slash/bang scripts, even with ambient `oneshot_commands=true`. Native execution uses the explicit `audit` API. This prevents unintended command dispatch, not model prompt injection.
+## Preconditions and selection
 
-## Preconditions
-
-- Start Pi from the target Git repository root. The native target comes from Pi's cwd, not a caller-supplied host path.
-- Require Swival 1.0.46, LiteLLM 1.103.3, Python 3.13+, Linux on Debian ARM64 with util-linux 2.41.5-0+deb13u1, bubblewrap 0.12.0-1~deb13u1, pidfd support, and the reviewed nono 0.79.0 ARM64 GNU artifact identity. Native mode requires a safe local `jedisct1/swival` pack in `HOME/.config`; `XDG_CONFIG_HOME` must be absent or resolve to that same store. Other selections, releases, and unverified platform/version combinations fail closed.
-- Darwin/macOS native audits are unsupported. Ordinary delegation keeps AgentFS. There is no sandbox fallback.
-- Require a propagation-free final namespace. Native execution rejects shared/slave or unknown mount relationships before Session/provider activity. A privileged host can still modify files or namespaces directly.
-- Require a passing real native-layout isolation canary on Linux before use. Offline transport tests do not prove OS isolation.
-- Follow the operator's provider and data boundaries. A configured profile does not authorize sending repository contents to its provider.
-- Daybreak requires prior human ChatGPT login and account authorization for the exact model. Direct selection does not grant access, choose another account, or require a named profile.
-- For configured profile routes, verify the selected profile, provider, model, and supported effort with `swival --list-profiles`. Halt when a required profile is absent. Do not silently fall back.
-- Native mode rejects required secret encryption or outbound request filtering. Upstream auxiliary calls and traces omit those controls. Never turn them off to make an audit run.
-
-For authorized Daybreak use, select provider `chatgpt`, model `gpt-daybreak-blue-latest`, and effort `xhigh` with dispatch overrides. For other approved routes, use the configured `frontier` profile with `high` unless the operator chooses another route. Preserve provider and data boundaries. Direct overrides apply only to that call and do not change stored configuration, host defaults, or ordinary delegation.
-
-Swival accepts effort through `xhigh`, not Pi's `max`. Requested effort is not guaranteed for every native phase: upstream auxiliary `call_llm_text` requests omit it. Report the configured route and requested effort, not uniform per-phase effort.
-
-## Native routing
-
-The first preflight binds the selected profile, effective client provider/model/endpoint, supported cloud selectors, and safe requested execution options. The second preflight and execution must match it. Drift fails before Session construction. A native-only guard checks primary, auxiliary, and retry transports, blocks model-list discovery/replacement and Hugging Face text-generation fallback, and rejects cached alternate models. A caught route failure still fails the run. Ordinary delegation is unchanged.
-
-| Provider | Supported destination selection |
-| --- | --- |
-| `lmstudio` | Explicit model; configured HTTP base or released loopback default. |
-| `generic` | Explicit model and HTTP base, with released `/vN` normalization. |
-| `openrouter` | Explicit model; configured base, `OPENROUTER_API_BASE`, or released default. |
-| `chatgpt` | Released GPT Responses routing, including profile/model prefixes. Bind `CHATGPT_API_BASE`, then `OPENAI_CHATGPT_API_BASE`, then the released Codex endpoint. Upstream ignores the configured base; native mode accepts it only when it matches that effective selection. |
-| `huggingface` | `org/model`, with optional `huggingface/` prefix; configured base, `HF_API_BASE`, `HUGGINGFACE_API_BASE`, or released router endpoint. Dynamic provider/model mapping and the released non-chat text-generation fallback are unsupported. |
-| `bedrock` | Explicit region in `base_url`; regular runtime endpoint from that region or `AWS_BEDROCK_RUNTIME_ENDPOINT`. Bind configured/ambient account-profile selectors. Region discovery, isolated-region partitions, and alternate Mantle/agent/Claude Platform/OpenAI endpoint routes are unsupported. |
-| `vertexai` | Explicit project/location and a bare model selected by the released `GEMINI` handler. Legacy, partner, model-garden, agent-engine, and other dispatch modes are unsupported. Use a configured base or the released location-derived endpoint; without a configured base, reject `VERTEXAI_API_BASE` and `litellm.api_base` overrides. Reject location replacement. |
-
-Endpoints must be representable HTTP URLs without userinfo, queries, fragments, encoded/opaque components, or recognized credential content. Nonempty routing-affecting `extra_body`, executable providers, and `USE_LITELLM_PROXY` are unsupported. Profile/model/cloud selectors use bounded token grammars; unrepresentable selectors fail with value-free diagnostics. Native mode does not discover destination selectors from credential or configuration stores. Vertex uses the released selector before Session and on each call. Its first metadata import uses production mode and the bundled model-cost map, with no dotenv or remote fetch. It caches the selector under a lock, then restores the prior environment flags, including absent values and import failures. Imported modules remain initialized in the private native process; audit threads do not change these flags. Swival's pre-existing package import may set the offline-map flag when it was absent.
-
-The binding records typed constructor options, including context/output limits, turns, retries, timeout, sampling, thinking/cache settings, and requested effort. It does not assert that every phase forwards them. Credentials and custom `user_agent` metadata stay runtime-only and outside the binding. Credential-source metadata describes configuration or runtime lookup, not credential values, store contents, owner, billing provenance, or provider authorization. Remote server routing is not an attestation of the server's internal model selection. Do not put secrets in model, profile, endpoint, or cloud-selector fields. Token validation cannot detect every secret deliberately placed in a routing identifier.
+- Confirm scope and the operator's provider and data boundaries before sending source to a provider.
+- Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
+- With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
+- Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
+- Configuration inspection does not prove account access. Do not send repository content to probe specialist access. There is no fallback to another model, provider, endpoint, account, profile, or sandbox.
 
 ## Dispatch
 
-Use this exact route for an authorized Daybreak audit. It does not require a named profile and must not fall back:
+Use configured provider/model defaults:
 
 ```json
-{
-  "audit": {
-    "paths": ["src/**/*.py"],
-    "all": true,
-    "workers": 4,
-    "patchMaxTurns": 50
-  },
-  "providerOverride": "chatgpt",
-  "modelOverride": "gpt-daybreak-blue-latest",
-  "reasoningEffortOverride": "xhigh",
-  "timeoutMs": 900000
-}
+{"audit":{"all":true}}
 ```
 
-For another approved route, replace the three direct route overrides with its verified `profileOverride` and `reasoningEffortOverride`. Do not infer provider access from profile presence or replace a rejected route.
+Select an existing operator-configured specialist profile when installation policy requires it:
 
-- `paths`: up to 64 relative committed path/glob tokens. Omit for the repository's auditable scope. Paths with spaces, controls, shell syntax, absolute paths, or traversal are unsupported.
-- `all`: deep-review every selected file; otherwise native triage selects deep-review candidates.
-- `workers`: 1–8 native pipeline workers, not autonomous Swival subagents.
-- `patchMaxTurns`: 1–100 turns per patch loop. Native audit has no no-patch option.
-- `timeoutMs`: bounded runtime, 15 minutes by default and at most the operator-configured ceiling (30 minutes by default).
-- `async`: optional; returns a `runId` for `status`, `resume`, and `interrupt` while the originating Pi process stays connected. Pi disconnect cancels the native audit.
-
-Do not combine native audit with `task`, `agent`, `cwd`, `tasks`, `chain`, reviewer/self-review settings, output routing, extra arguments, or security overrides. Native mode permits only the structured audit options, existing model/profile/sampling overrides, and its runtime/output budgets. Invalid combinations fail before launch.
-
-## Source and permissions
-
-The extension builds an independent repository under the configured artifact root, outside the source checkout and its Git metadata. It imports committed objects with hardened Git plumbing. It does not execute source hooks or filters, share object stores, retain remotes, or update source refs.
-
-All staged, unstaged, and untracked changes are excluded. The manifest records source commit/tree and snapshot commit. The snapshot commit is synthetic; it preserves the committed tree, not commit history. Existing source status must remain unchanged, even when it was dirty before the audit. A tracked `swival.toml` stays in committed scope and released phase inputs. Its snapshot working copy is inert so project `[audit]` runtime settings do not execute; original source bytes and Git objects remain unchanged.
-
-Native audit may edit its snapshot, create internal Git worktrees, and generate reports and patches. It authenticates nono bytes before an update-disabled fixed version query and requires the exact reviewed installed bytes for both the `jedisct1/swival@0.1.2` manifest and full profile policy. It validates the bounded local files without listing or pulling, binds both identities in runtime evidence, and revalidates them before probe, launch, and Session construction. Because the reviewed policy extends `default`, every host and final-namespace checkpoint also rejects sibling, user `.jsonc`/`.json`, and installed-pack `install_as` or alias overrides. Only the authenticated executable's embedded `default` is supported; ambiguous, symlinked, malformed, or oversized resolver inputs fail closed. The pinned canonical `unshare --user --map-current-user --mount --propagation private --` prefix creates a same-ID private user/mount namespace before bubblewrap. It uses no `--keep-caps`, `--fork`, persistent namespace, setuid fallback, host privilege, or host propagation change. Bubblewrap recursively mounts the original root/submounts read-only, uses private temp/dev/shared-memory/proc mounts and PID/IPC namespaces, drops capabilities, and disables nested user namespaces. Canonical source/Git/runtime/config paths remain visible read-only; rebindings cannot replace private mount roots. Only snapshot and evidence receive persistent write grants. The final payload has zero effective, permitted, inheritable, ambient, and bounding capability sets. The native Session uses `sandbox="builtin"` as an application guard inside bubblewrap, with `files="some"`, `commands="none"`, and `network="provider-only"`. Instructions, skills, memory, history, lifecycle hooks, MCP, A2A, and autonomous subagents remain disabled.
-
-Verifier and patch loops inherit these restricted modes. They cannot execute project commands or PoCs. Treat verification as native verifier judgment, not independent exploit reproduction. Patch generation is optional evidence, not permission to apply a fix.
-
-Unsupported tracked links, gitlinks, unsafe names, secret-shaped paths, recognized credential content, oversized snapshots, and protected or unknown configurations fail closed. Snapshot limits are 4096 entries, 8 MiB per object, and 64 MiB total. Do not treat credential scanning as a guarantee that a repository has no secrets.
-
-ChatGPT requires prior human login and a valid token. Native execution rejects missing, malformed, or expired auth before automatic login, refresh, sensitive prompts, or auth writes. No writable-home exception is added.
-
-Project-supplied routing and executable provider routes are unsupported. Explicit AgentFS backend/session, nono, strict-read, lifecycle, and protection requirements are not silently replaced. If native mode cannot preserve a requirement, stop; do not weaken permissions, broaden egress, or substitute a prompt audit.
-
-## Evidence and completion
-
-The tool returns the artifact directory. It preserves:
-
-```text
-<artifact-dir>/
-├── manifest.json
-├── request.json
-├── run-meta.json
-├── completed.json (or spawn-error.txt failure fallback)
-├── stdout.txt
-├── stderr.txt
-└── evidence/
-    ├── native-result.json
-    ├── native-state/<audit-id>/state.json
-    └── audit-findings/<number>-<title>.md and .patch
+```json
+{"audit":{"all":true},"profileOverride":"security-specialist"}
 ```
 
-Both synchronous and asynchronous execution use the same wrapper and shared finalizer. Live ownership precedes external execution. Timeout, interruption, or Pi disconnect cancels the native audit. The trusted supervisor pins namespace init through a live pidfd before releasing bubblewrap’s private startup block. It closes control descriptors before untrusted execution. The finalizer requires namespace-init death and process-group absence, drains bounded logs, and exports regular-file partial evidence before removing owned temporary resources. Every retained evidence subtree receives recursive type and resource checks, including unmatched files in export namespaces. Limits are 4096 retained entries, 8 MiB per regular file, and 64 MiB combined retained bytes; source traversal has a separate 4096-entry limit. Byte-identical retry destinations count once; conflicting destinations fail. Combined subprocess output is capped at 2 MiB.
+`security-specialist` is illustrative, not bundled or reserved. Explicit profile selection outranks `active_profile`. Authorized explicit field overrides outrank profile values. Do not add provider/model/effort overrides automatically; inherit selected settings. Reject conflicts with installation policy before execution. Ordinary inherited effort is best-effort; auxiliary phases can omit it.
 
-Preservation failure retains the remaining snapshot for diagnosis and fails the run. Unverified shutdown prevents copying or deleting mutable sources. Cleanup and persistence failures remain separate diagnostics. If completion-marker persistence fails, the wrapper atomically writes a failure fallback to `spawn-error.txt`, independently of Pi's lifetime. A failure of both terminal writes leaves disk-only recovery unknown.
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Exit zero or a plausible answer alone does not prove completion. The extension checks the route binding in request/manifest/result, native state, snapshot/scope identity, reviewed-file coverage, deep-review coverage, verification state, and report/patch pairs. Empty scope, partial phases, truncated coverage, missing state, and incomplete artifacts are not successful audits. Zero findings with complete state means the native pipeline completed; it does not establish that the code is secure.
+## Route capabilities
 
-Use `status` or `resume` with only the returned `id` and `action`. Valid terminal results survive extension reloads. Legacy group-only completion records do not prove namespace death and remain unpruned. Without live ownership or valid terminal evidence, disk-only native state is unknown; inspect the returned artifact directory. The extension never signals or probes a PID recovered from disk.
+Support means a Swival-supported route meeting required native policies on the pinned runtime, not a promise that every route/version works. Swival owns provider/auth integration.
 
-Compare source content, Git status, and refs with their initial values. Inspect every patch manually. Never apply audit patches automatically.
+| Route | Native requirements |
+| --- | --- |
+| Configured ChatGPT | Concrete model; standard upstream auth; dedicated runtime-only auth-directory grant. |
+| API-key OpenRouter | Concrete model; selected `OPENROUTER_API_KEY`; no ChatGPT directory or grant. |
+| Explicit OpenRouter-compatible loopback endpoint | Deliberately configured adapter/model/`base_url`, `max_context_tokens`, and a dedicated endpoint key through `OPENROUTER_API_KEY`; no remote-key inheritance or automatic conversion. |
+| Dynamic model-list adapters, including generic, LMStudio, llama.cpp and Google's generic transport | Refused with `MODEL_REPLACEMENT_UNCONTROLLABLE`: this runtime can replace a selected model after model-not-found. |
+| Other Swival routes | Evaluate credential authority, command execution, replacement, and policy requirements. Additional credential directories are not granted. |
 
-## Validation and live probes
+Automatic/multi-model selectors are unsupported. Client evidence does not prove backend alias resolution or routing. Configure local endpoints deliberately; never convert a rejected generic route to another adapter. Supply only that endpoint's dedicated credential, not a remote account key.
 
-`npm test` uses local transport stubs and released Swival entry points with stubbed LLM responses and denied sockets. It provides offline native execution and lifecycle evidence, not live provider proof or per-phase effort attestation. A prior prompt-only probe does not prove native execution.
+Preflight returns bounded, value-free codes, including `PROFILE_UNAVAILABLE`, `ROUTE_INCOMPLETE`, `CREDENTIAL_INTERFACE_UNSUPPORTED`, `CONFIG_INVALID`, and `RUNTIME_UNSUPPORTED`. `POLICY_NOT_PROPAGATED` names recognized requirements omitted by native or auxiliary phases: encryption, secret shielding, request filtering, `extra_body`, disabled prompt caching, thinking controls, strict-read/session isolation, or strict all-phase effort/retry requirements. Inline keys, custom headers, cloud/file/command credential requirements, credential-bearing URLs, ambient endpoints, and proxies fail closed. Stop instead of disabling controls.
 
-A live probe requires explicit operator approval and all sandbox prerequisites. Use only a disposable synthetic Git repository, an explicit approved profile, and generated artifacts outside that repository. Start a separate Pi session from its root, run the dispatch above against one synthetic file, then inspect native state, artifacts, source status, and refs. Bound its timeout and worker/patch budgets. If nono or another prerequisite is missing, mark the live probe blocked; do not install tools or fall back to unrestricted network.
+For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks metadata, never auth-store contents. API-key/local routes create no ChatGPT store and forward no ChatGPT variables.
 
-For prompt-only review, use existing review skills or generic plain-language delegation. Keep it separate from native audit evidence. For remediation, dispatch `self-review-worker` only after the operator approves the findings and scope.
+`paths` accepts at most 64 relative path/glob tokens without spaces, traversal, shell syntax, or host paths. Omit it for the auditable committed scope. `all` requires deep review of every selected file. `workers` is 1–8 pipeline workers, not autonomous subagents. `patchMaxTurns` is 1–100 turns per patch loop. The default timeout is 15 minutes; the default operator ceiling is 30 minutes.
+
+Native async is unsupported. Do not combine `audit` with `task`, `agent`, `cwd`, parallel/chain dispatch, output routing, reviewer settings, extra arguments, or permission overrides. Ordinary freeform delegation is separate and does not attest native completion. Do not use freeform slash-command tasks as a substitute.
+
+## Boundary
+
+The adapter imports only committed Git objects into a separate disposable repository outside the original source checkout and Git metadata. It disables source hooks, filters, lazy fetches, and remotes. It excludes staged, unstaged, and untracked content. The synthetic snapshot commit preserves the source tree, not its history. A tracked `swival.toml` remains auditable from HEAD; its runtime copy and the run's global configuration are inert.
+
+The adapter launches upstream AgentFS directly with a fresh session. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap, with `commands=none`, `files=some`, and `network=provider-only`. Instructions, skills, metaskills, MCP, A2A, autonomous subagents, lifecycle hooks, history, continuation, and memory are disabled. Verifier and patch loops inherit command and network restrictions. They cannot run project commands, builds, tests, Python, fetch tools, or PoCs. Describe verification as source-only judgment, not executed exploit reproduction.
+
+The adapter explicitly grants AgentFS write-through access to the snapshot. For ChatGPT only, it also grants a dedicated auth-store directory inside HOME. The default store is `~/.config/litellm/chatgpt/auth.json`. Safe `CHATGPT_TOKEN_DIR` and basename-only `CHATGPT_AUTH_FILE` selections are supported. Broad, shared, linked, or source/artifact/runtime-overlapping stores fail closed, including future paths under HOME's `.agentfs` and service directories. The auth directory never enters Swival `--add-dir` or model-tool roots. The adapter collects artifacts from the snapshot after verified normal shutdown; it does not claim COW-only export. Upstream also grants built-in temporary, service, and session paths. On macOS, source and Git metadata must not overlap those exceptions, including `/tmp`, `/var/tmp`, `/private/var/folders`, and HOME's `Library`. The adapter checks canonical paths and directory identities before launch. See the [complete AgentFS restriction](../swival/references/agentfs.md). The original source and Git metadata remain protected. AgentFS does not provide host-read confidentiality or provider-process egress confinement. The extension and installed runtime remain trusted.
+
+Snapshot and evidence limits are 4096 entries, 8 MiB per object/file, and 64 MiB total. Unsupported tracked links, unsafe paths, recognized credential content, protected configuration, and oversized inputs fail closed. Scanning cannot prove that source contains no secrets.
+
+## Lifetime and evidence
+
+Timeout, cancellation, and normal Pi session shutdown stop the live owned process group with bounded TERM/KILL escalation. Before export, the adapter requires process-group absence, drained diagnostics, and no active AgentFS session. Unverified shutdown retains the snapshot without export.
+
+After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Native runs never resume from disk, signal recovered PIDs, or use a guardian. Preserve crash resources for manual inspection. Normal completion removes the snapshot and run-local configuration; AgentFS session metadata remains retained. Native artifact directories are not automatically pruned.
+
+The returned artifact directory contains `manifest.json`, `run-meta.json`, `diagnostics.json`, a terminal record, and `evidence/native-cli-report.json`. Audit state lives under `evidence/native-state/<audit-id>/state.json`; finding reports and patches live under `evidence/audit-findings/`. Diagnostics retain bounded counters, not raw login output. A failed terminal write uses `spawn-error.txt`; failure of both writes leaves completion unknown.
+
+Exit zero and a plausible answer are insufficient. Completion requires matching committed scope, CLI route and policy, `phase=done`, mandatory/deep coverage, terminal verification states, feasible finding lineage, unique report/patch pairs, and complete diagnostics without lost expansion warnings. Missing, empty, reused, symlinked, oversized, truncated, or incomplete evidence cannot attest completion. Complete zero-finding state means the pipeline finished, not that the code is secure.
+
+Compare source content, status, and refs with their initial values. Review patches manually. Do not apply patches or begin remediation without separate approval. Use `self-review-worker` only for approved implementation work.
+
+## Validation
+
+Run `npm run native-agentfs-integration` with existing prerequisites and isolated synthetic fixtures. It tests the production launcher/finalizer with real AgentFS, released API/local zero-finding audit producers and HTTP doubles, plus synthetic ChatGPT refresh/model-tool-denial controls. Full finding/verifier/patch phases run separately with real upstream route resolution and synthetic LLM responses. Synthetic nono registration proves availability, not authenticity. These tests make no live provider or auth calls.
+
+Live provider or authentication tests require separate approval. Never install missing prerequisites, broaden network policy, or replace a rejected route to make a test pass.

@@ -100,7 +100,10 @@ describe("offline loader smoke", () => {
 	it("keeps loader diagnostics when declared resources are invalid", async () => {
 		const fixture = mkdtempSync(join(tmpdir(), "broken pi package "));
 		try {
-			await (await import("node:fs/promises")).cp(ROOT, fixture, { recursive: true, filter: (source) => !["node_modules", ".venv", "__pycache__"].some((entry) => source.split("/").includes(entry)) });
+			const fs = await import("node:fs/promises");
+			for (const resource of ["package.json", "extensions", "scripts", "skills", "prompts", "agents"]) {
+				await fs.cp(join(ROOT, resource), join(fixture, resource), { recursive: true });
+			}
 			await (await import("node:fs/promises")).rm(join(fixture, "extensions", "index.ts"));
 			const result = await runSmoke(fixture);
 

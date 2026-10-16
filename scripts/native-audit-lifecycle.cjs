@@ -58,7 +58,7 @@ function validTerminal(value, fallback) {
 		typeof value.exitedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value.exitedAt) ||
 		!Number.isFinite(Date.parse(value.exitedAt)) ||
 		!["not-started", "verified", "unverified"].includes(value.shutdown)) return false;
-	if (value.boundary !== undefined && value.boundary !== "bubblewrap-pidfd") return false;
+	if (value.boundary !== undefined && value.boundary !== "agentfs-cli") return false;
 	const keys = new Set(["exitCode", "exitedAt", "shutdown", "boundary", "retainedResources", ...diagnostics]);
 	if (Object.keys(value).some((key) => !keys.has(key))) return false;
 	if (diagnostics.some((key) => value[key] !== undefined &&
@@ -193,6 +193,8 @@ function preserveEvidence(runDir) {
 	});
 	// Every retained entry counts, including unmatched files in export namespaces.
 	retained(evidence);
+	publishEvidence(runDir, path.join(snapshot, "native-cli-report.json"),
+		path.join(evidence, "native-cli-report.json"), budget);
 	// Bound source traversal independently from the logical destination union.
 	const sourceScan = { entries: 0 };
 	const states = path.join(snapshot, ".swival", "audit");
@@ -226,50 +228,40 @@ function atomicTerminal(runDir, name, record) {
 }
 
 async function finalizeNativeAudit(options, outcome) {
-	const { runDir, ownership, closeLogs, startupBarrier, cancellationReason } = options;
+	const { runDir, ownership, closeLogs, cancellationReason } = options;
 	const existing = readNativeTerminal(runDir);
 	if (existing && (existing.shutdown !== "unverified" || !ownership)) return existing;
 	const record = { exitCode: outcome.exitCode ?? 1, exitedAt: new Date().toISOString(),
 		...(existing ?? {}), ...outcome };
 	delete record.shutdownFailure;
+	record.shutdown = "unverified";
 	if (ownership) {
 		const stopped = await shutdownGroup(ownership);
 		record.shutdown = stopped.shutdown;
 		if (stopped.wasAlive && !record.stopped) record.stopped = "Native process left running descendants.";
-	} else {
-		// No ownership acknowledgement means no external execution was
-		// authorized. The trusted bootstrap has a finite commit deadline.
-		if (startupBarrier) await startupBarrier();
-		record.shutdown = "not-started";
+		let verified = false;
+		try { verified = await ownership.verify?.() === true; } catch { /* Keep resources on lost proof. */ }
+		if (!verified) record.shutdown = "unverified";
+		if (record.shutdown === "verified") record.boundary = "agentfs-cli";
 	}
 	if (closeLogs) {
 		try { await closeLogs(record.shutdown); }
-		catch { record.cleanupFailure = [record.cleanupFailure, "Native runner log I/O failed."].filter(Boolean).join(" "); }
-	}
-	let namespaceRequired = !!ownership?.verify;
-	try {
-		namespaceRequired ||= JSON.parse(regularBytes(runDir, path.join(runDir, "request.json"), terminalLimit)).sandbox === "bubblewrap";
-	} catch { /* Legacy records gain no new live namespace authority. */ }
-	if (ownership && namespaceRequired) {
-		let verified = false;
-		try { verified = await ownership.verify?.() === true; } catch { /* Retain on lost proof. */ }
-		if (!verified) record.shutdown = "unverified";
-		else if (record.shutdown === "verified") record.boundary = "bubblewrap-pidfd";
+		catch { record.cleanupFailure = "Native diagnostic drain failed."; }
 	}
 	const retained = [];
 	const snapshot = path.join(runDir, "snapshot");
 	if (record.shutdown === "unverified") {
-		record.shutdownFailure = "Native namespace/process shutdown could not be verified.";
-		for (const name of ["snapshot", "runtime-bin", "sandbox"]) retained.push(path.join(runDir, name));
+		record.shutdownFailure = "Native CLI/process/AgentFS shutdown could not be verified.";
+		for (const name of ["snapshot", "runtime-bin", "config"]) retained.push(path.join(runDir, name));
 	} else {
 		try { preserveEvidence(runDir); }
 		catch { record.preservationFailure = "Native evidence preservation failed or exceeded resource limits."; }
-		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "sandbox")];
+		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "config")];
 		if (record.preservationFailure) retained.push(snapshot);
 		else removable.unshift(snapshot);
 		for (const target of removable) {
 			try {
-				// Remove only run-scoped resources, never legacy AgentFS sessions.
+				// Remove only run-scoped resources, never disk-recovered AgentFS sessions.
 				if (fs.existsSync(target)) checkedPath(runDir, path.dirname(target));
 				fs.rmSync(target, { recursive: true, force: true });
 			} catch {
@@ -296,4 +288,4 @@ async function finalizeNativeAudit(options, outcome) {
 	}
 }
 
-module.exports = { finalizeNativeAudit, readNativeTerminal };
+module.exports = { finalizeNativeAudit, readNativeTerminal, regularBytes };

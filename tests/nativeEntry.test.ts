@@ -1,58 +1,37 @@
 import { expect, it } from "vitest";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import { execFile } from "node:child_process";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import { nativeTestPython } from "./nativePython.js";
 import { inspectNativeAudit } from "../extensions/native-audit.js";
+import { nativeScratch } from "./nativeFixtures.js";
 
-it("executes released Session.ask native phases and inherited isolation with denied sockets", async () => {
-	// The aggregate includes five cold subprocesses; allow startup under full-suite load.
-	const result = await new Promise<{ code: number; output: string; diagnostics: string }>((resolve) => {
-		execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py")],
-			{ timeout: 60_000, maxBuffer: 64 * 1024,
-				env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True" } },
-			(error, stdout, stderr) => {
-				const output = stdout + stderr;
-				resolve({ code: error ? 1 : 0, output, diagnostics: JSON.stringify({ output,
-					error: error && { code: error.code, killed: error.killed, signal: error.signal } }) });
-			});
-	});
-	expect(result.code, result.diagnostics).toBe(0);
-	expect(result.output).toContain("Ran 38 tests");
-	expect(result.output).toMatch(/\bOK\b/);
-}, 65_000);
-
-it("checks bubblewrap mount ordering and read-only ChatGPT auth without HTTP", async () => {
+it("executes released CLI phases, inherited same-route policy retries, terminal errors, tool denials, and standard auth offline", async () => {
 	const result = await new Promise<{ code: number; output: string }>((resolve) => {
-		execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_bubblewrap_test.py")],
-			{ timeout: 15000, maxBuffer: 64 * 1024 },
-			(error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+		execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py")], {
+			timeout: 90_000, maxBuffer: 64 * 1024,
+			env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
+		}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 	});
 	expect(result.code, result.output).toBe(0);
-	expect(result.output).toContain("Ran 37 tests");
-}, 20_000);
+	expect(result.output).toContain("Ran 27 tests"); expect(result.output).toMatch(/\bOK\b/);
+}, 95_000);
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(
-	"validates released finding/verification/patch/%s-report evidence without provider transport", async (report) => {
-		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "released-finding-")));
+	"validates actual released CLI finding/verification/patch/%s-report evidence offline", async (report) => {
+		const root = nativeScratch("released-finding-");
 		try {
 			const output = await new Promise<{ code: number; output: string }>((resolve) => {
-				execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py"),
-					"--export-finding", root, report], {
-						timeout: 20_000, maxBuffer: 64 * 1024,
-						env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True" },
-					}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+				execFile(nativeTestPython, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py"), "--export-finding", root, report], {
+					timeout: 30_000, maxBuffer: 64 * 1024,
+					env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
+				}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 			});
 			expect(output.code, output.output).toBe(0);
-			const code = report === "lost" ? 1 : 0;
-			const result = await inspectNativeAudit(root, code);
-			expect(result.status, result.error).toBe(["complete", "recovered", "out-of-scope"].includes(report)
-				? "completed" : "partial");
+			const result = await inspectNativeAudit(root, 0);
+			expect(result.status, result.error).toBe(["complete", "recovered", "out-of-scope"].includes(report) ? "completed" : "partial");
 			if (["empty", "whitespace"].includes(report)) expect(result.error).toContain("report is empty");
 			if (report === "lost") expect(result.error).toContain("expansion");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	}, 25_000,
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	}, 35_000,
 );

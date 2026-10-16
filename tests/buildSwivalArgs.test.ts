@@ -92,22 +92,6 @@ describe("buildSwivalArgs", () => {
 		expect(args[idx("--base-url") + 1]).toBe("http://b");
 	});
 
-	it("constructs profile-free Daybreak argv from clean agent defaults", () => {
-		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", {
-			provider: "chatgpt",
-			model: "gpt-daybreak-blue-latest",
-			reasoningEffort: "xhigh",
-		});
-		const value = (flag: string) => args[args.indexOf(flag) + 1];
-		expect(value("--provider")).toBe("chatgpt");
-		expect(value("--model")).toBe("gpt-daybreak-blue-latest");
-		expect(value("--reasoning-effort")).toBe("xhigh");
-		expect(args).not.toContain("--profile");
-		expect(args).not.toContain("chatgpt-daybreak-blue");
-		// Direct route selection must not change ordinary sandbox defaults.
-		expect(args).not.toContain("--sandbox");
-	});
-
 	it("passes through sampling flags when set", () => {
 		const args = buildSwivalArgs(
 			makeAgent({
