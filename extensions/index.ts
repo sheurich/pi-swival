@@ -40,6 +40,7 @@ import {
 	type AgentScope,
 	discoverSwivalAgents,
 	type SwivalAgentConfig,
+	type SwivalAgentDiscoveryResult,
 } from "./agents.js";
 
 // Maximum array size of tasks[] and chain[] params.
@@ -500,8 +501,8 @@ export function resolveAgentBaseDir(
  * roster. Enumerates the roster that resolution just scanned — bundled, user
  * (`~/.pi/agent/swival-agents/`), and project (`.pi/swival-agents/`) scope,
  * after collision precedence — so the caller can retry from the same message.
- * `swival-subagent` has no listing action, and an agent name that was guessed
- * by analogy with another agent's name will otherwise fail with no hint.
+ * An agent name guessed by analogy with another agent's name would otherwise
+ * fail with no hint. The list action provides a bounded capability catalogue.
  *
  * Called only on the failure branch; the success path pays nothing.
  */
@@ -2813,7 +2814,7 @@ const SwivalParams = Type.Object({
 
 	/** When true, spawn the swival process detached and return immediately with
 	 *  a `runId`. Only applies to single-agent mode (agent+task). Parallel and
-	 *  chain modes ignore this flag and always run synchronously. */
+	 *  chain modes reject this flag. */
 	async: Type.Optional(
 		Type.Boolean({
 			description:
@@ -2821,21 +2822,85 @@ const SwivalParams = Type.Object({
 		}),
 	),
 
-	/** Control action for a previously started async run. Must be paired with `id`. */
+	/** List definitions without launching, or control a previously started async run. */
 	action: Type.Optional(
-		StringEnum(["status", "interrupt", "resume"] as const, {
+		StringEnum(["list", "status", "interrupt", "resume"] as const, {
 			description:
-				"Control action for an async run identified by `id`. status: check whether the run is alive or read its final report.json. interrupt: send SIGTERM to the process. resume: return the final output and reviewer feedback from a completed run.",
+				"list: read a bounded agent capability catalogue; accepts only agentScope and cwd, without launching or probing Swival. Other actions require id. status: check progress or final report. interrupt: stop a run tracked by this Pi process only. resume: retrieve completed output and reviewer feedback, not continue execution. Live steering is unsupported.",
 		}),
 	),
 
 	/** runId of the async run to query (returned by a prior async invocation). */
 	id: Type.Optional(
 		Type.String({
-			description: "runId returned by a previous async invocation (e.g. swival-run-1716326580000). Required when action is set.",
+			description: "runId returned by a previous async invocation (e.g. swival-run-1716326580000). Required for status, interrupt and resume; forbidden for list.",
 		}),
 	),
 });
+
+const MAX_CATALOGUE_ROWS = 20;
+const MAX_CATALOGUE_NAME_CHARS = 80;
+const MAX_CATALOGUE_DESCRIPTION_CHARS = 160;
+const MAX_CATALOGUE_TEXT_CHARS = 8192;
+
+function catalogueText(value: string, cap: number): string {
+	const clean = stripAnsi(value).replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ")
+		.replace(/\s+/g, " ").trim();
+	return clean.length > cap ? `${clean.slice(0, cap - 1)}…` : clean;
+}
+
+function buildAgentCatalogue(discovery: SwivalAgentDiscoveryResult, agentScope: AgentScope) {
+	return {
+		mode: "list" as const,
+		schemaVersion: 1 as const,
+		agentScope,
+		total: discovery.agents.length,
+		omitted: Math.max(0, discovery.agents.length - MAX_CATALOGUE_ROWS),
+		agents: discovery.agents.slice(0, MAX_CATALOGUE_ROWS).map((agent) => ({
+			name: catalogueText(agent.name, MAX_CATALOGUE_NAME_CHARS),
+			description: catalogueText(agent.description, MAX_CATALOGUE_DESCRIPTION_CHARS),
+			source: agent.source,
+			reviewer: {
+				required: agent.requiresReviewer === true,
+				selfReview: agent.selfReview ?? "unknown",
+				externalReviewer: agent.reviewer === undefined ? "unknown" : Boolean(agent.reviewer),
+			},
+			configured: { sandbox: agent.sandbox ?? "unknown", network: agent.network ?? "unknown" },
+			effectiveRuntime: "unknown" as const,
+			modes: ["single", "parallel", "chain"] as const,
+			async: "single-only" as const,
+			controls: {
+				status: true,
+				resume: "completed-output-only",
+				interrupt: "same-process-only",
+				liveSteering: false,
+			} as const,
+		})),
+		diagnostics: discovery.diagnostics,
+		diagnosticsTotal: discovery.diagnosticsTotal,
+		diagnosticsOmitted: discovery.diagnosticsOmitted,
+		dispatchBlocked: discovery.dispatchBlocked,
+	};
+}
+
+type SwivalCatalogueDetails = ReturnType<typeof buildAgentCatalogue>;
+
+function formatAgentCatalogue(details: SwivalCatalogueDetails): string {
+	const lines = [
+		`Swival agent catalogue v${details.schemaVersion}: ${details.total} total, ${details.agents.length} shown, ${details.omitted} omitted.`,
+		"Configured values are sanitized declarations, not effective runtime guarantees; effective runtime is unknown.",
+		"Modes: single, parallel, chain. Async: single-only. Status: progress/final report. Resume: completed output only. Interrupt: same-process only. Live steering: unsupported.",
+		...details.agents.map((agent) =>
+			`${agent.name} (${agent.source}): ${agent.description} | reviewer required: ${agent.reviewer.required}; configured sandbox: ${agent.configured.sandbox}, network: ${agent.configured.network}`),
+		`Discovery diagnostics: ${details.diagnosticsTotal} total, ${details.diagnosticsOmitted} omitted. ` +
+			(details.diagnostics.map((d) => `${d.source}:${d.code}`).join(", ") || "none"),
+	];
+	if (details.dispatchBlocked) lines.push("Dispatch is blocked until definitions with unresolved identities are repaired.");
+	const text = lines.join("\n");
+	const marker = "\n[Catalogue text truncated; bounded rows remain in details.]";
+	return text.length > MAX_CATALOGUE_TEXT_CHARS
+		? text.slice(0, MAX_CATALOGUE_TEXT_CHARS - marker.length) + marker : text;
+}
 
 function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverrides {
 	const g = <T>(k: string): T | undefined => params[k] as T | undefined;
@@ -3042,12 +3107,12 @@ export interface SwivalExtensionOptions {
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
 	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
-	pi.registerTool({
+	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails>({
 		name: "swival-subagent",
 		label: "Swival subagent",
 		description: [
 			"Delegate a task to a swival subprocess with its built-in reviewer loop.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution).",
+			"Use action:list for a bounded capability catalogue without launching Swival. Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution). Async supports single only; resume retrieves completed output, live steering is unsupported, and interrupt is same-process only.",
 			"Bundled agents work out of the box; override or extend via ~/.pi/agent/swival-agents/ (user) or .pi/swival-agents/ (project).",
 			"Use this when you want the reviewer loop, test-as-contract, sandbox overlay, or secret encryption to wrap the subagent's work.",
 		].join(" "),
@@ -3064,10 +3129,23 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const agentScope: AgentScope = params.agentScope ?? "user";
+			if (params.action === "list") {
+				if (Object.keys(params).some((key) => !["action", "agentScope", "cwd"].includes(key))) {
+					return {
+						content: [{ type: "text", text: "action:list cannot be combined with dispatch or control inputs. Use only action, agentScope and cwd." }],
+						details: { mode: "single", agentScope, projectAgentsDir: null, results: [] },
+						isError: true,
+					};
+				}
+				const cwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
+				const details = buildAgentCatalogue(discoverSwivalAgents(cwd, agentScope), agentScope);
+				return { content: [{ type: "text", text: formatAgentCatalogue(details) }], details };
+			}
+
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
 			void pruneOldArtifacts(artifactRoot);
 
-			const agentScope: AgentScope = params.agentScope ?? "user";
 			// Project-agent discovery must walk up from the effective working
 			// directory the swival process will run in, not Pi's own cwd. In
 			// single mode that is params.cwd if provided; in parallel/chain modes
@@ -3291,6 +3369,26 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			const requestedNames = hasChain ? params.chain!.map((step) => step.agent)
+				: hasTasks ? params.tasks!.map((task) => task.agent) : [params.agent as string];
+			if (discovery.dispatchBlocked || requestedNames.some((name) => discovery.invalidAgentNames.includes(name))) {
+				const cause = discovery.dispatchBlocked
+					? "An invalid definition has an unresolved identity; dispatch cannot safely resolve agent precedence."
+					: "An invalid agent definition shadows a requested name; lower-priority fallback is disabled.";
+				const codes = discovery.diagnostics.map((d) => `${d.source}:${d.code}`).join(", ");
+				return {
+					content: [{ type: "text", text: `Swival agent discovery blocked dispatch: ${cause} Repair the definitions and use action:list to check discovery. Diagnostics: ${codes || "invalid_definition"}.` }],
+					details: {
+						...makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						projectAgentsDir: null,
+						diagnostics: discovery.diagnostics,
+						diagnosticsTotal: discovery.diagnosticsTotal,
+						diagnosticsOmitted: discovery.diagnosticsOmitted,
+					},
+					isError: true,
 				};
 			}
 
@@ -3648,6 +3746,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "user";
+			if (args.action === "list") {
+				return new Text(theme.fg("toolTitle", theme.bold("swival list ")) +
+					theme.fg("muted", `[${scope}]`), 0, 0);
+			}
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("swival ")) +
@@ -3688,8 +3790,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		// -------------------------------------------------- render result --
 
 		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SwivalDetails | undefined;
-			if (!details || details.results.length === 0) {
+			const details = result.details;
+			if (!details || details.mode === "list" || details.results.length === 0) {
 				const t = result.content[0];
 				return new Text(t?.type === "text" ? t.text : "(no output)", 0, 0);
 			}

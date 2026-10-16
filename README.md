@@ -31,6 +31,8 @@ Or install from a local checkout:
 pi install /path/to/pi-swival
 ```
 
+Pi installs runtime dependencies for managed git/npm packages. For a local checkout, install the pinned runtime dependency, `yaml` 2.9.0, from the checkout root with `npm install --ignore-scripts --legacy-peer-deps`.
+
 The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The eight bundled swival agents under `agents/` are discovered automatically by the extension at runtime — no symlinks or manual copies needed.
 
 To override a bundled agent or add your own, place `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` in a project root (project scope). Discovery priority: project > user > bundled.
@@ -61,9 +63,33 @@ Key features beyond pi's example subagent extension:
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
 - Standard input task delivery (protects prompts from `ps aux` and bypasses `ARG_MAX` when `sandbox: builtin` is configured).
 - Operational telemetry (prompt cache token savings, security policy blocks, and storm breaker suppressions).
-- Async / background runs with cross-session `status` / `resume` / `interrupt`.
+- Async / background runs in single mode, with saved `status` / `resume` results across sessions and same-process `interrupt`.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
+
+#### Agent catalogue
+
+Call `swival-subagent` with `action: "list"` to inspect agent capabilities without launching Swival or probing a provider:
+
+```json
+{
+  "action": "list",
+  "cwd": "/path/to/project",
+  "agentScope": "both"
+}
+```
+
+`cwd` defaults to Pi's working directory. `agentScope` accepts `user` (the default), `project`, or `both`; bundled agents always remain available. Project discovery walks up from `cwd` to the nearest `.pi/swival-agents/` directory. List accepts only `action`, `cwd`, and `agentScope`. Dispatch and control fields, including `id`, `task`, overrides, and `async`, are rejected even when false or empty. List does not write files, prune artifacts, or ask for confirmation.
+
+The result's `details` contains `mode: "list"`, `schemaVersion: 1`, the selected scope, and up to 20 sorted agent rows. Names are limited to 80 characters, descriptions to 160, and model-facing text to 8192. `total` and `omitted` report exact agent counts. Rows expose descriptions, source scope, reviewer settings, configured sandbox/network settings, supported modes, and controls. They omit system prompts, command strings, provider routing, and definition paths.
+
+`configured` contains sanitized declarations after scope restrictions. Missing settings appear as `"unknown"`; `effectiveRuntime` is always `"unknown"`. The catalogue does not read Swival's runtime configuration or prove effective sandbox, network, or reviewer behavior.
+
+Discovery retains valid siblings and reports at most 12 fixed diagnostics with source scope. Codes are `invalid_yaml`, `invalid_frontmatter`, `invalid_definition`, `unreadable_definition`, `unreadable_directory`, and `outside_directory`. `diagnosticsTotal` and `diagnosticsOmitted` give exact counts without exposing parser messages or file contents.
+
+Invalid admitted definitions fail closed. An identified invalid override blocks dispatch for that name instead of selecting a lower-priority definition. A failure with an unresolved identity sets `dispatchBlocked: true` and blocks dispatch before launch. Symlinks outside the scanned directory remain excluded and nonblocking; discovery does not read their targets.
+
+`async: true` supports single dispatch only. `status` reports progress or final results. `resume` retrieves completed output and reviewer feedback; it does not restart execution. `interrupt` can stop only a run tracked by the same Pi process. Live steering is unsupported.
 
 ### Skills
 
@@ -115,16 +141,16 @@ pi-swival/
 │   └── swival-worker-briefs/   # SKILL.md
 ├── prompts/
 │   └── swival-audit.md         # slash-command-style audit walkthrough
-└── tests/                  # vitest harness for pure functions in extensions/
+└── tests/                  # vitest unit, fixture, and extension-loader tests
 ```
 
 ## Running the tests
 
-The vitest harness covers the pure functions in `extensions/index.ts` — argument building, report summarization, parallel summary formatting, artifact persistence, trace tailing, UTF-8 boundary handling, and bundled-agent integrity — plus the skill documentation invariants in `tests/skillDocs.test.ts`. The harness never spawns an actual `swival` process; everything under test is pure.
+The Vitest harness covers argument building, report and parallel summaries, artifact persistence, trace tailing, UTF-8 boundary handling, and bundled-agent integrity. It also tests agent discovery, catalogue behavior, and skill documentation invariants. Subprocess fixture tests launch local fake executables, never live Swival or providers. `tests/catalogueLoad.test.ts` loads this package through Pi 1.3.0's public extension loader with synthetic directories and checks the registered schema and list result. It blocks the real child-process boundary before imports and requires no session, authentication storage, or provider setup.
 
 ```bash
 cd tests
-./setup.sh           # first time only — installs vitest + symlinks pi peer deps
+./setup.sh           # installs Vitest + pinned YAML and links Pi peer dependencies
 npx vitest run
 ```
 

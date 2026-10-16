@@ -15,7 +15,17 @@ if [[ ! -d node_modules/vitest ]]; then
 	npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps
 fi
 
-# 2. Find the Pi install so we can symlink the peer packages the extension
+# 2. Install the extension's declared runtime dependency without installing peers.
+if ! node -e '
+	const expected = require("../package.json").dependencies.yaml;
+	const installed = require("../node_modules/yaml/package.json").version;
+	process.exit(installed === expected ? 0 : 1);
+' >/dev/null 2>&1; then
+	npm install --prefix .. --ignore-scripts --no-audit --no-fund \
+		--legacy-peer-deps --package-lock=false
+fi
+
+# 3. Find the Pi install so we can symlink the peer packages the extension
 #    imports from: @earendil-works/{pi-ai, pi-agent-core, pi-coding-agent,
 #    pi-tui} and typebox.
 PI_PKG=""
