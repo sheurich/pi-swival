@@ -91,6 +91,60 @@ Invalid admitted definitions fail closed. An identified invalid override blocks 
 
 `async: true` supports single dispatch only. `status` reports progress or final results. `resume` retrieves completed output and reviewer feedback; it does not restart execution. `interrupt` can stop only a run tracked by the same Pi process. Live steering is unsupported.
 
+### Optional async observation
+
+Async launches save their owning session UUID. Observation exposes only bounded state, never task text, output, or PIDs. Recovered runs without terminal evidence remain `unknown`. Legacy runs without an owner remain available through explicit `status` and `resume` queries.
+
+To include owned runs in pi-subagents Fleet and `bg_wait`, use the wrapper layout below. Install and review pi-subagents separately. Pi packages have separate module roots; installing both packages does not make their imports available to a user extension. pi-swival never discovers or installs the consumer.
+
+Select the existing package directories explicitly. The synthetic paths `/opt/pi-packages/pi-swival` and `/opt/pi-packages/pi-subagents` below stand for your selected pi-swival checkout and pi-subagents package root. For Pi-managed installations, `pi list` shows the installed locations. Replace both targets with those locations; do not copy either package or install another dependency tree.
+
+```bash
+mkdir -p ~/.pi/agent/swival-observation/node_modules
+ln -s /opt/pi-packages/pi-swival ~/.pi/agent/swival-observation/node_modules/pi-swival
+ln -s /opt/pi-packages/pi-subagents ~/.pi/agent/swival-observation/node_modules/pi-subagents
+```
+
+Save this wrapper as `~/.pi/agent/swival-observation/index.ts`. Its imports resolve through the two wrapper-local links. Pi supplies the host API.
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import registerSwival from "pi-swival/extensions/index.ts";
+import { createPiSubagentsAdapter } from "pi-swival/integrations/pi-subagents.ts";
+import {
+  registerExternalRun, updateExternalRun, unregisterExternalRun,
+} from "pi-subagents/external-runs";
+import { registerBackgroundWorkProvider } from "pi-subagents/background-work";
+
+export default function (pi: ExtensionAPI) {
+  registerSwival(pi, {
+    observationAdapter: createPiSubagentsAdapter({
+      registerExternalRun, updateExternalRun, unregisterExternalRun,
+      registerBackgroundWorkProvider,
+    }),
+  });
+}
+```
+
+In `~/.pi/agent/settings.json`, disable the package's default extension and enable the wrapper:
+
+```json
+{
+  "packages": [
+    {
+      "source": "https://github.com/sheurich/pi-swival",
+      "extensions": []
+    },
+    "npm:pi-subagents"
+  ],
+  "extensions": ["./swival-observation/index.ts"]
+}
+```
+
+Merge these entries into your existing settings. Replace the existing pi-swival entry with the object form, keeping its exact source and pin. Keep your existing pi-subagents source and other settings. Remove any separate entry that loads `pi-swival/extensions` directly, including project entries. The wrapper must be the only Swival extension entry point. Restart Pi or run `/reload`.
+
+The adapter uses the consumer's session file identity, with the UUID as its fallback. It caches at most 20 Fleet rows and 100 active wait items. Unknown activity has no consumer state and is omitted. Cancelling `bg_wait` does not stop a Swival run. Observation emits only the private `pi-swival:async-observation` reconciliation event; it never starts a model turn. Use explicit `status` or `resume` to retrieve results.
+
 ### Skills
 
 | Skill | Use |

@@ -42,6 +42,18 @@ import {
 	type SwivalAgentConfig,
 	type SwivalAgentDiscoveryResult,
 } from "./agents.js";
+import {
+	ASYNC_OBSERVATION_CHANNEL,
+	MAX_OBSERVATION_ROWS,
+	captureAsyncOwner,
+	createAsyncObservation,
+	isAsyncOwnerId,
+	isObservationText,
+	type AsyncObservation,
+	type AsyncObservationAdapter,
+	type AsyncOwner,
+	type AsyncRunObservation,
+} from "./async-observation.js";
 
 // Maximum array size of tasks[] and chain[] params.
 const MAX_PARALLEL_TASKS = 8;
@@ -69,6 +81,9 @@ const ASYNC_RUNNER_PATH = path.resolve(
  * Persisted to disk so `status` and `resume` work even after Pi restarts.
  */
 export interface RunMeta {
+	/** UUID owns the run. The optional file is only a consumer compatibility hint. */
+	ownerSessionId?: string;
+	ownerSessionFile?: string;
 	runId: string;
 	agent: string;
 	task: string;
@@ -121,6 +136,13 @@ interface RunStateInfo {
  * artifact root.
  */
 const asyncRuns = new Map<string, AsyncRunEntry>();
+const asyncObservationListeners = new Set<() => void>();
+
+function asyncRunChanged(): void {
+	for (const listener of asyncObservationListeners) {
+		try { listener(); } catch { /* Observation cannot affect execution. */ }
+	}
+}
 
 // -------------------------------------------------------------- helpers --
 
@@ -1985,7 +2007,8 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				typeof parsed.artifactDir !== "string" ||
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
 				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
-				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean")
+				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean") ||
+				!validPersistedAsyncOwner(parsed)
 			) continue;
 
 			// Path containment: artifactDir must be under artifactRoot
@@ -2108,6 +2131,150 @@ function formatCompletedAsyncFailure(
 	return `Run ${runId} ${label}: ${reason.text}\nArtifact dir: ${state.meta.artifactDir}`;
 }
 
+function validPersistedAsyncOwner(meta: Record<string, unknown>): boolean {
+	if (!("ownerSessionId" in meta)) return !("ownerSessionFile" in meta);
+	return isAsyncOwnerId(meta.ownerSessionId)
+		&& (!("ownerSessionFile" in meta) || isObservationText(meta.ownerSessionFile, 4096));
+}
+
+/** Read one regular artifact without following a leaf symlink or an unbounded growing file. */
+async function readObservationJson(file: string, cap: number): Promise<{
+	value: Record<string, unknown>; mtimeMs: number;
+} | undefined> {
+	let handle: fs.promises.FileHandle | undefined;
+	try {
+		handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+			| fs.constants.O_NONBLOCK);
+		const stat = await handle.stat();
+		if (!stat.isFile() || stat.size > cap) return undefined;
+		const buffer = Buffer.alloc(cap + 1);
+		let length = 0;
+		while (length < buffer.length) {
+			const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+			if (bytesRead === 0) break;
+			length += bytesRead;
+		}
+		if (length > cap) return undefined;
+		const value: unknown = JSON.parse(buffer.toString("utf8", 0, length));
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		return { value: value as Record<string, unknown>, mtimeMs: stat.mtimeMs };
+	} catch { return undefined; }
+	finally { await handle?.close().catch(() => undefined); }
+}
+
+function asyncObservationIdentity(meta: RunMeta) {
+	return {
+		runId: meta.runId, ownerSessionId: meta.ownerSessionId!,
+		...(meta.ownerSessionFile ? { ownerSessionFile: meta.ownerSessionFile } : {}),
+		agent: meta.agent, startedAt: meta.startedAt,
+	};
+}
+
+async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry): Promise<AsyncRunObservation> {
+	const base = asyncObservationIdentity(meta);
+	if (entry && !entry.exited) return Object.freeze({ ...base, state: "running" });
+	const marker = await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024);
+	const exitedAt = marker?.value.exitedAt;
+	const endedAt = typeof exitedAt === "string" &&
+		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(exitedAt)
+		? Date.parse(exitedAt) : NaN;
+	const code = marker?.value.exitCode;
+	const canonicalDate = Number.isFinite(endedAt)
+		? new Date(endedAt).toISOString() : undefined;
+	const validMarker = marker && canonicalDate !== undefined
+		&& (canonicalDate === exitedAt || canonicalDate.replace(".000Z", "Z") === exitedAt)
+		&& endedAt >= meta.startedAt && marker.mtimeMs >= meta.startedAt && (code === null ||
+			(typeof code === "number" && Number.isSafeInteger(code) && code >= 0 && code <= 2147483647));
+	if (!entry && !validMarker) return Object.freeze({ ...base, state: "unknown" });
+	const raw = await readObservationJson(path.join(meta.artifactDir, "report.json"), 1024 * 1024);
+	let report: ReportSummary | undefined;
+	try {
+		if (raw && raw.mtimeMs >= meta.startedAt) report = summarizeReport(raw.value);
+	} catch { /* Malformed reports fail closed under the normal result policy. */ }
+	const bootstrap = enforceCompletedAsyncAgentFs(meta, report);
+	const nono = enforceCompletedAsyncNono(meta, bootstrap.report);
+	const exitCode = entry ? entry.exitCode : validMarker ? code as number | null : null;
+	const spawnFailed = await fs.promises.lstat(path.join(meta.artifactDir, "spawn-error.txt"))
+		.then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
+	return Object.freeze({ ...base,
+		state: spawnFailed || isRunFailure({ exitCode: exitCode ?? 1, report: nono.report })
+			? "failed" : "completed",
+		...(validMarker ? { endedAt } : {}),
+	});
+}
+
+function eligibleAsyncObservationMeta(meta: RunMeta, ownerSessionId: string, root: string): boolean {
+	return meta.ownerSessionId === ownerSessionId
+		&& validPersistedAsyncOwner(meta as unknown as Record<string, unknown>)
+		&& isObservationText(meta.runId, 160) && isObservationText(meta.agent, 160)
+		&& Number.isSafeInteger(meta.startedAt) && meta.startedAt >= 0
+		&& meta.startedAt <= 8_640_000_000_000_000
+		&& typeof meta.artifactDir === "string" && path.dirname(path.resolve(meta.artifactDir)) === root;
+}
+
+function selectLocalAsyncObservationEntries(ownerSessionId: string, root: string): AsyncRunEntry[] {
+	const live: AsyncRunEntry[] = [];
+	const terminal: AsyncRunEntry[] = [];
+	let inspected = 0;
+	for (const entry of asyncRuns.values()) {
+		if (++inspected > 256) break;
+		if (!eligibleAsyncObservationMeta(entry.meta, ownerSessionId, root)) continue;
+		(entry.exited ? terminal : live).push(entry);
+	}
+	// Prioritize live handles within the inspection budget, not across an unbounded history.
+	return [...live, ...terminal].slice(0, MAX_OBSERVATION_ROWS);
+}
+
+function readLocalAsyncRunObservations(
+	ownerSessionId: string,
+	artifactRoot: string,
+): readonly AsyncRunObservation[] {
+	if (!isAsyncOwnerId(ownerSessionId)) return Object.freeze([]);
+	return Object.freeze(selectLocalAsyncObservationEntries(ownerSessionId, path.resolve(artifactRoot))
+		.filter((entry) => !entry.exited)
+		.map((entry) => Object.freeze({
+			...asyncObservationIdentity(entry.meta), state: "running" as const,
+		})));
+}
+
+/** Bounded private state only. Recovered PIDs, tasks and output are never inspected or returned. */
+export async function readAsyncRunObservations(
+	ownerSessionId: string,
+	artifactRoot: string = ARTIFACT_ROOT,
+): Promise<readonly AsyncRunObservation[]> {
+	const rows: AsyncRunObservation[] = [];
+	if (!isAsyncOwnerId(ownerSessionId)) return Object.freeze(rows);
+	const root = path.resolve(artifactRoot);
+	const seen = new Set<string>();
+	for (const entry of selectLocalAsyncObservationEntries(ownerSessionId, root)) {
+		seen.add(entry.meta.runId);
+		rows.push(await observeAsyncRun(entry.meta, entry));
+	}
+	if (rows.length >= MAX_OBSERVATION_ROWS) return Object.freeze(rows);
+	try {
+		const directory = await fs.promises.opendir(root);
+		let scanned = 0;
+		for await (const item of directory) {
+			if (++scanned > 256 || rows.length >= MAX_OBSERVATION_ROWS) break;
+			if (!item.isDirectory()) continue;
+			const artifactDir = path.join(root, item.name);
+			const record = await readObservationJson(path.join(artifactDir, "run-meta.json"), 65536);
+			if (!record || record.value.artifactDir !== artifactDir) continue;
+			const meta = record.value as unknown as RunMeta;
+			if (!eligibleAsyncObservationMeta(meta, ownerSessionId, root) || seen.has(meta.runId)) continue;
+			if (("agentFsRequested" in meta && typeof meta.agentFsRequested !== "boolean")
+				|| ("nonoRequested" in meta && typeof meta.nonoRequested !== "boolean")) continue;
+			seen.add(meta.runId);
+			rows.push(await observeAsyncRun(meta));
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			throw new Error("Async observation unavailable.");
+		}
+	}
+	return Object.freeze(rows);
+}
+
 // ------------------------------------------------ async (background) --
 
 /**
@@ -2129,7 +2296,12 @@ export async function runSingleSwivalAsync(
 	cwd: string | undefined,
 	overrides: SwivalOverrides,
 	artifactRoot: string = ARTIFACT_ROOT,
+	owner?: AsyncOwner,
 ): Promise<{ runId: string; artifactDir: string }> {
+	const runOwner = captureAsyncOwner({
+		getSessionId: () => owner?.ownerSessionId,
+		getSessionFile: () => owner?.ownerSessionFile,
+	});
 	const agent = agents.find((a) => a.name === agentName);
 	if (!agent) {
 		throw new Error(unknownAgentMessage(agentName, agents));
@@ -2199,6 +2371,7 @@ export async function runSingleSwivalAsync(
 		agent: agentName,
 		task,
 		startedAt: ts,
+		...runOwner,
 		pid: proc.pid,
 		artifactDir,
 		stdoutFile,
@@ -2216,7 +2389,9 @@ export async function runSingleSwivalAsync(
 	const scheduleExpiry = () => {
 		if (ttlScheduled) return;
 		ttlScheduled = true;
-		setTimeout(() => { asyncRuns.delete(runId); }, ASYNC_RUN_TTL_MS).unref?.();
+		setTimeout(() => {
+			if (asyncRuns.get(runId) === entry) { asyncRuns.delete(runId); asyncRunChanged(); }
+		}, ASYNC_RUN_TTL_MS).unref?.();
 	};
 	proc.once("close", (code) => {
 		const current = asyncRuns.get(runId);
@@ -2225,6 +2400,7 @@ export async function runSingleSwivalAsync(
 			current.exitCode = code;
 		}
 		scheduleExpiry();
+		asyncRunChanged();
 	});
 	proc.once("error", (err) => {
 		const current = asyncRuns.get(runId);
@@ -2240,8 +2416,10 @@ export async function runSingleSwivalAsync(
 			"utf-8",
 		).catch(() => undefined);
 		scheduleExpiry();
+		asyncRunChanged();
 	});
 	proc.unref();
+	asyncRunChanged();
 
 	try {
 		await fs.promises.writeFile(
@@ -3103,10 +3281,49 @@ export function buildParallelSummary(
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
 	trustProjectAgents?: boolean;
+	observationAdapter?: AsyncObservationAdapter;
+	onObservationDiagnostic?(message: string): void;
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
 	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
+	let observation: { owner: AsyncOwner; observer: AsyncObservation } | undefined;
+	let observationOwnerSessionId: string | undefined;
+	let observationGeneration = 0;
+	const startObservation = (owner: AsyncOwner | undefined, replace = false) => {
+		if (!replace && observation?.owner.ownerSessionId === owner?.ownerSessionId
+			&& observation?.owner.ownerSessionFile === owner?.ownerSessionFile) return;
+		observation?.observer.dispose();
+		observation = undefined;
+		if (!owner) return;
+		const observer = createAsyncObservation({
+			owner, adapter: options.observationAdapter,
+			readLocalSnapshot: () => readLocalAsyncRunObservations(owner.ownerSessionId, artifactRoot),
+			readSnapshot: () => readAsyncRunObservations(owner.ownerSessionId, artifactRoot),
+			subscribe(callback) {
+				asyncObservationListeners.add(callback);
+				return () => { asyncObservationListeners.delete(callback); };
+			},
+			emitWake: (data) => { pi.events.emit(ASYNC_OBSERVATION_CHANNEL, data); },
+			onDiagnostic: options.onObservationDiagnostic,
+		});
+		observation = { owner, observer };
+		return observer.refresh();
+	};
+	pi.on?.("session_start", (_event, ctx) => {
+		const owner = captureAsyncOwner(ctx.sessionManager);
+		observationOwnerSessionId = owner?.ownerSessionId;
+		observationGeneration++;
+		return startObservation(owner, true);
+	});
+	pi.on?.("session_shutdown", (_event, ctx) => {
+		const owner = captureAsyncOwner(ctx.sessionManager);
+		if (!owner || observationOwnerSessionId !== owner.ownerSessionId) return;
+		observationGeneration++;
+		observationOwnerSessionId = undefined;
+		observation?.observer.dispose();
+		observation = undefined;
+	});
 	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails>({
 		name: "swival-subagent",
 		label: "Swival subagent",
@@ -3129,6 +3346,13 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const launchOwner = params.async ? captureAsyncOwner(ctx.sessionManager) : undefined;
+			// Shutdown must retire pending approval even before an observer exists.
+			if (launchOwner && observationOwnerSessionId !== launchOwner.ownerSessionId) {
+				observationOwnerSessionId = launchOwner.ownerSessionId;
+				observationGeneration++;
+			}
+			const launchGeneration = observationGeneration;
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			if (params.action === "list") {
 				if (Object.keys(params).some((key) => !["action", "agentScope", "cwd"].includes(key))) {
@@ -3654,6 +3878,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				const task = params.task as string;
 				let runId: string;
 				let artifactDir: string;
+				if (launchGeneration === observationGeneration) void startObservation(launchOwner);
 				try {
 					({ runId, artifactDir } = await runSingleSwivalAsync(
 						ctx.cwd,
@@ -3663,6 +3888,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						discoveryCwd,
 						overrides,
 						artifactRoot,
+						launchOwner,
 					));
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
