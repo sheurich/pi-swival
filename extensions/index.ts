@@ -36,6 +36,8 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { captureNativeRuntime, inspectNativeAudit, prepareNativeAudit, validateNativeAuditParams, parseNativeRoute,
+	type NativeAuditResult, type NativeAuditLaunch } from "./native-audit.js";
 import {
 	type AgentScope,
 	discoverSwivalAgents,
@@ -84,6 +86,7 @@ export interface RunMeta {
 	agentFsRequested?: boolean;
 	/** Whether this run effectively requested Nono. */
 	nonoRequested?: boolean;
+	nativeAuditRequested?: boolean;
 }
 
 interface AsyncRunEntry {
@@ -242,7 +245,8 @@ async function writeRunOutput(
  * outcome=success. Reviewer rejection and AgentError subclasses can exit zero,
  * so missing, malformed, or unknown reports must fail closed.
  */
-export function isRunFailure(r: { exitCode: number; report?: { outcome?: string } }): boolean {
+export function isRunFailure(r: { exitCode: number; nativeAudit?: NativeAuditResult; report?: { outcome?: string } }): boolean {
+	if (r.nativeAudit) return r.exitCode !== 0 || r.nativeAudit.status !== "completed";
 	return r.exitCode !== 0 || r.report?.outcome !== "success";
 }
 
@@ -981,6 +985,7 @@ export interface SwivalResult {
 	stderrTail: string[];
 	durationMs: number;
 	report?: ReportSummary;
+	nativeAudit?: NativeAuditResult;
 	errorMessage?: string;
 	// Populated only on failure. Use `renderStatus(result)` for the terminal
 	// state; use `result.reason?.code` for a machine-readable failure cause.
@@ -1910,6 +1915,20 @@ export async function persistArtifacts(
 
 // ------------------------------------------------- artifact lifecycle --
 
+async function isNativeArtifact(directory: string): Promise<boolean> {
+	if (path.basename(directory).startsWith("native-audit-")) return true;
+	for (const name of ["snapshot", "request.json", path.join("evidence", "native-state")]) {
+		try { await fs.promises.lstat(path.join(directory, name)); return true; }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true; }
+	}
+	try {
+		const meta = path.join(directory, "run-meta.json");
+		const stat = await fs.promises.lstat(meta);
+		if (!stat.isFile() || stat.size > 65536) return false;
+		return JSON.parse(await fs.promises.readFile(meta, "utf8")).nativeAuditRequested === true;
+	} catch { return false; }
+}
+
 /**
  * Remove artifact directories in `artifactRoot` that are older than 7 days
  * (based on directory mtime). Best-effort: individual removal failures are
@@ -1938,6 +1957,7 @@ export async function pruneOldArtifacts(
 		try {
 			const stat = await fs.promises.stat(fullPath);
 			if (!stat.isDirectory() || stat.mtimeMs >= cutoff) continue;
+			if (await isNativeArtifact(fullPath)) continue;
 			// Fix 4: never prune a directory belonging to an in-flight run.
 			if (activeArtifactDirs.has(fullPath)) continue;
 			// Fix 4: require completed.json — a missing marker means the run is
@@ -2055,7 +2075,7 @@ async function loadRunState(
 
 	// Disk fallback: find run-meta.json, then read completed.json + spawn-error.txt.
 	const meta = await findRunMeta(runId, artifactRoot);
-	if (!meta) return undefined;
+	if (!meta || meta.nativeAuditRequested || await isNativeArtifact(meta.artifactDir)) return undefined;
 
 	let completed: CompletedMarker | undefined;
 	try {
@@ -2462,7 +2482,7 @@ async function runSingleSwival(
 				timeoutTimer.unref?.();
 			}
 
-			proc.stdout.on("data", (buf: Buffer) => {
+			proc.stdout!.on("data", (buf: Buffer) => {
 				stdoutBuf += stripAnsi(stdoutDecoder.decode(buf, { stream: true }));
 				if (stdoutBuf.length > STDOUT_RING_CHARS) {
 					stdoutBuf = stdoutBuf.slice(-STDOUT_RING_CHARS);
@@ -2471,7 +2491,7 @@ async function runSingleSwival(
 				scheduleEmit();
 			});
 
-			proc.stderr.on("data", (buf: Buffer) => {
+			proc.stderr!.on("data", (buf: Buffer) => {
 				stderrBuf += stripAnsi(stderrDecoder.decode(buf, { stream: true }));
 				const lines = stderrBuf.split("\n");
 				stderrBuf = lines.pop() ?? "";
@@ -2676,6 +2696,12 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 const SwivalParams = Type.Object({
+	audit: Type.Optional(Type.Object({
+		paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs, not commands." })),
+		all: Type.Optional(Type.Boolean({ description: "Deep-review every file in scope." })),
+		workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+		patchMaxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+	}, { additionalProperties: false, description: "Synchronous, source-only native audit of repository-root cwd's committed tree. No async, task, agent, cwd or permission overrides." })),
 	agent: Type.Optional(Type.String({ description: "Swival agent name (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -2955,6 +2981,7 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
  * cause.
  */
 export function renderStatus(r: SwivalResult): RunStatus {
+	if (r.nativeAudit) return isRunFailure(r) ? "failed" : "completed";
 	if (r.exitCode === -1) return "running";
 	if (r.exitCode !== 0) return "failed";
 	if (r.report?.outcome === "error") return "error";
@@ -3103,16 +3130,30 @@ export function buildParallelSummary(
 export interface SwivalExtensionOptions {
 	artifactRoot?: string;
 	trustProjectAgents?: boolean;
+	nativePython?: string;
+	nativeMaxTimeoutMs?: number;
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
 	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
-	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails>({
+	const nativeRuntime = captureNativeRuntime(options.nativePython);
+	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
+	const nativeRuns = new Set<NativeAuditLaunch>();
+	const preparing = new Set<AbortController>();
+	pi.on?.("session_shutdown", async () => {
+		for (const controller of preparing) controller.abort();
+		for (const run of nativeRuns) run.cancel("Native audit cancelled during session shutdown.");
+		await Promise.allSettled([...nativeRuns].map((run) => run.completion));
+	});
+	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails | undefined>({
 		name: "swival-subagent",
 		label: "Swival subagent",
 		description: [
 			"Delegate a task to a swival subprocess with its built-in reviewer loop.",
-			"Use action:list for a bounded capability catalogue without launching Swival. Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution). Async supports single only; resume retrieves completed output, live steering is unsupported, and interrupt is same-process only.",
+			"Use action:list for a bounded capability catalogue without launching Swival.",
+			"Modes: single (agent + task), parallel (tasks array), chain (sequential with '{previous}' substitution), or native audit (audit object).",
+			"Native mode uses synchronous upstream AgentFS CLI and provider-only policy for source-only verification. Native async is unsupported.",
+			"Ordinary async supports single only; resume retrieves completed output, live steering is unsupported, and interrupt is same-process only.",
 			"Bundled agents work out of the box; override or extend via ~/.pi/agent/swival-agents/ (user) or .pi/swival-agents/ (project).",
 			"Use this when you want the reviewer loop, test-as-contract, sandbox overlay, or secret encryption to wrap the subagent's work.",
 		].join(" "),
@@ -3141,6 +3182,46 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				const cwd = resolveDispatchCwd(undefined, params.cwd, ctx.cwd);
 				const details = buildAgentCatalogue(discoverSwivalAgents(cwd, agentScope), agentScope);
 				return { content: [{ type: "text", text: formatAgentCatalogue(details) }], details };
+			}
+
+			if ("audit" in params) {
+				const controller = new AbortController();
+				const abort = () => controller.abort();
+				signal?.addEventListener("abort", abort, { once: true });
+				if (signal?.aborted) abort();
+				preparing.add(controller);
+				let run: NativeAuditLaunch | undefined;
+				try {
+					const input = params as unknown as Record<string, unknown>;
+					const audit = validateNativeAuditParams(input);
+					if (!Number.isInteger(nativeMaxTimeoutMs) || nativeMaxTimeoutMs < 1 || nativeMaxTimeoutMs > 2_147_483_647) {
+						throw new Error("Invalid native timeout ceiling.");
+					}
+					const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
+					run = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
+						artifactDir, runId, nativeMaxTimeoutMs, controller.signal);
+					preparing.delete(controller);
+					nativeRuns.add(run);
+					const routeText = `Resolved native route: ${run.route.provider}/${run.route.model}` +
+						(run.route.endpoint ? `; endpoint=${run.route.endpoint}` : "") +
+						(run.route.profile ? `; profile=${run.route.profile}` : "") +
+						(run.route.reasoningEffort ? `; effort=${run.route.reasoningEffort}` : "");
+					const terminal = await run.completion;
+					const nativeAudit = { ...await inspectNativeAudit(artifactDir, terminal.exitCode), route: run.route };
+					const result: SwivalResult = { agent: "native-audit", agentSource: "bundled", task: run.meta.task,
+						exitCode: terminal.exitCode, nativeAudit, stderrTail: [], durationMs: Date.now() - run.meta.startedAt,
+						artifactDir, errorMessage: nativeAudit.error,
+						finalOutput: applyInlineCap(nativeAudit.answer ?? "", params.maxInlineBytes ?? 64 * 1024,
+							path.join(artifactDir, "evidence", "native-cli-report.json")) };
+					return { content: [{ type: "text", text: `Native audit status: ${nativeAudit.status}. ${routeText}\n${nativeAudit.error ?? result.finalOutput}\nSource-only verifier judgment; patches are proposals.\nArtifact dir: ${artifactDir}` }],
+						details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [result] }, isError: isRunFailure(result) };
+				} catch (error) {
+					return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
+				} finally {
+					preparing.delete(controller);
+					signal?.removeEventListener("abort", abort);
+					if (run) nativeRuns.delete(run);
+				}
 			}
 
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
@@ -3215,6 +3296,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 						details: makeDetails("single")([]),
 						isError: true,
 					};
+				}
+
+				const saved = await findRunMeta(runId, artifactRoot);
+				if (runId.startsWith("native-audit-") || saved && (saved.nativeAuditRequested || await isNativeArtifact(saved.artifactDir))) {
+					return { content: [{ type: "text", text: "Native async and disk recovery are unsupported. A crashed audit may remain running; no export or claimed completion is available." }],
+						details: makeDetails("single")([]), isError: true };
 				}
 
 				if (params.action === "status") {
@@ -3745,6 +3832,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		// ---------------------------------------------------- render call --
 
 		renderCall(args, theme, _context) {
+			if ("audit" in args) {
+				const selection = args.profileOverride !== undefined ? "explicit profile" :
+					Object.keys(args).some((key) => key.endsWith("Override")) ? "explicit overrides" : "configured defaults";
+				return new Text(theme.fg("toolTitle", theme.bold("swival native audit ")) +
+					theme.fg("muted", `[${selection}]`), 0, 0);
+			}
 			const scope: AgentScope = args.agentScope ?? "user";
 			if (args.action === "list") {
 				return new Text(theme.fg("toolTitle", theme.bold("swival list ")) +
@@ -3809,6 +3902,12 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					new Text(`${rIcon} ${theme.fg("accent", r.agent)} ${theme.fg("muted", meta)}`, 0, 0),
 				);
 				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+				if (r.nativeAudit) {
+					let route: NativeAuditResult["route"];
+					try { route = parseNativeRoute(r.nativeAudit.route); } catch { /* Do not render unvalidated saved route values. */ }
+					container.addChild(new Text(theme.fg("muted", `Native audit: ${r.nativeAudit.status}` +
+						(route ? `; ${route.provider}/${route.model}${route.endpoint ? `; endpoint=${route.endpoint}` : ""}` : "")), 0, 0));
+				}
 				if (r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", r.errorMessage), 0, 0));
 				}

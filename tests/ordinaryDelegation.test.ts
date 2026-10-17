@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import registerExtension from "../extensions/index.js";
 
-describe("audit pipeline integration with hostile Git and unusual filenames", () => {
+describe("ordinary delegation with synthetic CLI reports and hostile repository fixtures", () => {
 	const tmpDirs: string[] = [];
 	const originalPath = process.env.PATH;
 	let repoDir: string;
@@ -23,6 +23,7 @@ describe("audit pipeline integration with hostile Git and unusual filenames", ()
 		repoDir = makeTmp("pi-swival-audit-repo-");
 		binDir = makeTmp("pi-swival-audit-bin-");
 		artifactRoot = makeTmp("pi-swival-audit-artifacts-");
+		fs.writeFileSync(path.join(binDir, "package.json"), '{"type":"commonjs"}\n');
 
 		// Set up Git repo
 		execFileSync("git", ["init"], { cwd: repoDir });
@@ -91,7 +92,7 @@ describe("audit pipeline integration with hostile Git and unusual filenames", ()
 		tmpDirs.length = 0;
 	});
 
-	it("successfully delegates /audit and captures report when repo has hostile Git config and unusual files", async () => {
+	it("captures an ordinary report with hostile Git config and unusual files", async () => {
 		// Mock swival that exercises Git in the repository and verifies hostile config protection
 		const fakeSwival = path.join(binDir, "swival");
 		fs.writeFileSync(
@@ -177,8 +178,8 @@ process.exit(0);
 		const result = await tool.execute(
 			"audit-call-1",
 			{
-				agent: "audit-worker",
-				task: "/audit",
+				agent: "swival",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,
@@ -244,8 +245,8 @@ process.exit(1);
 		const result = await tool.execute(
 			"audit-call-error",
 			{
-				agent: "audit-worker",
-				task: "/audit",
+				agent: "swival",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,
@@ -299,8 +300,8 @@ process.exit(130);
 		const result = await tool.execute(
 			"audit-call-interrupt",
 			{
-				agent: "audit-worker",
-				task: "/audit",
+				agent: "swival",
+				task: "Review the committed source as plain text.",
 				cwd: repoDir,
 			},
 			undefined,

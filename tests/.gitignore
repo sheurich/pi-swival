@@ -1,3 +1,5 @@
 node_modules/
-package-lock.json
-# Do not ignore package.json itself or any of the test files.
+.venv/
+__pycache__/
+.scratch/
+# The committed package-lock.json makes the standalone test harness reproducible.

@@ -1,14 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the pi-swival package.
-#
-# Runs three layers of check, ordered cheapest first:
-#   1. Manifest:    every path declared in package.json#pi resolves on disk.
-#   2. Frontmatter: every bundled agent has a name and description.
-#   3. Loadability: the offline SDK test loads the package and lists its agents.
-#
-# Designed to run in CI on a clean ubuntu-latest with Pi installed globally.
-# Exit non-zero on first failure.
-
+# Credential-free manifest, resource-loader, and catalogue smoke tests.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -77,18 +68,19 @@ for (const file of files) {
 if (!ok) process.exit(1);
 "
 
-step "3. Pi loads the package offline"
+step "3. Pi loads the declared resources offline"
 
-# Bootstrap before loading: a clean checkout has no YAML runtime dependency
-# or Vitest harness. setup.sh is idempotent when npm test runs it again.
-"$ROOT/tests/setup.sh"
+# No AgentSession, stdin, model selection, or ambient Pi/project resources.
+NPM_GLOBAL_ROOT="$(npm root -g 2>/dev/null || true)" node "$ROOT/scripts/smoke-loader.mjs" "$ROOT"
 
+step "4. Pi lists the agent catalogue offline"
+
+# Setup runs separately, outside npm's lifecycle. Smoke never installs.
 SCRATCH="$(mktemp -d -t pi-swival-smoke.XXXXXX)"
 trap 'rm -rf "$SCRATCH"' EXIT
 LOG="$SCRATCH/loader.log"
 
 # Reuse the guarded SDK loader test; do not create a CLI auth/model runtime.
-# Keep failures inside an OR-list so set -e cannot hide the captured output.
 ec=0
 (
   cd "$ROOT/tests"
@@ -101,6 +93,6 @@ if [[ $ec -ne 0 ]]; then
   fail "pi load failed"
 fi
 
-echo "  ok pi loaded the package cleanly"
+echo "  ok pi loaded the package and listed its agents cleanly"
 
 step "All smoke tests passed"

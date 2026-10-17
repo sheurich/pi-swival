@@ -1,21 +1,40 @@
 #!/usr/bin/env bash
-# Bootstrap the standalone vitest harness for the swival-subagent extension.
-# Idempotent — safe to re-run.
+# Bootstrap the standalone Vitest harness. Run directly, never through npm.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 if ! command -v npm >/dev/null 2>&1; then
-	echo "error: npm not found on PATH; install Node.js before running setup.sh." >&2
+	echo "error: npm not found on PATH; install Node.js before running tests/setup.sh." >&2
 	exit 1
 fi
 
-# 1. Install vitest locally.
-if [[ ! -d node_modules/vitest ]]; then
-	npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+if [[ -n "${npm_lifecycle_event:-}" || -n "${npm_config_allow_scripts:-}" ]]; then
+	cat >&2 <<'EOF'
+error: tests/setup.sh must be run directly, outside an npm lifecycle.
+
+npm exports your allow-scripts policy as npm_config_allow_scripts to lifecycle
+children. npm rejects a nested install under that policy even with
+--ignore-scripts. Run ./tests/setup.sh once, then run npm test. Your npm policy
+and configuration were left unchanged.
+EOF
+	exit 1
 fi
 
-# 2. Install the extension's declared runtime dependency without installing peers.
+pinned_types_present() {
+	node -e 'const pins = require("./package.json").devDependencies;
+	for (const name of ["typescript", "@types/node"]) {
+		try { if (require("./node_modules/" + name + "/package.json").version !== pins[name]) process.exit(1); }
+		catch { process.exit(1); }
+	}'
+}
+if [[ ! -d node_modules/vitest || ! -f node_modules/typescript/package.json ||
+	! -f node_modules/@types/node/package.json ]] || ! pinned_types_present; then
+	npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+fi
+pinned_types_present
+
+# Install the extension's declared runtime dependency without installing peers.
 if ! node -e '
 	const expected = require("../package.json").dependencies.yaml;
 	const installed = require("../node_modules/yaml/package.json").version;
@@ -25,96 +44,20 @@ if ! node -e '
 		--legacy-peer-deps --package-lock=false
 fi
 
-# 3. Find the Pi install so we can symlink the peer packages the extension
-#    imports from: @earendil-works/{pi-ai, pi-agent-core, pi-coding-agent,
-#    pi-tui} and typebox.
-PI_PKG=""
-npm_global_root=""
-npm_global_root="$(npm root -g 2>/dev/null)" || npm_global_root=""
-for candidate in \
-	/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent \
-	/opt/homebrew/lib/node_modules/@mariozechner/pi-coding-agent \
-	"${HOME}/.local/share/npm/lib/node_modules/@earendil-works/pi-coding-agent" \
-	"${HOME}/.local/share/npm/lib/node_modules/@mariozechner/pi-coding-agent" \
-	${npm_global_root:+"${npm_global_root}/@earendil-works/pi-coding-agent"} \
-	${npm_global_root:+"${npm_global_root}/@mariozechner/pi-coding-agent"}; do
-	if [[ -d "$candidate" ]]; then
-		PI_PKG="$candidate"
-		break
-	fi
-done
-
-if [[ -z "$PI_PKG" ]]; then
-	echo "error: could not locate pi-coding-agent (@earendil-works or @mariozechner); install Pi first." >&2
+npm_global_root="$(npm root -g 2>/dev/null || true)"
+NPM_GLOBAL_ROOT="$npm_global_root" node ../scripts/test-peer-bootstrap.mjs --link "$PWD/node_modules"
+if ! command -v uv >/dev/null 2>&1; then
+	echo "uv and Python 3.13 are required for the offline native audit tests." >&2
 	exit 1
 fi
-
-mkdir -p node_modules/@earendil-works
-
-# Determine the scope prefix used by this install (@earendil-works or @mariozechner).
-PI_SCOPE=""
-PI_MODULES_DIR=""
-if [[ -d "${PI_PKG}/node_modules/@earendil-works/pi-ai" ]]; then
-	PI_SCOPE="@earendil-works"
-	PI_MODULES_DIR="${PI_PKG}/node_modules"
-elif [[ -d "${PI_PKG}/node_modules/@mariozechner/pi-ai" ]]; then
-	PI_SCOPE="@mariozechner"
-	PI_MODULES_DIR="${PI_PKG}/node_modules"
-elif [[ -n "$npm_global_root" && -d "${npm_global_root}/@earendil-works/pi-ai" ]]; then
-	PI_SCOPE="@earendil-works"
-	PI_MODULES_DIR="${npm_global_root}"
-elif [[ -n "$npm_global_root" && -d "${npm_global_root}/@mariozechner/pi-ai" ]]; then
-	PI_SCOPE="@mariozechner"
-	PI_MODULES_DIR="${npm_global_root}"
-elif [[ -d "$(dirname "$PI_PKG")/pi-ai" ]]; then
-	PI_SCOPE="@earendil-works"
-	PI_MODULES_DIR="$(dirname "$PI_PKG")"
-else
-	echo "error: cannot find pi-ai under ${PI_PKG}/node_modules/ or ${npm_global_root}" >&2
+if [[ -L .venv ]]; then
+	echo "Refusing a symlinked test virtual environment." >&2
 	exit 1
 fi
-
-# The extension imports from @earendil-works/* — symlink to whatever scope
-# the Pi install uses internally.
-for pkg in pi-ai pi-agent-core; do
-	target=""
-	if [[ -d "${PI_MODULES_DIR}/${PI_SCOPE}/${pkg}" ]]; then
-		target="${PI_MODULES_DIR}/${PI_SCOPE}/${pkg}"
-	elif [[ -d "${PI_PKG}/node_modules/${PI_SCOPE}/${pkg}" ]]; then
-		target="${PI_PKG}/node_modules/${PI_SCOPE}/${pkg}"
-	fi
-	if [[ -n "$target" ]]; then
-		ln -sfn "$target" "node_modules/@earendil-works/${pkg}"
-	fi
-done
-
-# pi-tui may live under pi-coding-agent or as a sibling top-level package.
-PI_TUI="${PI_PKG}/node_modules/${PI_SCOPE}/pi-tui"
-if [[ ! -d "$PI_TUI" ]]; then
-	PI_TUI="${PI_MODULES_DIR}/${PI_SCOPE}/pi-tui"
+if [[ ! -d .venv ]]; then
+	uv --no-config venv --python 3.13 --no-python-downloads .venv
 fi
-if [[ ! -d "$PI_TUI" ]]; then
-	# Try sibling install (e.g. /opt/homebrew/lib/node_modules/@earendil-works/pi-tui)
-	PI_TUI="$(dirname "$PI_PKG")/pi-tui"
-fi
-if [[ -d "$PI_TUI" ]]; then
-	ln -sfn "$PI_TUI" "node_modules/@earendil-works/pi-tui"
-else
-	echo "warning: could not locate pi-tui; tests importing TUI types will fail." >&2
-fi
-
-ln -sfn "$PI_PKG" node_modules/@earendil-works/pi-coding-agent
-
-TYPEBOX_TARGET=""
-if [[ -d "${PI_PKG}/node_modules/typebox" ]]; then
-	TYPEBOX_TARGET="${PI_PKG}/node_modules/typebox"
-elif [[ -n "$npm_global_root" && -d "${npm_global_root}/typebox" ]]; then
-	TYPEBOX_TARGET="${npm_global_root}/typebox"
-elif [[ -d "$(dirname "$PI_PKG")/../typebox" ]]; then
-	TYPEBOX_TARGET="$(dirname "$PI_PKG")/../typebox"
-fi
-if [[ -n "$TYPEBOX_TARGET" ]]; then
-	ln -sfn "$TYPEBOX_TARGET" node_modules/typebox
-fi
-
-echo "swival-subagent tests ready. Run: npx vitest run"
+uv --no-config pip sync --python .venv/bin/python --only-binary :all: \
+	--require-hashes requirements.txt
+.venv/bin/python -c 'import sys, importlib.metadata; assert sys.version_info[:2] == (3, 13); assert importlib.metadata.version("swival") == "1.0.46"'
+echo "Test dependencies, selected Pi peers, and pinned Swival are ready. Run: npm run ci"

@@ -2,7 +2,7 @@
 
 Install Swival, point it at a provider, and verify connectivity.
 
-Tracked against Swival 1.0.45.
+Tracked against Swival 1.0.46.
 
 Bedrock and Vertex are reached through Swival's native `bedrock` and `vertexai` providers. No proxy process or second routing configuration is required.
 
@@ -66,10 +66,14 @@ Needs application default credentials (`gcloud auth application-default login`).
 
 ### ChatGPT subscription
 
+A named profile remains optional:
+
 ```toml
 provider = "chatgpt"
-model = "gpt-5.6-terra"
+model = "<configured-chatgpt-model>"
 ```
+
+For ChatGPT, standard upstream authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before a native audit. Device-login challenges cancel without returning their contents. Model selection does not grant account access or change host defaults. Never fall back after a missing, unavailable, or rejected selected route. Native auxiliary calls can omit effort, secret shielding, and filtering; required unpropagated controls fail closed.
 
 ### Local models
 
@@ -88,6 +92,16 @@ A per-profile `api_key` is fine here because the profile also sets `provider = "
 ### File-access defaults
 
 By default, Swival restricts file access to the base directory (auto-detected project root, or the current directory). Command execution defaults to unrestricted (`--commands all`). Add `yolo = true` only if you also want to lift the file-access restriction; otherwise leave it out and scope access with `--add-dir` / `--add-dir-ro`.
+
+## Native audit prerequisites
+
+The Pi adapter requires Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux remains unverified. Native mode uses configured Swival provider/model defaults or an existing `profileOverride` selected by installation policy. No specialist selected permits defaults. Missing or invalid selected specialists stop before launch; terminal selected-route failures stop without fallback. Names do not identify specialists or prove access. The ordinary provider examples above do not imply native adapter support. Offline native representatives cover ChatGPT, API-key OpenRouter, and an explicit OpenRouter-compatible loopback endpoint with a dedicated endpoint key and `max_context_tokens`. Generic/LMStudio/llama.cpp and equivalent dynamic-list routes are refused because upstream can replace the model after NotFound. Never convert a rejected route automatically. Other routes require compatible credential authority, source-only execution and policy propagation. No every-provider/version promise applies.
+
+For ChatGPT only, use standard upstream ChatGPT authentication, including login, token refresh, and auth-state writes. API-key/local routes receive no ChatGPT directory grant. Configure their selected key at execution time; never send a remote key to a local endpoint. The adapter does not inspect or export auth stores, change account access, or substitute another route. Native async is unsupported. A Pi crash or SIGKILL can leave Swival running without artifact export or claimed completion. Normal timeout, cancellation, and session shutdown stop the live owned process group.
+
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+
+Require source-only review and manually inspect patches. Native mode refuses protected encryption/filtering, strict-read isolation, custom sessions, proxies, unknown policy, and ambiguous routing. Never disable controls or add write grants to make launch succeed. See [the native audit skill](../../auditing-with-swival/SKILL.md).
 
 ## Verify
 
