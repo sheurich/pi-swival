@@ -7,6 +7,8 @@ import registerExtension from "../extensions/index.js";
 import { nativeTestPython as python } from "./nativePython.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
+// Cold pinned-upstream imports need a subprocess budget below the test deadline.
+const PREFLIGHT_PROCESS_TIMEOUT_MS = 15_000;
 const startupPath = process.env.PATH;
 beforeEach(() => {
 	process.env.PATH = (startupPath ?? "").split(path.delimiter).filter(path.isAbsolute).join(path.delimiter);
@@ -97,7 +99,16 @@ describe("native audit dispatch boundary", () => {
 		expect(fs.readdirSync(root)).toEqual([]);
 	});
 	it("registered native tool rejects an ambient proxy before artifacts, workers, or providers", async () => {
-		const source = repository(); const home = scratch();
+		const source = repository(); const home = scratch(); const bin = scratch();
+		// Satisfy executable discovery without an installed sandbox or any launch.
+		for (const name of ["agentfs", "nono"]) {
+			fs.writeFileSync(path.join(bin, name), [
+				`#!${python}`, "from pathlib import Path",
+				`Path(${JSON.stringify(path.join(root, `${name}-dispatch`))}).write_text("forbidden")`,
+				"raise SystemExit(1)", "",
+			].join("\n"), { mode: 0o755 });
+		}
+		process.env.PATH = `${bin}${path.delimiter}${process.env.PATH}`;
 		fs.mkdirSync(path.join(home, ".config"), { recursive: true });
 		const previous = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
 			hTtP_pRoXy: process.env.hTtP_pRoXy };
@@ -110,6 +121,7 @@ describe("native audit dispatch boundary", () => {
 				undefined, undefined, { cwd: source, hasUI: false });
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toMatch(/preflight failed.*No native worker\/provider was started/i);
+			expect(result.content[0].text).toContain("Unsupported native transport proxy requirements.");
 			expect(fs.readdirSync(root)).toEqual([]);
 			expect(fs.existsSync(path.join(root, "generic-dispatch"))).toBe(false);
 		} finally {
@@ -120,7 +132,9 @@ describe("native audit dispatch boundary", () => {
 	});
 });
 
-describe("native preflight protection requirements (no worker, no provider)", () => {
+describe("native preflight protection requirements (no worker, no provider)", {
+	timeout: PREFLIGHT_PROCESS_TIMEOUT_MS + 5000,
+}, () => {
 	it.each([
 		["global", 'encrypt_secrets = true'], ["project", 'llm_filter = "required-filter"'],
 		["global", 'encrypt_secrets_key = "synthetic-never-log-this"'],
@@ -200,7 +214,7 @@ async function runPreflight(source: string, home: string, environment = {}, rout
 	return new Promise<{ code: number; output: string }>((resolve) => {
 		const child = execFile(python, ["-I", path.join(ROOT, "scripts", "native_audit.py"), "--preflight"], {
 			cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1", ...environment },
-			timeout: 5000, maxBuffer: 64 * 1024,
+			timeout: PREFLIGHT_PROCESS_TIMEOUT_MS, maxBuffer: 64 * 1024,
 		}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 		child.stdin!.end(JSON.stringify({ source, routing }));
 	});

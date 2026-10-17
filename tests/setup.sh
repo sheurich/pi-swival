@@ -34,6 +34,16 @@ if [[ ! -d node_modules/vitest || ! -f node_modules/typescript/package.json ||
 fi
 pinned_types_present
 
+# Install the extension's declared runtime dependency without installing peers.
+if ! node -e '
+	const expected = require("../package.json").dependencies.yaml;
+	const installed = require("../node_modules/yaml/package.json").version;
+	process.exit(installed === expected ? 0 : 1);
+' >/dev/null 2>&1; then
+	npm install --prefix .. --ignore-scripts --no-audit --no-fund \
+		--legacy-peer-deps --package-lock=false
+fi
+
 npm_global_root="$(npm root -g 2>/dev/null || true)"
 NPM_GLOBAL_ROOT="$npm_global_root" node ../scripts/test-peer-bootstrap.mjs --link "$PWD/node_modules"
 if ! command -v uv >/dev/null 2>&1; then

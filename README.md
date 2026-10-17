@@ -31,6 +31,8 @@ Or install from a local checkout:
 pi install /path/to/pi-swival
 ```
 
+Pi installs runtime dependencies for managed git/npm packages. For a local checkout, install the pinned runtime dependency, `yaml` 2.9.0, from the checkout root with `npm install --ignore-scripts --legacy-peer-deps`.
+
 The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The five bundled swival agents under `agents/` are discovered automatically by the extension at runtime — no symlinks or manual copies needed.
 
 To override a bundled agent or add your own, place `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` in a project root (project scope). Discovery priority: project > user > bundled.
@@ -61,9 +63,33 @@ Key features beyond pi's example subagent extension:
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
 - Standard input task delivery (protects prompts from `ps aux` and bypasses `ARG_MAX` when `sandbox: builtin` is configured).
 - Operational telemetry (prompt cache token savings, security policy blocks, and storm breaker suppressions).
-- Async / background runs with cross-session `status` / `resume` / `interrupt`.
+- Async / background runs in single mode, with saved `status` / `resume` results across sessions and same-process `interrupt`.
 
 See `skills/swival/SKILL.md` for dispatch examples and `extensions/index.ts` for the full schema.
+
+#### Agent catalogue
+
+Call `swival-subagent` with `action: "list"` to inspect agent capabilities without launching Swival or probing a provider:
+
+```json
+{
+  "action": "list",
+  "cwd": "/path/to/project",
+  "agentScope": "both"
+}
+```
+
+`cwd` defaults to Pi's working directory. `agentScope` accepts `user` (the default), `project`, or `both`; bundled agents always remain available. Project discovery walks up from `cwd` to the nearest `.pi/swival-agents/` directory. List accepts only `action`, `cwd`, and `agentScope`. Dispatch and control fields, including `id`, `task`, overrides, and `async`, are rejected even when false or empty. List does not write files, prune artifacts, or ask for confirmation.
+
+The result's `details` contains `mode: "list"`, `schemaVersion: 1`, the selected scope, and up to 20 sorted agent rows. Names are limited to 80 characters, descriptions to 160, and model-facing text to 8192. `total` and `omitted` report exact agent counts. Rows expose descriptions, source scope, reviewer settings, configured sandbox/network settings, supported modes, and controls. They omit system prompts, command strings, provider routing, and definition paths.
+
+`configured` contains sanitized declarations after scope restrictions. Missing settings appear as `"unknown"`; `effectiveRuntime` is always `"unknown"`. The catalogue does not read Swival's runtime configuration or prove effective sandbox, network, or reviewer behavior.
+
+Discovery retains valid siblings and reports at most 12 fixed diagnostics with source scope. Codes are `invalid_yaml`, `invalid_frontmatter`, `invalid_definition`, `unreadable_definition`, `unreadable_directory`, and `outside_directory`. `diagnosticsTotal` and `diagnosticsOmitted` give exact counts without exposing parser messages or file contents.
+
+Invalid admitted definitions fail closed. An identified invalid override blocks dispatch for that name instead of selecting a lower-priority definition. A failure with an unresolved identity sets `dispatchBlocked: true` and blocks dispatch before launch. Symlinks outside the scanned directory remain excluded and nonblocking; discovery does not read their targets.
+
+`async: true` supports single dispatch only. `status` reports progress or final results. `resume` retrieves completed output and reviewer feedback; it does not restart execution. `interrupt` can stop only a run tracked by the same Pi process. Live steering is unsupported.
 
 ### Skills
 
@@ -140,19 +166,21 @@ pi-swival/
 ├── prompts/
 │   └── swival-audit.md         # slash-command-style audit walkthrough
 ├── scripts/                    # ordinary runner, native preflight/finalizer, smoke helpers
-└── tests/                      # offline unit, dispatch, and native entry-point tests
+└── tests/                      # offline unit, catalogue, extension-loader, and native tests
 ```
 
 ## Running the tests
 
-The harness covers parsing, dispatch, report acceptance, traces, snapshots, artifacts, cancellation, and documentation. Native tests execute released finding, verification, patch, and report phases with stubbed LLM responses and denied sockets and DNS. Lifecycle tests use local transport stubs. No live provider calls are part of the suite.
+The harness covers parsing, dispatch, report acceptance, traces, snapshots, artifacts, cancellation, documentation, agent discovery, and catalogue behavior. Native tests execute released finding, verification, patch, and report phases with stubbed LLM responses and denied sockets and DNS. Lifecycle tests use local transport stubs. No live provider calls are part of the suite.
+
+`tests/catalogueLoad.test.ts` loads this package through Pi 1.3.0's public extension loader with synthetic directories and checks the registered schema and list result. It blocks the real child-process boundary before imports and requires no session, authentication storage, or provider setup.
 
 ```bash
 ./tests/setup.sh      # first time only; run directly, not through npm
 npm test
 ```
 
-The offline harness uses Node 22.19+ or Node 24, selected Pi peers, uv, and installed Python 3.13. Setup links peers and syncs the hash-locked Swival 1.0.46/LiteLLM 1.103.4 fixture into ignored `tests/.venv`. Run setup directly, outside npm's lifecycle. Tests and typechecking never install dependencies. The peer-loader, locks, and typecheck setup are shared test prerequisites; ordinary runtime maintenance changes are not included.
+The offline harness uses Node 22.19+ or Node 24, selected Pi peers, uv, and installed Python 3.13. Setup installs the pinned YAML runtime dependency, links peers, and syncs the hash-locked Swival 1.0.46/LiteLLM 1.103.4 fixture into ignored `tests/.venv`. Run setup directly, outside npm's lifecycle. Tests and typechecking never install dependencies. The peer-loader, locks, and typecheck setup are shared test prerequisites; ordinary runtime maintenance changes are not included.
 
 From the package root:
 
@@ -164,7 +192,7 @@ npm run native-agentfs-integration  # explicit real native bootstrap/export gate
 npm run ci         # typecheck + smoke + ordinary agentfs canary + vitest
 ```
 
-The smoke test creates an isolated working directory and agent directory, uses in-memory settings, and loads only this package through `DefaultResourceLoader`. It checks the extension and `swival-subagent` tool, bundled skills and prompt, and agent frontmatter without starting a session or reading stdin.
+The smoke test checks manifest paths and agent frontmatter, then creates isolated working and agent directories to load only this package through `DefaultResourceLoader` with in-memory settings. It checks the extension and `swival-subagent` tool, bundled skills and prompt without starting a session or reading stdin. It also runs the guarded offline catalogue loader test. Run setup separately; smoke never installs dependencies.
 
 The unit suite uses synthetic CLI processes, released native phases, denied sockets/DNS, and mocked auth HTTP. It covers standard login/refresh/auth writes, inherited same-route policy-error retries, terminal errors, no fallback, tool denials, timeout/cancellation, descendants, and parent loss. The explicit native AgentFS integration command requires installed binaries and never skips a missing prerequisite. Its synthetic nono registration proves availability, not authenticity. API/local fixtures combine the real released zero-finding producer, resolver, AgentFS and finalizer with HTTP doubles. ChatGPT fixtures test standard refresh persistence and model-tool auth denial with synthetic evidence. These runs do not prove live account access or inference. Other platforms and live providers remain unverified.
 

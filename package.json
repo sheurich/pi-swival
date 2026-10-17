@@ -33,6 +33,9 @@
     "native-agentfs-integration": "./scripts/native-agentfs-integration-test.sh",
     "ci": "npm run typecheck && npm run smoke && npm run agentfs-integration && npm test"
   },
+  "dependencies": {
+    "yaml": "2.9.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
