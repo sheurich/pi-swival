@@ -248,6 +248,18 @@ class NativeEntryTests(unittest.TestCase):
         self.assertFalse(agent._MODEL_AUTOFIX)
 
     def test_default_api_and_explicit_local_endpoint(self):
+        self.write_config('provider="openrouter"\nmodel="example/concrete"\n'
+                          'max_context_tokens=128000\n')
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key"}), \
+             patch.object(agent, "resolve_provider", side_effect=FORBIDDEN), \
+             patch.object(authenticator, "Authenticator", side_effect=FORBIDDEN):
+            for endpoint in (None, "https://caller.invalid/v1", "http://127.0.0.1:8444/v1"):
+                with self.subTest(endpoint=endpoint):
+                    with self.assertRaises(bridge.NativeAuditError) as error:
+                        bridge.resolve_native_config({"source": str(self.repo),
+                                                      "routing": {"baseUrl": endpoint}})
+                    self.assertEqual(error.exception.reason, "CONFIG_INVALID")
+
         for endpoint in (None, "http://127.0.0.1:8444/v1"):
             with self.subTest(endpoint=endpoint):
                 self.write_config('provider="openrouter"\nmodel="example/concrete"\n'

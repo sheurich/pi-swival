@@ -38,13 +38,13 @@ class NativeAuditError(Exception):
 
 RUNTIME_VERSIONS = {"swival": "1.0.46", "litellm": "1.103.4"}
 OVERRIDE_KEYS = {
-    "provider": "provider", "model": "model", "baseUrl": "base_url",
+    "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
     "topP": "top_p", "seed": "seed", "maxOutputTokens": "max_output_tokens",
     "maxTurns": "max_turns", "providerTimeout": "provider_timeout",
 }
 ROUTING_KEYS = {
-    *OVERRIDE_KEYS.values(), "api_key", "user_agent", "extra_body", "aws_profile",
+    *OVERRIDE_KEYS.values(), "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
     "project", "location", "max_context_tokens", "retries", "prompt_cache",
     "sanitize_thinking", "show_thinking",
 }
@@ -149,6 +149,9 @@ def _parse_route(parser, values):
 
 def resolve_native_config(request):
     """Select through released precedence, then admit concrete native capabilities."""
+    routing = request.get("routing", {})
+    if not isinstance(routing, dict) or set(routing) - (set(OVERRIDE_KEYS) | {"profile"}):
+        raise NativeAuditError("CONFIG_INVALID")
     if (sys.version_info < (3, 13) or any(importlib.metadata.version(name) != version
                                        for name, version in RUNTIME_VERSIONS.items())):
         raise NativeAuditError("RUNTIME_UNSUPPORTED")
@@ -166,9 +169,6 @@ def resolve_native_config(request):
     raw = _scan_config(config_module.global_config_dir() / "config.toml")
     source = Path(request["source"]).resolve()
     _scan_config(source / "swival.toml", project=True)
-    routing = request.get("routing", {})
-    if not isinstance(routing, dict) or set(routing) - (set(OVERRIDE_KEYS) | {"profile"}):
-        raise NativeAuditError("CONFIG_INVALID")
     profile = routing.get("profile", raw.get("active_profile"))
     if profile is not None or "profile" in routing:
         if not _identifier(profile, 80):

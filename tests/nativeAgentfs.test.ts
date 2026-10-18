@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { nativeTestPython } from "./nativePython.js";
 import { captureNativeRuntime, prepareNativeAudit, inspectNativeAudit } from "../extensions/native-audit.js";
-import { fixtureRepository, nativeScratch } from "./nativeFixtures.js";
+import { fixtureRepository, fixtureSearchPath, nativeScratch } from "./nativeFixtures.js";
 
 // This probes CLI bootstrap and write-through snapshot collection, not audit completion.
 // Upstream --allow base_dir makes the independent snapshot writable on the host.
@@ -240,7 +240,7 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
  agent.main()
 `, { mode: 0o700 });
 	const runtime = { ...captureNativeRuntime(), python: selected, cli,
-		searchPath: (process.env.PATH ?? "").split(path.delimiter).filter(path.isAbsolute).join(path.delimiter),
+		searchPath: fixtureSearchPath(),
 		environment: { HOME: home, XDG_CONFIG_HOME: config, TMPDIR: path.join(root, "tmp"), NONO_NO_UPDATE_CHECK: "1" } };
 	fs.mkdirSync(runtime.environment.TMPDIR);
 	const params = { audit: { all: true, workers: 1, patchMaxTurns: 5 }, providerOverride: "chatgpt", modelOverride: "gpt-offline", timeoutMs: 30_000 };
@@ -282,7 +282,7 @@ it.each(["auth-runtime", "evidence-alias"])("rejects %s before real AgentFS rece
 		fixtureGit(source, "add", "."); fixtureGit(source, "commit", "-m", "evidence alias fixture");
 	}
 	const directory = path.join(home, ".agentfs/run");
-	const runtime = { ...captureNativeRuntime(), python: selected, cli,
+	const runtime = { ...captureNativeRuntime(), python: selected, cli, searchPath: fixtureSearchPath(),
 		environment: { HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), TMPDIR: path.join(root, "tmp"),
 			...(kind === "auth-runtime" ? { CHATGPT_TOKEN_DIR: directory } : {}) } };
 	fs.mkdirSync(runtime.environment.TMPDIR);
@@ -339,7 +339,7 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
  report_path.write_text(json.dumps(report))
  print('REAL_RELEASED_API_AUDIT_WITH_HTTP_DOUBLES', flush=True)
 `, { mode: 0o700 });
-	const runtime = { ...captureNativeRuntime(), python: selected, cli,
+	const runtime = { ...captureNativeRuntime(), python: selected, cli, searchPath: fixtureSearchPath(),
 		environment: { HOME: home, XDG_CONFIG_HOME: config, TMPDIR: path.join(root, "tmp"),
 			OPENROUTER_API_KEY: "synthetic-dedicated-fixture-key", CHATGPT_API_KEY: "synthetic-unrelated-key" } };
 	fs.mkdirSync(runtime.environment.TMPDIR);

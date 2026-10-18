@@ -21,7 +21,7 @@ const scratch = () => {
 	return dir;
 };
 const git = (cwd: string, ...args: string[]) => execFileSync("git", [
-	"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args,
+	"-c", "core.hooksPath=/dev/null", "-c", "core.excludesFile=/dev/null", "-c", "commit.gpgsign=false", ...args,
 ], { cwd, timeout: 5000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }).toString();
 const repository = () => {
 	const dir = scratch();
@@ -91,6 +91,8 @@ describe("native audit dispatch boundary", () => {
 		{ selfReviewOverride: false }, { reviewerOverride: "/bin/true" }, { encryptSecretsOverride: false },
 		{ networkOverride: "full" }, { extraArgs: ["--yolo"] }, { subagentsOverride: true },
 		{ instructionsFullOverride: true }, { output: "/tmp/out" },
+		{ baseUrlOverride: "https://caller.invalid/v1" }, { baseUrlOverride: "http://127.0.0.1:8444/v1" },
+		{ baseUrlOverride: null },
 	])("rejects incompatible or bypass fields without native launch: %j", async (other) => {
 		const result = await tool.execute("audit", { audit: {}, ...other }, undefined, undefined, { cwd: ROOT, hasUI: false });
 		expect(result.isError).toBe(true);
@@ -282,7 +284,8 @@ describe("independent committed snapshot", () => {
 		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
 		const source = repository(); const target = path.join(source, file);
 		fs.mkdirSync(path.dirname(target), { recursive: true }); fs.writeFileSync(target, "source-controlled evidence");
-		git(source, "add", "."); git(source, "commit", "-m", "reserved evidence fixture");
+		git(source, "add", "--", file); git(source, "commit", "-m", "reserved evidence fixture");
+		expect(git(source, "show", `HEAD:${file}`)).toBe("source-controlled evidence");
 		const destination = path.join(scratch(), "snapshot");
 		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
 		expect(fs.existsSync(destination)).toBe(false);

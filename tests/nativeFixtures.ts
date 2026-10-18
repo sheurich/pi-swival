@@ -9,9 +9,13 @@ export function nativeScratch(prefix: string): string {
 	if (fs.realpathSync(root) !== root) throw new Error("Fixture temp root escaped the worktree");
 	return fs.mkdtempSync(path.join(root, prefix));
 }
+// Fixture runtimes must not inherit cwd-relative executable search entries.
+export function fixtureSearchPath(searchPath = process.env.PATH ?? ""): string {
+	return searchPath.split(path.delimiter).filter(path.isAbsolute).join(path.delimiter);
+}
 export function fixtureGit(cwd: string, ...args: string[]): string {
 	return execFileSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-		"-c", "commit.gpgsign=false", ...args], { cwd, timeout: 5000, maxBuffer: 1024 * 1024,
+		"-c", "core.excludesFile=/dev/null", "-c", "commit.gpgsign=false", ...args], { cwd, timeout: 5000, maxBuffer: 1024 * 1024,
 		stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
 }
 export function fixtureRepository(root: string): string {

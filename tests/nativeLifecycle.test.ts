@@ -131,7 +131,9 @@ describe("synchronous native CLI lifecycle", () => {
 		"refuses a source alias in the upstream %s write exception before launch", async (exception) => {
 			const f = fixture();
 			fs.symlinkSync(f.source, path.join(f.runtime.environment.HOME, exception));
-			await expect(f.start()).rejects.toThrow(/built-in writable/);
+			// AgentFS descendants now fail the cross-platform runtime-path gate;
+			// Library still exercises the Darwin-only built-in write exceptions.
+			await expect(f.start()).rejects.toThrow(exception === ".agentfs" ? /runtime configuration.*source\/Git/i : /built-in writable/);
 			expect(fs.existsSync(f.artifactDir)).toBe(false);
 		}, 20_000);
 	it.each(["git", "python", "cli", "agentfs", "nono"] as const)(

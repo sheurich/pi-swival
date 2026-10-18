@@ -7,7 +7,7 @@ const releasedKey = (finding: Record<string, unknown>) => execFileSync(python, [
 	"import json, sys",
 	"from swival.audit import FindingRecord, _finding_key",
 	"print(_finding_key(FindingRecord(**json.load(sys.stdin))))",
-].join("; ")], { input: JSON.stringify(finding), timeout: 5000, maxBuffer: 16 * 1024 }).toString().trim();
+].join("; ")], { input: JSON.stringify(finding), shell: false, timeout: 5000, maxBuffer: 16 * 1024 }).toString().trim();
 
 const cases = [
 	["acbd6d629a17", { title: "test", finding_type: "security", severity: "high",
@@ -21,6 +21,11 @@ describe("released Swival finding coverage identity", () => {
 	it.each(cases)("matches pinned Python serialization for %s", (expected, finding) => {
 		expect(releasedKey(finding)).toBe(expected);
 		expect(nativeFindingKey(finding)).toBe(expected);
+	});
+
+	it("matches the released _finding_key for DEL in scalar and list fields", () => {
+		const finding = { ...cases[0][1], title: "DEL\u007f", proof: ["before\u007fafter"] };
+		expect(nativeFindingKey(finding)).toBe(releasedKey(finding));
 	});
 
 	it("rejects values outside the released FindingRecord schema", () => {

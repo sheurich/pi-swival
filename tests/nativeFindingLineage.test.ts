@@ -13,13 +13,13 @@ afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursiv
 
 const producerOutput = (scenario: string, home: string) => JSON.parse(execFileSync(python,
 	["-I", "-B", path.join(import.meta.dirname, "native_lineage_fixture.py"), scenario], {
-		timeout: 10_000, maxBuffer: 1024 * 1024,
+		shell: false, timeout: 10_000, maxBuffer: 1024 * 1024,
 		env: { HOME: home, PATH: process.env.PATH, TMPDIR: path.join(home, "tmp"), LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
 	}).toString());
 
 type ArtifactPairMode = "distinct" | "report-reuse" | "patch-reuse" | "both-reused";
 
-function lineage(scenario: string, artifactPairMode?: ArtifactPairMode) {
+function lineage(scenario: string, artifactPairMode?: ArtifactPairMode, patchContent?: string) {
 	const artifactRoot = nativeScratch("native-lineage-"); roots.push(artifactRoot);
 	const runId = `lineage-${scenario}`; const root = path.join(artifactRoot, runId); fs.mkdirSync(root);
 	const generated = producerOutput(scenario, root);
@@ -68,7 +68,7 @@ function lineage(scenario: string, artifactPairMode?: ArtifactPairMode) {
 	}
 	for (const entry of Object.values(artifactState)) {
 		fs.writeFileSync(path.join(findingsDir, entry.report_filename), "synthetic artifact report\n");
-		fs.writeFileSync(path.join(findingsDir, entry.patch_filename), "synthetic artifact patch\n");
+		fs.writeFileSync(path.join(findingsDir, entry.patch_filename), patchContent ?? "synthetic artifact patch\n");
 	}
 	const fallbackCommit = "1".repeat(40);
 	const fallbackScope = { branch: "main", commit: fallbackCommit, tracked_files: ["code.py"], mandatory_files: ["code.py"], focus: [] };
@@ -115,6 +115,38 @@ describe("released Swival finding lineage", () => {
 			const recovered = await fixture.recover(action);
 			expect(recovered.isError, "Native synchronous runs are never resurrected from disk").toBe(true);
 		}
+	}, 15_000);
+
+	it.each(["", " \t\r\n"])("rejects released keep lineage with a blank patch: %j", async (content) => {
+		expect(await lineage("keep", undefined, content).direct).toMatchObject({
+			status: "partial", error: "Native finding patch is empty.",
+		});
+	});
+
+	it("rejects a released Phase 2 overflow followed by a valid non-all SKIP", async () => {
+		const root = nativeScratch("native-phase2-overflow-"); roots.push(root);
+		const generated = JSON.parse(execFileSync(python,
+			["-I", "-B", path.join(import.meta.dirname, "native_completion_fixture.py")], {
+				timeout: 10_000, maxBuffer: 1024 * 1024, shell: false,
+				env: { HOME: root, PATH: process.env.PATH, TMPDIR: root, LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
+			}).toString());
+		expect(generated.producer).toEqual({ version: "1.0.46",
+			audit_sha256: "be7f711d303c8929a1ed388e80c569b0e851587c72f0154d24e7e3a8546f4902" });
+		expect(generated.triage).toMatchObject({ priority: "SKIP", confidence: "high", triage_failure_mode: null });
+		expect(generated.transport_calls).toBe(2);
+		expect(generated.persisted_state).toMatchObject({ metrics: { truncated_calls: 1 },
+			truncated_files: {}, candidate_files: [], deep_reviewed_files: [], select_all: false });
+		const f = completeNativeFixture(root, generated.persisted_state);
+		const command = "/audit --workers 1 --patch-max-turns 5";
+		const report = JSON.parse(fs.readFileSync(path.join(root, "evidence", "native-cli-report.json"), "utf8"));
+		f.write("evidence/native-cli-report.json", { ...report, task: command });
+		f.write("manifest.json", { snapshotCommit: f.scope.commit, files: f.scope.tracked_files, scope: f.scope,
+			sandbox: "agentfs", session: f.session, command, audit: { all: false }, route: f.route });
+		expect(await inspectNativeAudit(root, 0)).toMatchObject({ status: "partial", error: expect.stringMatching(/truncated coverage/) });
+		// Counterfactual control: only the released truncation metric prevents completion.
+		f.write("evidence/native-state/abc12345/state.json", { ...generated.persisted_state,
+			metrics: { ...generated.persisted_state.metrics, truncated_calls: 0 } });
+		expect((await inspectNativeAudit(root, 0)).status).toBe("completed");
 	}, 15_000);
 
 	it("accepts two independently keyed findings with distinct artifact pairs", async () => {

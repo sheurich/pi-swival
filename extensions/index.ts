@@ -1915,8 +1915,8 @@ export async function persistArtifacts(
 
 // ------------------------------------------------- artifact lifecycle --
 
+// Control classification requires native metadata/evidence, not an agent-name prefix.
 async function isNativeArtifact(directory: string): Promise<boolean> {
-	if (path.basename(directory).startsWith("native-audit-")) return true;
 	for (const name of ["snapshot", "request.json", path.join("evidence", "native-state")]) {
 		try { await fs.promises.lstat(path.join(directory, name)); return true; }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true; }
@@ -1957,7 +1957,8 @@ export async function pruneOldArtifacts(
 		try {
 			const stat = await fs.promises.stat(fullPath);
 			if (!stat.isDirectory() || stat.mtimeMs >= cutoff) continue;
-			if (await isNativeArtifact(fullPath)) continue;
+			// Retention is deliberately more conservative than control classification.
+			if (name.startsWith("native-audit-") || await isNativeArtifact(fullPath)) continue;
 			// Fix 4: never prune a directory belonging to an in-flight run.
 			if (activeArtifactDirs.has(fullPath)) continue;
 			// Fix 4: require completed.json — a missing marker means the run is

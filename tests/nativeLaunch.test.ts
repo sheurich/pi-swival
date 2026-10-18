@@ -66,7 +66,8 @@ describe("native CLI launch contract", () => {
 		for (const mutation of [{ version: 1 }, { endpoint: "http://user:synthetic-secret@offline.invalid" },
 			{ provider: "synthetic\nsecret" }, { options: { api_key: "synthetic-secret" } },
 			{ runtime: { swival: "unproved", litellm: "1.103.4" } }, { selection: { profileSource: "explicit", explicitFields: [] } },
-			{ reportIdentity: { provider: "openrouter", model: "replacement" } }]) {
+			{ reportIdentity: { provider: "openrouter", model: "replacement" } },
+			{ selection: { profileSource: null, explicitFields: ["baseUrl"] } }]) {
 			expect(() => parse(JSON.stringify({ ...route, ...mutation }), true)).toThrow(/preflight/i);
 		}
 		expect(() => parse('{"ok":false,"reason":"PROFILE_UNAVAILABLE"}', false)).toThrow(/profile.*unavailable.*no fallback/i);

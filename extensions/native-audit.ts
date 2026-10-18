@@ -3,7 +3,6 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
-import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { isDeepStrictEqual } from "node:util";
@@ -19,7 +18,7 @@ export interface NativeAuditOptions {
 
 const NATIVE_FIELDS = new Set([
 	"audit", "async", "timeoutMs", "maxInlineBytes", "profileOverride", "modelOverride",
-	"providerOverride", "baseUrlOverride", "reasoningEffortOverride", "temperatureOverride",
+	"providerOverride", "reasoningEffortOverride", "temperatureOverride",
 	"topPOverride", "seedOverride", "maxTurnsOverride", "maxOutputTokensOverride",
 	"providerTimeoutOverride",
 ]);
@@ -97,6 +96,23 @@ async function pathIsWithin(location: string, root: string): Promise<boolean> {
 		}
 		if (path.dirname(current) === current) return false;
 	}
+}
+
+/** Resolve directory metadata, including future descendants and dangling directory aliases. */
+async function canonicalRuntimePath(directory: string, directoryOnly = true, links = 0): Promise<string> {
+	let stat;
+	try { stat = await fs.lstat(directory); }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		return path.join(await canonicalRuntimePath(path.dirname(directory), true, links), path.basename(directory));
+	}
+	if (stat.isSymbolicLink()) {
+		if (links >= 40) throw new Error("Runtime configuration symlink limit exceeded.");
+		const target = await fs.readlink(directory);
+		return canonicalRuntimePath(path.isAbsolute(target) ? target : `${path.dirname(directory)}${path.sep}${target}`, directoryOnly, links + 1);
+	}
+	if (directoryOnly ? !stat.isDirectory() : !stat.isFile()) throw new Error("Runtime configuration path has an unsupported type.");
+	return fs.realpath(directory);
 }
 
 /** Validate metadata only; never read, copy, or export an authentication record. */
@@ -211,7 +227,7 @@ const routeIdentifier = (value: unknown, limit = 160): value is string => typeof
 	!/[A-Za-z0-9]{40,}|(?:^|\/)\.\.?(?:\/|$)/.test(value);
 const routeOptions = new Set(["max_output_tokens", "max_turns", "provider_timeout", "retries",
 	"temperature", "top_p", "seed", "max_context_tokens"]);
-const explicitRouteFields = new Set(["profile", "provider", "model", "baseUrl", "reasoningEffort",
+const explicitRouteFields = new Set(["profile", "provider", "model", "reasoningEffort",
 	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout"]);
 const routeFailure = () => new Error("Native audit configuration preflight failed: invalid or unsupported metadata. No native worker/provider was started.");
 
@@ -590,11 +606,57 @@ export async function prepareNativeAudit(
 	const identity = await sourceIdentity(cwd, trustedGit);
 	if (await fs.realpath(cwd) !== identity.sourceRoot) throw new Error("Native audit requires repository-root cwd.");
 	const protectedRoots = [identity.sourceRoot, identity.sourceGitDir, identity.sourceWorktreeGitDir];
-	const input = runtime.environment ?? process.env;
+	const input = { ...(runtime.environment ?? process.env) };
+	// These roots select operator configuration and AgentFS runtime state. Validate
+	// before any configuration import or native executable, on every platform.
+	for (const key of ["HOME", "XDG_CONFIG_HOME"] as const) {
+		const configured = key === "HOME" ? input.HOME : input.XDG_CONFIG_HOME ?? path.join(input.HOME!, ".config");
+		try {
+			if (!configured || !path.isAbsolute(configured) || /[\x00-\x1f\x7f]/.test(configured)) throw new Error();
+			const canonical = await canonicalRuntimePath(configured);
+			for (const root of protectedRoots) {
+				// A normal home containing the repository is valid; only refuse roots
+				// at or beneath source/Git, not ancestors of those protected paths.
+				if (await pathIsWithin(canonical, root)) throw new Error();
+			}
+			input[key] = canonical;
+		} catch {
+			throw new Error("Native audit runtime configuration roots must be absolute directories outside source/Git.");
+		}
+	}
 	const session = `native-${randomBytes(16).toString("hex")}`;
-	if (!input.HOME || !path.isAbsolute(input.HOME)) throw new Error("Native audit requires an absolute home.");
+	// XDG/HOME themselves may be innocent while these descendants alias source
+	// or Git. Resolve dangling aliases too, before imports or native probes.
+	const effectivePaths = Object.freeze({
+		configFile: path.join(input.XDG_CONFIG_HOME!, "swival", "config.toml"),
+		nonoRoot: path.join(input.XDG_CONFIG_HOME!, "nono"),
+		sessionRoot: path.join(input.HOME!, ".agentfs", "run", session),
+	});
+	const resolveRuntimePaths = async () => {
+		try {
+			const resolved = {
+				configFile: await canonicalRuntimePath(effectivePaths.configFile, false),
+				nonoRoot: await canonicalRuntimePath(effectivePaths.nonoRoot),
+				sessionRoot: await canonicalRuntimePath(effectivePaths.sessionRoot),
+			};
+			for (const [key, target] of Object.entries(resolved)) {
+				for (const root of protectedRoots) {
+					if (await pathIsWithin(target, root) || key !== "configFile" && await pathIsWithin(root, target)) throw new Error();
+				}
+			}
+			return Object.freeze(resolved);
+		} catch {
+			throw new Error("Native audit runtime configuration paths must be outside source/Git and non-overlapping writable roots.");
+		}
+	};
+	const runtimePaths = await resolveRuntimePaths();
+	const assertRuntimePaths = async () => {
+		if (!isDeepStrictEqual(runtimePaths, await resolveRuntimePaths())) {
+			throw new Error("Native audit runtime configuration paths changed during preparation.");
+		}
+	};
 	if (process.platform === "darwin") {
-		await assertNativeSourceIsolation(protectedRoots, agentfsDarwinWriteRoots(input.HOME, session));
+		await assertNativeSourceIsolation(protectedRoots, agentfsDarwinWriteRoots(input.HOME!, session));
 	}
 	const pin = async (bin: string, virtualenv = false) => {
 		if (!path.isAbsolute(bin)) throw new Error("Native runtime paths must be absolute.");
@@ -629,7 +691,10 @@ export async function prepareNativeAudit(
 		if (field.endsWith("Override") && params[field] !== undefined) routing[field.slice(0, -8)] = params[field];
 	}
 	const request: Record<string, any> = { source: identity.sourceRoot, routing, audit };
-	const preflight = () => nativePreflight(python, identity.sourceRoot, JSON.stringify(request), preflightEnv);
+	const preflight = async () => {
+		await assertRuntimePaths();
+		return nativePreflight(python, identity.sourceRoot, JSON.stringify(request), preflightEnv);
+	};
 	const { route } = await preflight();
 	checkCancelled();
 	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider);
@@ -638,15 +703,18 @@ export async function prepareNativeAudit(
 		env.CHATGPT_TOKEN_DIR = authStore.directory;
 		env.CHATGPT_AUTH_FILE = authStore.filename;
 	}
+	await assertRuntimePaths();
 	if (!(await boundedExec(agentfs, ["--version"], cwd, undefined, env, 5000, 16384)).toString().match(/(?:^|\s)v?0\.6\.4(?:\s|$)/)) {
 		throw new Error("Native audit requires tested AgentFS 0.6.4. No fallback.");
 	}
+	await assertRuntimePaths();
 	await boundedExec(nono, ["--version"], cwd, undefined, env, 5000, 16384);
+	await assertRuntimePaths();
 	if ((await boundedExec(agentfs, ["ps"], cwd, undefined, env, 5000, 65536)).toString().includes(session)) {
 		throw new Error("Refusing a reused native AgentFS session.");
 	}
 	try {
-		await fs.lstat(path.join(env.HOME ?? os.homedir(), ".agentfs", "run", session));
+		await fs.lstat(runtimePaths.sessionRoot);
 		throw new Error("Refusing a pre-existing native AgentFS session.");
 	} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 	checkCancelled();
@@ -669,8 +737,7 @@ export async function prepareNativeAudit(
 		await fs.writeFile(path.join(config, "swival", "config.toml"), "# Inert native configuration.\n", { mode: 0o600 });
 		// Upstream checks the operator's installed nono profile. Do not copy it,
 		// replace its policy, or claim authenticity from an availability check.
-		const originalConfig = input.XDG_CONFIG_HOME ?? path.join(input.HOME ?? os.homedir(), ".config");
-		await fs.symlink(path.join(originalConfig, "nono"), path.join(config, "nono"));
+		await fs.symlink(runtimePaths.nonoRoot, path.join(config, "nono"));
 		env.XDG_CONFIG_HOME = config;
 		const bin = path.join(runDir, "runtime-bin"); await fs.mkdir(bin, { mode: 0o700 });
 		for (const [name, target] of [["git", trustedGit.executable], ["agentfs", agentfs], ["nono", nono]]) {
@@ -683,6 +750,7 @@ export async function prepareNativeAudit(
 			sandbox: "agentfs", session, authStore, route, scope, audit, command: args.at(-1) }, null, 2), { mode: 0o600 });
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
 		checkCancelled();
+		await assertRuntimePaths();
 	} catch (error) {
 		await fs.rm(runDir, { recursive: true, force: true });
 		throw error;
@@ -813,7 +881,7 @@ function releasedFinding(value: unknown): ReleasedFindingRecord | undefined {
 		triage_decision: triage, threat_model: threat };
 }
 
-const pythonAsciiString = (value: string) => JSON.stringify(value).replace(/[\u0080-\uffff]/g,
+const pythonAsciiString = (value: string) => JSON.stringify(value).replace(/[\u007f-\uffff]/g,
 	(character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const pythonStringList = (value: string[]) => `[${value.map(pythonAsciiString).join(", ")}]`;
 
@@ -1075,10 +1143,13 @@ export async function inspectNativeAudit(artifactDir: string, exitCode: number):
 				if ((await fs.realpath(file)) !== file || !stat.isFile() || stat.size > 8 * 1024 * 1024) {
 					throw new Error("Missing regular bounded native report/patch pair.");
 				}
-				if (extension === "md" && !(await fs.readFile(file, "utf8")).trim()) {
-					return { status: "partial", error: "Native finding report is empty.", statePath };
+				if (!(await fs.readFile(file, "utf8")).trim()) {
+					return { status: "partial", error: `Native finding ${extension === "md" ? "report" : "patch"} is empty.`, statePath };
 				}
 			}
+		}
+		if (Object.hasOwn(state.metrics, "truncated_calls") && state.metrics.truncated_calls !== 0) {
+			return { status: "partial", error: "Native audit has incomplete or truncated coverage.", statePath };
 		}
 		return { status: "completed", answer: report.result.answer, statePath };
 	} catch { return { status: "failed", error: "Native audit lacks valid state, scope, or report/patch evidence." }; }

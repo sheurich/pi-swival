@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { nativeScratch } from "./nativeFixtures.js";
+import { completeNativeFixture, nativeScratch } from "./nativeFixtures.js";
+import { inspectNativeAudit } from "../extensions/native-audit.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { pruneOldArtifacts } from "../extensions/index.js";
 
@@ -58,6 +59,29 @@ describe("native-audit-lifecycle shared finalization", () => {
 		expect(checked).toBe(true); expect(term.shutdown).toBe("verified");
 		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
 	});
+	it.each([
+		["absent", undefined, "completed"], ["zero", 0, "completed"],
+		["positive", 1, "partial"], ["negative", -1, "partial"], ["fraction", 0.5, "partial"],
+		["string", "0", "partial"], ["null", null, "partial"], ["boolean", false, "partial"],
+		["object", {}, "partial"], ["array", [], "partial"], ["unsafe", 2 ** 53, "partial"],
+	] as const)("preserves and checks %s truncated_calls after finalization", async (_name, count, status) => {
+		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const metrics = count === undefined ? {} : { truncated_calls: count };
+		const prepared = completeNativeFixture(f.runDir, { metrics });
+		fs.writeFileSync(path.join(f.state, "state.json"), JSON.stringify(prepared.state));
+		fs.copyFileSync(path.join(f.runDir, "evidence", "native-cli-report.json"),
+			path.join(f.runDir, "snapshot", "native-cli-report.json"));
+		fs.rmSync(path.join(f.runDir, "evidence", "native-state"), { recursive: true });
+		fs.rmSync(path.join(f.runDir, "completed.json"));
+		fs.writeFileSync(path.join(f.runDir, "request.json"), JSON.stringify({ sandbox: "agentfs" }));
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
+		expect(term).toMatchObject({ exitCode: 0, shutdown: "verified", boundary: "agentfs-cli" });
+		expect(JSON.parse(fs.readFileSync(path.join(prepared.stateDir, "state.json"), "utf8")).metrics).toEqual(metrics);
+		const result = await inspectNativeAudit(f.runDir, 0);
+		expect(result.status).toBe(status);
+		if (status === "partial") expect(result.error).toMatch(/truncated coverage/);
+	});
+
 	it("preserves byte-identical stopped evidence before removing all owned temporary resources", async () => {
 		const f = fixture();
 		const { finalizeNativeAudit, readNativeTerminal } = lifecycle();
