@@ -751,6 +751,8 @@ export async function prepareNativeAudit(
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
 		checkCancelled();
 		await assertRuntimePaths();
+		// No asynchronous work may separate this final check from spawn.
+		checkCancelled();
 	} catch (error) {
 		await fs.rm(runDir, { recursive: true, force: true });
 		throw error;

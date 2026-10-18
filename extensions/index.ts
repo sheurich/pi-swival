@@ -3140,11 +3140,23 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 	const nativeRuntime = captureNativeRuntime(options.nativePython);
 	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
 	const nativeRuns = new Set<NativeAuditLaunch>();
-	const preparing = new Set<AbortController>();
+	// Track the whole operation, including preparation and post-run inspection.
+	// These promises only resolve, so rejected preparation/finalization cannot
+	// leave an unhandled rejection or prevent the shutdown drain.
+	const nativeOperations = new Map<AbortController, Promise<void>>();
+	const shutdownReason = "Native audit cancelled during session shutdown.";
+	let shutdowns = 0;
 	pi.on?.("session_shutdown", async () => {
-		for (const controller of preparing) controller.abort();
-		for (const run of nativeRuns) run.cancel("Native audit cancelled during session shutdown.");
-		await Promise.allSettled([...nativeRuns].map((run) => run.completion));
+		shutdowns++;
+		try {
+			while (nativeOperations.size) {
+				for (const run of nativeRuns) run.cancel(shutdownReason);
+				for (const controller of nativeOperations.keys()) controller.abort();
+				await Promise.allSettled([...nativeOperations.values()]);
+			}
+		} finally {
+			shutdowns--;
+		}
 	});
 	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails | undefined>({
 		name: "swival-subagent",
@@ -3190,7 +3202,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				const abort = () => controller.abort();
 				signal?.addEventListener("abort", abort, { once: true });
 				if (signal?.aborted) abort();
-				preparing.add(controller);
+				let finishOperation!: () => void;
+				nativeOperations.set(controller, new Promise<void>((resolve) => { finishOperation = resolve; }));
+				// A drain is temporary: do not change reuse after session_shutdown.
+				if (shutdowns) controller.abort();
 				let run: NativeAuditLaunch | undefined;
 				try {
 					const input = params as unknown as Record<string, unknown>;
@@ -3201,8 +3216,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 					const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
 					run = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
 						artifactDir, runId, nativeMaxTimeoutMs, controller.signal);
-					preparing.delete(controller);
 					nativeRuns.add(run);
+					// Defensively stop a live handle returned after cancellation, even
+					// if preparation did not observe its signal before returning.
+					if (controller.signal.aborted) run.cancel(shutdowns ? shutdownReason : undefined);
 					const routeText = `Resolved native route: ${run.route.provider}/${run.route.model}` +
 						(run.route.endpoint ? `; endpoint=${run.route.endpoint}` : "") +
 						(run.route.profile ? `; profile=${run.route.profile}` : "") +
@@ -3219,9 +3236,10 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				} catch (error) {
 					return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
 				} finally {
-					preparing.delete(controller);
 					signal?.removeEventListener("abort", abort);
 					if (run) nativeRuns.delete(run);
+					nativeOperations.delete(controller);
+					finishOperation();
 				}
 			}
 
