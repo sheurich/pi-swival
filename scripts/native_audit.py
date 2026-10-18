@@ -95,7 +95,8 @@ def _scan_config(filename, *, project=False):
         raw = tomllib.loads(filename.read_text(encoding="utf-8"))
     except Exception as exc:
         raise NativeAuditError("CONFIG_INVALID") from exc
-    _requirements(raw)
+    # Upstream still validates every profile's schema; selected policy is checked later.
+    _requirements({key: value for key, value in raw.items() if key != "profiles"})
     known = set(config_module.CONFIG_KEYS) | {
         "profiles", "active_profile", "audit", "mcp_servers", "a2a_servers", "serve_skills",
     }

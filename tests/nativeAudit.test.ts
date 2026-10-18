@@ -211,6 +211,66 @@ describe("native preflight protection requirements (no worker, no provider)", {
 	});
 });
 
+describe("profile-scoped requirements", {
+	timeout: PREFLIGHT_PROCESS_TIMEOUT_MS + 5000,
+}, () => {
+	const profileConfig = [
+		'provider = "chatgpt"', 'model = "gpt-default"',
+		'[profiles.audit]', 'provider = "chatgpt"', 'model = "gpt-audit"',
+		'[profiles.local]', 'provider = "lmstudio"', 'model = "synthetic-local"', 'sanitize_thinking = true',
+		'[profiles.protected]', 'provider = "chatgpt"', 'model = "gpt-protected"', 'sanitize_thinking = true',
+		'',
+	].join("\n");
+	it.each([
+		{ name: "explicit allowed profile despite unused sanitizer profiles", prefix: "", routing: { profile: "audit" },
+			model: "gpt-audit", profile: "audit", profileSource: "explicit" },
+		{ name: "allowed active profile despite unused policy", prefix: 'active_profile = "audit"\n', routing: {},
+			model: "gpt-audit", profile: "audit", profileSource: "active" },
+		{ name: "explicit allowed profile overrides protected active profile", prefix: 'active_profile = "protected"\n', routing: { profile: "audit" },
+			model: "gpt-audit", profile: "audit", profileSource: "explicit" },
+		{ name: "no selected profile uses global provider and model defaults", prefix: "", routing: {},
+			model: "gpt-default", profile: null, profileSource: null },
+	])("admits $name without auth-store or provider initialization", async ({ prefix, routing, model, profile, profileSource }) => {
+		const home = scratch(); fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"), prefix + profileConfig);
+		const result = await runPreflight(repository(), home, {}, routing);
+		expect(result.code, result.output).toBe(0);
+		expect(JSON.parse(result.output)).toMatchObject({ provider: "chatgpt", model, profile,
+			reportIdentity: { provider: "chatgpt", model }, selection: { profileSource } });
+		expect(fs.readdirSync(home)).toEqual([".config"]);
+		expect(fs.readdirSync(path.join(home, ".config"))).toEqual(["swival"]);
+	});
+	it.each([
+		{ name: "explicit selected sanitizer profile", prefix: "", routing: { profile: "local" }, config: profileConfig,
+			project: "", reason: "POLICY_NOT_PROPAGATED", field: "sanitize_thinking" },
+		{ name: "active selected sanitizer profile", prefix: 'active_profile = "protected"\n', routing: {}, config: profileConfig,
+			project: "", reason: "POLICY_NOT_PROPAGATED", field: "sanitize_thinking" },
+		{ name: "global unsupported requirement", prefix: 'llm_filter = "synthetic-required-filter"\n', routing: { profile: "audit" }, config: profileConfig,
+			project: "", reason: "POLICY_NOT_PROPAGATED", field: "llm_filter" },
+		{ name: "project unsupported requirement", prefix: "", routing: { profile: "audit" }, config: profileConfig,
+			project: 'llm_filter = "synthetic-required-filter"\n', reason: "POLICY_NOT_PROPAGATED", field: "llm_filter" },
+		{ name: "global requirement cannot be disabled by selected profile", prefix: 'sanitize_thinking = true\n', routing: { profile: "audit" },
+			config: profileConfig.replace('[profiles.audit]\n', '[profiles.audit]\nsanitize_thinking = false\n'),
+			project: "", reason: "POLICY_NOT_PROPAGATED", field: "sanitize_thinking" },
+		{ name: "malformed type in unused profile via released validation", prefix: "", routing: { profile: "audit" },
+			config: profileConfig.replace('model = "synthetic-local"', 'model = 42'),
+			project: "", reason: "CONFIG_INVALID", field: undefined },
+		{ name: "unknown key in unused profile via released validation", prefix: "", routing: { profile: "audit" },
+			config: profileConfig.replace('[profiles.local]\n', '[profiles.local]\nunknown_policy = true\n'),
+			project: "", reason: "CONFIG_INVALID", field: undefined },
+		{ name: "missing selected profile without fallback", prefix: 'active_profile = "audit"\n', routing: { profile: "missing" }, config: profileConfig,
+			project: "", reason: "PROFILE_UNAVAILABLE", field: undefined },
+	])("rejects $name", async ({ prefix, routing, config, project, reason, field }) => {
+		const source = repository(); const home = scratch();
+		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"), prefix + config);
+		if (project) fs.writeFileSync(path.join(source, "swival.toml"), project);
+		const result = await runPreflight(source, home, {}, routing);
+		expect(result.code, result.output).toBe(1);
+		expect(JSON.parse(result.output)).toEqual({ ok: false, reason, ...(field ? { field } : {}) });
+	});
+});
+
 async function runPreflight(source: string, home: string, environment = {}, routing = {}) {
 	const { execFile } = await import("node:child_process");
 	return new Promise<{ code: number; output: string }>((resolve) => {
