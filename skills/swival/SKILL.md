@@ -13,10 +13,7 @@ description: >-
 
 Tracked against Swival 1.0.45.
 
-Swival is a coding agent with a built-in reviewer loop, layered
-sandboxing (builtin + AgentFS + nono), format-preserving secret
-encryption, outbound request filtering, and A2A orchestration.
-Access it from Pi via the `swival-subagent` tool.
+Swival is a coding agent with a built-in reviewer loop, layered sandboxing (builtin + AgentFS + nono), format-preserving secret encryption, outbound request filtering, and A2A orchestration. Access it from Pi via the `swival-subagent` tool.
 
 ## Delegation via swival-subagent
 
@@ -32,12 +29,9 @@ Bundled definitions live at `../../agents/<name>.md` relative to this skill, so 
 | `test-runner` | Task has a runnable test command as acceptance criterion (pass `reviewerOverride`) |
 | `sandboxed-explorer` | Exploratory changes you want to inspect before applying |
 | `swival` | Simple delegation, no review needed (also the default when agent is omitted) |
-| `audit-worker` | Read-only security or domain audit bucket; task must start with `/audit` (Stage 2 of the audit pipeline) |
-| `security-recon` | Survey a repository and emit `recon.json` bucket specs (Stage 1) |
-| `security-consolidator` | Merge per-bucket audit reports into one findings document (Stage 3) |
 | `a2a-coordinator` | Delegate part of a task to a remote A2A agent named in an `a2aConfig` TOML file; requires `network: full` |
 
-The three audit agents are driven by the `auditing-with-swival` skill; use it rather than dispatching them ad hoc. Use the `swival-worker-briefs` skill to write structured task briefs for `self-review-worker`.
+Use `auditing-with-swival` for the structured native audit API. Use `swival-worker-briefs` to write task briefs for `self-review-worker`.
 
 ### Dispatch examples
 
@@ -82,8 +76,6 @@ swival-subagent with tasks: [
   { agent: "sandboxed-explorer", task: "Refactor tokenizer logic" }
 ]
 ```
-
-AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on the agent definition. Both `sandboxed-explorer` and `audit-worker` enable this setting.
 
 Git worktree isolation for real filesystem mutations:
 
@@ -143,8 +135,7 @@ swival-subagent with action: "status", id: "swival-run-1716326580000"
 
 ### Dispatch-time overrides
 
-Override agent frontmatter per call without editing the agent
-definition:
+Override agent frontmatter per call without editing the agent definition:
 
 | Parameter | Controls |
 |-----------|----------|
@@ -182,8 +173,7 @@ Swival's `/reasoning` command is REPL-only. Use `reasoningEffortOverride` (or th
 
 ## Authoring Agent Definitions
 
-Create a `.md` file in `~/.pi/agent/swival-agents/` with YAML
-frontmatter:
+Create a `.md` file in `~/.pi/agent/swival-agents/` with YAML frontmatter:
 
 ```yaml
 ---
@@ -202,7 +192,6 @@ sandbox: agentfs                  # builtin | agentfs | nono
 files: some                       # none | some | all
 commands: all                     # all | none | ask | "ls,git,rg"
 yolo: true                        # shorthand: files=all, commands=all
-noSandboxAutoSession: false       # audit-worker sets true for parallel AgentFS runs
 nonoRollback: true                # nono only: atomic rollback snapshots
 network: provider-only            # full | provider-only | none
 
@@ -236,14 +225,8 @@ Do not specify `model`, `provider`, or `baseUrl` in agent definitions. Model rou
 
 ### Agent configs do not inherit
 
-Each agent's frontmatter is independent. There is no base agent, no
-`extends:` field, and no implicit inheritance from the bundled set.
-When you fork a bundled agent into `~/.pi/agent/swival-agents/` or
-`.pi/swival-agents/`, copy the entire frontmatter; flags you omit
-revert to the schema default, which is rarely what the bundled
-agent intended. The trap to watch for:
+Each agent's frontmatter is independent. There is no base agent, no `extends:` field, and no implicit inheritance from the bundled set. When you fork a bundled agent into `~/.pi/agent/swival-agents/` or `.pi/swival-agents/`, copy the entire frontmatter; flags you omit revert to the schema default, which is rarely what the bundled agent intended. The trap to watch for:
 
-- `noSandboxAutoSession: true` on `sandboxed-explorer` and `audit-worker` is what makes parallel same-directory fan-out work. Drop it in a user-scope fork and the dispatcher refuses parallel execution on a shared `cwd`.
 - `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
 - The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
 - Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
@@ -253,7 +236,6 @@ When overriding a bundled agent name from the user scope, diff your frontmatter 
 
 ```bash
 # run from this skill's directory
-diff ../../agents/audit-worker.md ~/.pi/agent/swival-agents/audit-worker.md
 ```
 
 ## Capabilities Reference
@@ -313,10 +295,7 @@ Swival receives the task on standard input when the agent explicitly sets `sandb
 
 ### Secret encryption
 
-Credentials in tool output are format-preserving encrypted before
-reaching the LLM. The model sees plausible fakes; real values are
-restored locally. Enable with `encryptSecrets: true` in the agent
-or at dispatch time.
+Credentials in tool output are format-preserving encrypted before reaching the LLM. The model sees plausible fakes; real values are restored locally. Enable with `encryptSecrets: true` in the agent or at dispatch time.
 
 ### Agent Client Protocol (ACP)
 
@@ -324,9 +303,7 @@ Run `swival --acp` to speak the Agent Client Protocol on stdio. This allows ACP-
 
 ### Request auditing
 
-`--llm-filter COMMAND` intercepts every outbound LLM request.
-Filter receives JSON on stdin, writes filtered messages to stdout.
-Non-zero exit or `{"allow": false}` blocks the request.
+`--llm-filter COMMAND` intercepts every outbound LLM request. Filter receives JSON on stdin, writes filtered messages to stdout. Non-zero exit or `{"allow": false}` blocks the request.
 
 ### Command access
 
@@ -337,8 +314,7 @@ Non-zero exit or `{"allow": false}` blocks the request.
 | `ask` | Per-command approval |
 | `ls,git,rg` | Basename allowlist |
 
-Shell wrappers (`bash -c`, pipes, redirects) are blocked in any
-mode other than `all`.
+Shell wrappers (`bash -c`, pipes, redirects) are blocked in any mode other than `all`.
 
 ### Command governance
 
@@ -399,8 +375,7 @@ Use native subagents when Swival must decompose a single prompt into independent
 
 ## Model Selection
 
-Agents inherit from `~/.config/swival/config.toml`. Override at
-dispatch time with `profileOverride` or `modelOverride`.
+Agents inherit from `~/.config/swival/config.toml`. Override at dispatch time with `profileOverride` or `modelOverride`.
 
 Named profiles:
 
@@ -422,6 +397,34 @@ Switch at dispatch: `profileOverride: "budget"`.
 Native providers, no proxy needed: `lmstudio`, `llamacpp`, `huggingface`, `openrouter`, `google` (Gemini API), `vertexai` (alias for `geap`), `chatgpt`, `bedrock`, and `generic` (any OpenAI-compatible endpoint, such as a local server).
 
 Configuration constraints: `bedrock` and `vertexai` both reject `api_key`, and a global `api_key` still applies when a profile selects them, so do not set one globally on a work-cloud host. For `bedrock`, `base_url` means the region; leave it unset to take the region from `~/.aws/config`, since a global value leaks into `vertexai` profiles, which take `project` and `location` instead. The Vertex project key is `project`, not `gcp_project`.
+
+AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on the agent definition. `sandboxed-explorer` enables this setting.
+
+## Native source-only audit
+
+Use the explicit `audit` API from Pi's configured Git repository root. Read `auditing-with-swival` for scope, routing, and completion rules. It invokes the upstream AgentFS CLI on an independent committed snapshot. Required versions are Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, and AgentFS 0.6.4, with upstream's nono profile installed. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified.
+
+```json
+{"audit":{"all":true}}
+```
+
+Consult installation guidance before execution. With no specialist selected, native audit uses configured Swival defaults, including the active profile. When installation policy selects a specialist, pass its existing profile:
+
+```json
+{"audit":{"all":true},"profileOverride":"security-specialist"}
+```
+
+The name is illustrative, not bundled. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not infer specialization from vendor/model names or send source to probe access. Inherit effort unless an override is explicitly authorized.
+
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+
+Native support requires Swival-supported routes meeting the pinned policy contract. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint with its own key and context limit. Dynamic model-list adapters are refused because upstream can replace a model after NotFound. Other routes fail for concrete missing capabilities or credential authority, not unfamiliar vendors. Ordinary delegation retains its existing providers and behavior.
+
+For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. A device-login challenge cancels without returning its contents. AgentFS grants runtime access to a dedicated auth-store directory inside HOME, never through Swival `--add-dir` or model-tool roots. The adapter checks metadata, never auth-store contents. API-key/local routes receive no ChatGPT auth grant. Required encryption/filtering or unsupported policy fails closed; never disable controls or substitute a route.
+
+Native async is unsupported. Timeout, cancellation, and normal session shutdown stop the live owned process group. After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Retain crash resources and never signal recovered PIDs or resume native work from disk.
+
+The source-only verifier cannot run project commands, builds, tests, Python, fetch tools, or PoCs. Upstream allows write-through access to the disposable snapshot. Bounded direct collection requires verified shutdown. The original source/Git remain protected; host-read confidentiality and provider-process egress confinement are not guaranteed. Patches are proposals for manual review.
 
 ## Interactive REPL
 
@@ -446,8 +449,7 @@ swival --repl
 | `/learn` | Distil session into persistent memory |
 | `/compact` | Compress context |
 
-The REPL is useful for long exploratory sessions. For delegated
-work from Pi, use `swival-subagent` instead.
+The REPL is useful for long exploratory sessions. For delegated work from Pi, use `swival-subagent` instead.
 
 ## Configuration
 
@@ -467,9 +469,7 @@ Generate config: `swival --init-config`. Project config merges over global rathe
 | `ToolsNotSupportedError` | Model lacks function calling | Switch model; check `--extra-body` |
 | `LifecycleError` | Hook failed under `--lifecycle-fail-closed` | Inspect hook; drop fail-closed |
 
-Infrastructure failures: expired AWS SSO, 401/403/429,
-`ECONNREFUSED` (local model server down), `E2BIG` (giant system
-prompt).
+Infrastructure failures: expired AWS SSO, 401/403/429, `ECONNREFUSED` (local model server down), `E2BIG` (giant system prompt).
 
 ## Prerequisites
 

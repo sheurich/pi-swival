@@ -1,44 +1,26 @@
-# AgentFS Sandbox
+# AgentFS sandbox
 
-OS-enforced filesystem isolation via
-[AgentFS](https://github.com/tursodatabase/agentfs). File writes go
-to a session overlay stored in a SQLite database. Changes persist
-across runs that reuse the same session ID.
+[AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.0.46 invokes it with `--no-default-allows --allow <base-dir>`. That absolute base directory has write-through access to the host. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
 
-> No automatic merge-back. The overlay stays in
-> `~/.agentfs/run/<id>/delta.db` until you either reuse the session
-> ID for another run or copy files out with `agentfs fs` / `agentfs
-> mount`. Discard by removing the session directory. Nothing lands
-> on the real filesystem unless you explicitly extract it.
+For native audit, the adapter launches upstream AgentFS directly with `--no-default-allows` and a disposable committed snapshot grant. ChatGPT alone also receives a dedicated auth-store directory grant inside HOME. API-key/local routes receive no ChatGPT directory grant. Auth cannot overlap source, artifacts, or prospective AgentFS/service state, including all of HOME's `.agentfs`. These explicit grants are not the entire upstream write policy. The auth directory never enters Swival `--add-dir` or model-tool roots. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap. Original source and Git metadata stay outside the writable scope. After verified shutdown, the adapter reads bounded artifacts from the snapshot. It does not export from guessed delta paths or automatically apply patches.
 
-## Install
+AgentFS does not establish host-read confidentiality or provider-process egress confinement. `network=provider-only` is Swival's tool policy. The installed runtime remains trusted.
 
-Quick install (upstream one-liner):
+## Native source locations
 
-```bash
-curl -fsSL https://agentfs.ai/install | bash
-```
+The [AgentFS 0.6.4 Darwin policy](https://github.com/tursodatabase/agentfs/blob/3a5ed2b88e5d5a5f9b2c7fe02d012b50fd19e3c0/cli/src/sandbox/darwin.rs#L98-L157) also permits `/private/tmp`, `/tmp`, `/var/tmp`, `/private/var/folders`, `/dev`, `/private/var/db/mds`, HOME's `Library`, `/Library/Preferences`, `/Library/Keychains`, and the active AgentFS session directory. The banner omits several of these exceptions.
 
-The installer downloads a prebuilt binary from the latest GitHub
-release. It works on macOS (x86_64, arm64), Windows (x86_64), and
-Linux (x86_64, aarch64). No Homebrew formula exists as of AgentFS
-0.6.4 — only the Turso `turso` CLI ships via their Homebrew tap.
-Check the [releases
-page](https://github.com/tursodatabase/agentfs/releases) for
-current versions before pinning.
+Native preflight refuses source worktrees, worktree Git directories, or common Git directories overlapping these paths. It resolves symlinks and compares directory identities to catch aliases such as `/tmp` and `/private/tmp`. Source must remain outside these writable exceptions. The adapter does not change the upstream policy. Linux remains unverified by the native mechanism gate.
 
-### Safer install (pinned + checksum-verified)
+## Installation
 
-Piping a remote script into `bash` leaves you exposed to the
-upstream host being compromised or to a MITM swapping the payload.
-If that's a concern, download a pinned release and verify against
-the published `sha256.sum` first. Pick your platform triple and
-version; the `VERSION` below is known-good as of March 2026, re-check
-upstream before relying on it:
+Review the [release assets](https://github.com/tursodatabase/agentfs/releases) and verify the selected binary before installing it. AgentFS 0.6.4 is the version exercised by the native macOS bootstrap/export fixture. Linux requires its own passing native gate before a portability claim.
+
+Example checksum verification for a selected release:
 
 ```bash
 VERSION=v0.6.4
-TRIPLE=aarch64-apple-darwin   # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+TRIPLE=aarch64-apple-darwin
 BASE=https://github.com/tursodatabase/agentfs/releases/download/$VERSION
 
 curl -fsSLO "$BASE/agentfs-$TRIPLE.tar.xz"
@@ -58,94 +40,20 @@ mkdir -p ~/.local/bin
 install -m 0755 "agentfs-$TRIPLE/agentfs" ~/.local/bin/agentfs
 ```
 
-Inspect `agentfs-installer.sh` before running it if you prefer the
-scripted flow but want to audit what it does:
+Installation changes require operator approval. Do not install prerequisites to make an audit proceed without that approval.
 
-```bash
-curl -fsSL https://agentfs.ai/install -o agentfs-installer.sh
-less agentfs-installer.sh
-sh agentfs-installer.sh
-```
+## Sessions and inspection
 
-### Platform notes
+Swival normally derives a reusable session ID from the project directory. `--sandbox-session <id>` selects an explicit session; `--no-sandbox-auto-session` disables deterministic reuse. Native audit supplies a new random session and refuses reuse.
 
-On Linux the `agentfs run` overlay requires FUSE and user
-namespaces. macOS uses NFS + Apple Sandbox with no additional
-dependencies.
+Session data lives under `~/.agentfs/run/<id>/`, including `delta.db` and the live mount. Inspect active sessions with `agentfs ps`, and inspect an owned session with `agentfs diff <id>`. Overlay changes do not automatically merge back, but writes through an explicit `--allow` path already affect the host.
 
-## Usage
+Do not delete session data or signal recorded PIDs while a process may still use it. Native crash resources remain retained for manual inspection. The adapter never resurrects ownership from disk.
 
-```bash
-# Run sandboxed — writes go to an overlay database, not to disk
-swival --sandbox agentfs -q "Refactor the auth module"
+## Strict-read isolation
 
-# Inspect overlay changes
-agentfs diff <session-id>
-```
+`--sandbox-strict-read` is unsupported and refused by Swival 1.0.46 with AgentFS 0.6.4. No released AgentFS version in the tested contract supplies this feature. Do not describe it as an effective read boundary.
 
-There is no `agentfs apply` or `agentfs reset` command. Each
-`agentfs run --session <id>` stores its overlay under
-`~/.agentfs/run/<id>/`:
+## Native validation
 
-- `delta.db` — the copy-on-write SQLite overlay.
-- `mnt/` — where the overlay is mounted while the session is live.
-- `base_path` (Linux) — records the base directory for the session.
-
-Use the full `delta.db` path anywhere the AgentFS CLI accepts an
-`ID_OR_PATH`:
-
-- Keep changes for next run: reuse the same session ID;
-  Swival's auto-generated IDs already do this per project.
-- Discard changes: remove the session directory,
-  `rm -rf ~/.agentfs/run/<id>`, or start a new session with a
-  different ID.
-- Inspect changes:
-  `agentfs diff ~/.agentfs/run/<id>/delta.db`.
-- Pull files out: during the session, read them directly
-  from `~/.agentfs/run/<id>/mnt/`. After the session, use
-  `agentfs fs ~/.agentfs/run/<id>/delta.db cat <path>` or
-  `agentfs mount ~/.agentfs/run/<id>/delta.db <mount-point>`.
-
-The overlay does not automatically merge back into the real
-filesystem.
-
-## Session IDs
-
-Swival auto-generates a deterministic session ID from the project
-directory. Re-running in the same directory reuses the overlay.
-
-Override with `--sandbox-session <id>` to name sessions explicitly
-or run multiple independent sessions in the same project.
-
-Disable auto-session with `--no-sandbox-auto-session` to get a
-fresh overlay every time.
-
-## Strict read isolation
-
-`--sandbox-strict-read` restricts reads to the allowed directories
-as well as writes. The flag requires strict-read support in
-AgentFS, which is not in the 0.6.x line as of 0.6.4 (March 2026);
-Swival accepts the flag but AgentFS will no-op it until a release
-lands support. Track
-[tursodatabase/agentfs](https://github.com/tursodatabase/agentfs/releases)
-for progress.
-
-## How it works
-
-1. Swival detects `--sandbox agentfs` and locates the `agentfs` binary.
-2. It re-execs itself via `agentfs run --allow <base-dir> -- swival ...`.
-3. AgentFS interposes filesystem calls at the OS level. Writes go to
-   the overlay; reads see the overlay merged with the real filesystem.
-4. After the session, `agentfs diff` shows changes against the base.
-
-## Combining with other security features
-
-```bash
-# OS sandbox + self-review + secret encryption
-swival --sandbox agentfs --self-review --encrypt-secrets \
-  -q "Rotate credentials in config/"
-
-# Sandbox + read-only reference directory
-swival --sandbox agentfs --add-dir-ro /path/to/reference \
-  -q "Port the auth pattern from the reference repo"
-```
+Run `npm run native-agentfs-integration` with existing prerequisites. The gate uses isolated synthetic homes, source, Git metadata, and nono registration. It exercises real CLI bootstrap, original-source write refusal, process/session teardown, and production bounded snapshot collection. It makes no live provider/auth calls. API/local cases run the released zero-finding audit producer and resolver with HTTP doubles through production launch/finalization. ChatGPT controls exercise standard synthetic refresh persistence and model-tool auth denial. Full finding/verifier/patch phases run separately in offline fixtures. Synthetic registration proves profile availability only, not authenticity or nono enforcement.

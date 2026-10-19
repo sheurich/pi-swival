@@ -42,10 +42,7 @@ Confirm it shows up in your settings:
 pi list | grep pi-swival
 ```
 
-All eight bundled agents (`swival`, `self-review-worker`, `test-runner`,
-`sandboxed-explorer`, `audit-worker`, `security-recon`,
-`security-consolidator`, `a2a-coordinator`) are auto-discovered from the package's `agents/`
-directory — no symlinks needed.
+All five bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`) are auto-discovered from the package's `agents/` directory.
 
 ## Demo 1 — generic delegation
 
@@ -110,28 +107,26 @@ Expected behaviour:
 This is the key value of `sandboxed-explorer`: you see what swival would
 do, then decide whether to apply it.
 
-## Demo 4 — security audit prompt template
+## Demo 4 — native audit prompt template
 
-Run the `/swival-audit` prompt template against a small public repo. The
-template walks Pi through the recon → per-bucket → consolidate pipeline
-documented in the `auditing-with-swival` skill.
+Use a disposable synthetic Git repository and start Pi from its root. Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, upstream's nono profile, and separate approval for any live provider/auth calls. The real bootstrap/export gate passed on macOS; Linux remains unverified. Consult installation policy before execution. With no specialist selected, use configured Swival defaults. Pass a required configured specialist through `profileOverride`; a terminal selected-route failure stops without fallback. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint. Dynamic model-list adapters are refused because upstream can replace the selected model. For ChatGPT only, standard upstream authentication can log in, refresh tokens, and write auth state. API-key/local routes receive no ChatGPT store grant. Native async is unsupported.
+
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+
+After a Pi crash or SIGKILL, Swival may remain running; there is no artifact export or claimed completion afterward. Normal timeout, cancellation, and session shutdown stop the live owned group. Native verification is source-only and patch proposals require manual review.
 
 ```text
-/swival-audit https://github.com/example-org/some-small-repo
+/swival-audit src/**/*.py
 ```
 
 Expected behaviour:
 
-1. Pi expands the slash command into the audit walkthrough prompt.
-2. Pi clones the repo, inspects layout, and asks clarifying questions.
-3. After you confirm, Pi dispatches `audit-worker` agents per bucket.
+1. Pi expands the prompt and confirms relative scopes and approved routing.
+2. Pi dispatches one `audit` object, not a slash-prefixed freeform task.
+3. Native audit runs on an independent committed snapshot and returns preserved state, reports, and patch proposals.
+4. Source contents, status, and Git refs remain unchanged.
 
-For a faster demo without an external clone:
-
-```text
-/swival-audit /path/to/a/local/repo "Audit only the HTTP handlers,
-skip everything else."
-```
+Inspect native coverage and artifact pairs before treating the pipeline as complete. Native verifier judgment is not independently executed exploit reproduction. This demo does not prove uniform per-phase effort, and no patch applies automatically.
 
 ## Demo 5 — parallel dispatch
 
@@ -160,5 +155,5 @@ pi remove pi-swival
 | 1 | Extension loads, `swival-subagent` tool dispatches, default agent works |
 | 2 | Reviewer loop runs, structured report parsed |
 | 3 | AgentFS sandbox isolates writes |
-| 4 | `/swival-audit` prompt template registers, audit pipeline agents dispatch |
+| 4 | Prompt registration and native committed-snapshot execution, when all prerequisites are met |
 | 5 | Parallel task dispatch and per-task result blocks |
