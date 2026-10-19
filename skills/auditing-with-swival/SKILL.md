@@ -1,205 +1,84 @@
 ---
 name: auditing-with-swival
-description: >-
-  Run reproducible multi-bucket security audits using swival-subagent. Use
-  when auditing a non-trivial codebase for security issues — splits work into
-  recon, parallel per-bucket audit, and consolidation stages with structured
-  output contracts at each stage. Triggers on: security audit, audit a repo,
-  audit a codebase, multi-bucket audit, reproducible audit, consolidate audit
-  findings, "Swival audit", "/swival-audit".
+description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent.
 ---
 
 # Auditing with Swival
 
-A three-stage pipeline for security audits over codebases too large for one worker. Each stage has a structured output contract so the pipeline is reproducible across runs and across operators.
+Use the structured `audit` API from Pi at the target Git repository root. The adapter invokes one upstream CLI `/audit` request. It validates coverage and artifacts so the operator does not need to reconstruct completion from console output. The offline fixtures exercise released phases and rejected incomplete states. The operator still reviews findings and every patch.
 
-## When to use
+## Preconditions and selection
 
-Run this pipeline when:
+- Confirm scope and the operator's provider and data boundaries before sending source to a provider.
+- Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
+- With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
+- Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
+- Configuration inspection does not prove account access. Do not send repository content to probe specialist access. There is no fallback to another model, provider, endpoint, account, profile, or sandbox.
 
-- The target codebase is larger than ~5 k LOC or spans multiple trust boundaries
-- You need a defensible audit trail (prompts, reports, consolidated findings, hashes)
-- The output will be reviewed by another human or fed into a remediation plan
+## Dispatch
 
-For a one-off read of a small file or a quick "is X safe", just read the code directly. Don't spin up the pipeline.
+Use configured provider/model defaults:
 
-## What the human stops doing
-
-This skill exists to absorb the consolidation and routing labor:
-
-- Before: human reads N raw worker reports, manually deduplicates, ranks by severity, writes a summary doc. Hours per audit.
-- After: human reviews one recon JSON (confirm bucket cuts), then one consolidated findings doc. Minutes.
-
-Bucket discovery moves from a session-local judgment call to a recon worker output that's inspectable, version-controlled, and re-runnable.
-
-## Pipeline
-
-```
-Stage 1: recon          (1 worker)   → recon.json with bucket specs
-   ↓
-[checkpoint: human reviews bucket list]
-   ↓
-Stage 2: per-bucket     (N workers)  → reports/<bucket>.report.md (one per bucket)
-   ↓
-Stage 3: consolidation  (1 worker)   → consolidated-findings.md
-   ↓
-[checkpoint: human reviews consolidated doc]
+```json
+{"audit":{"all":true}}
 ```
 
-The orchestrator coordinates between stages but does not synthesize findings itself. All synthesis happens inside Swival workers with explicit contracts, so the orchestrator's judgment doesn't drift the output.
+Select an existing operator-configured specialist profile when installation policy requires it:
 
-## Workspace layout
-
-```
-$WORKSPACE/
-├── preflight/
-│   └── commits.txt              # repo path, ref, SHA at audit time
-├── recon.json                   # Stage 1 output, parsed for fan-out
-├── prompts/
-│   └── <bucket-id>.md           # generated per bucket from template
-├── reports/
-│   ├── <bucket-id>.report.md    # Stage 2 worker stdout
-│   └── <bucket-id>.swival-report.json
-├── consolidated-findings.md     # Stage 3 output
-└── SHA256SUMS.txt               # all reports hashed for auditability
+```json
+{"audit":{"all":true},"profileOverride":"security-specialist"}
 ```
 
-Set `WORKSPACE=$HOME/.cache/swival-audit-<repo-slug>-<date>` and create it before Stage 1.
+`security-specialist` is illustrative, not bundled or reserved. Explicit profile selection outranks `active_profile`. Authorized explicit field overrides outrank profile values. Do not add provider/model/effort overrides automatically; inherit selected settings. Reject conflicts with installation policy before execution. Ordinary inherited effort is best-effort; auxiliary phases can omit it.
 
-## Models and effort
+Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Pass these as dispatch-time overrides on every worker. Do not hardcode model names — they live in `~/.config/swival/config.toml`.
+## Route capabilities
 
-| Override | Value | Rationale |
-|---|---|---|
-| `profileOverride` | `"frontier"` | Frontier-tier judgment. Audit is novel reasoning across call graphs; review loop alone doesn't compensate for a weaker model. |
-| `reasoningEffortOverride` | `"high"` | Multi-step exploit reasoning needs extended thinking. |
-| `temperatureOverride` | `0.2` | Audit reports should be deterministic; suppress confident hallucination. |
-| `maxReviewRoundsOverride` | `2` | One review pass catches attention-lapse errors without unbounded spend. |
-| `seedOverride` | `<fixed int>` | Reproducibility on re-run. Pick a date-based int. |
+Support means a Swival-supported route meeting required native policies on the pinned runtime, not a promise that every route/version works. Swival owns provider/auth integration.
 
-Verify `swival --list-profiles` includes `frontier` before Stage 1. If not, halt — do not silently fall back.
+| Route | Native requirements |
+| --- | --- |
+| Configured ChatGPT | Concrete model; standard upstream auth; dedicated runtime-only auth-directory grant. |
+| API-key OpenRouter | Concrete model; selected `OPENROUTER_API_KEY`; no ChatGPT directory or grant. |
+| Explicit OpenRouter-compatible loopback endpoint | Deliberately configured adapter/model/`base_url`, `max_context_tokens`, and a dedicated endpoint key through `OPENROUTER_API_KEY`; no remote-key inheritance or automatic conversion. |
+| Dynamic model-list adapters, including generic, LMStudio, llama.cpp and Google's generic transport | Refused with `MODEL_REPLACEMENT_UNCONTROLLABLE`: this runtime can replace a selected model after model-not-found. |
+| Other Swival routes | Evaluate credential authority, command execution, replacement, and policy requirements. Additional credential directories are not granted. |
 
-## Stage 1 — recon
+Automatic/multi-model selectors are unsupported. Client evidence does not prove backend alias resolution or routing. Configure local endpoints deliberately; never convert a rejected generic route to another adapter. Supply only that endpoint's dedicated credential, not a remote account key.
 
-Dispatch one `security-recon` worker. Its only job is to survey the repo and emit `recon.json` matching the contract.
+Preflight returns bounded, value-free codes, including `PROFILE_UNAVAILABLE`, `ROUTE_INCOMPLETE`, `CREDENTIAL_INTERFACE_UNSUPPORTED`, `CONFIG_INVALID`, and `RUNTIME_UNSUPPORTED`. `POLICY_NOT_PROPAGATED` names recognized requirements omitted by native or auxiliary phases: encryption, secret shielding, request filtering, `extra_body`, disabled prompt caching, thinking controls, strict-read/session isolation, or strict all-phase effort/retry requirements. Inline keys, custom headers, cloud/file/command credential requirements, credential-bearing URLs, ambient endpoints, and proxies fail closed. Stop instead of disabling controls.
 
-```
-swival-subagent with
-  agent: "security-recon"
-  cwd: "<repo absolute path>"
-  task: "<contents of recon prompt — see below>"
-  output: "$WORKSPACE/recon.json"
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-```
+For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks metadata, never auth-store contents. API-key/local routes create no ChatGPT store and forward no ChatGPT variables.
 
-Recon prompt body (substitute repo metadata):
+`paths` accepts at most 64 relative path/glob tokens without spaces, traversal, shell syntax, or host paths. Omit it for the auditable committed scope. `all` requires deep review of every selected file. `workers` is 1–8 pipeline workers, not autonomous subagents. `patchMaxTurns` is 1–100 turns per patch loop. The default timeout is 15 minutes; the default operator ceiling is 30 minutes.
 
-```
-Survey the repository at <absolute path>, branch <branch>, commit <SHA>.
-Identify production code paths grouped by trust boundary or threat model.
-Emit recon.json matching the contract.
-```
+Native async is unsupported. Do not combine `audit` with `task`, `agent`, `cwd`, parallel/chain dispatch, output routing, reviewer settings, extra arguments, or permission overrides. Ordinary freeform delegation is separate and does not attest native completion. Do not use freeform slash-command tasks as a substitute.
 
-Output contract: see `references/recon-contract.md`.
+## Boundary
 
-Checkpoint: read `recon.json`. Confirm buckets are non-overlapping, named meaningfully, and globs cover the production surface. Adjust if needed (re-dispatch or hand-edit) before Stage 2.
+The adapter imports only committed Git objects into a separate disposable repository outside the original source checkout and Git metadata. It disables source hooks, filters, lazy fetches, and remotes. It excludes staged, unstaged, and untracked content. The synthetic snapshot commit preserves the source tree, not its history. A tracked `swival.toml` remains auditable from HEAD; its runtime copy and the run's global configuration are inert.
 
-## Stage 2 — parallel per-bucket audits
+The adapter launches upstream AgentFS directly with a fresh session. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap, with `commands=none`, `files=some`, and `network=provider-only`. Instructions, skills, metaskills, MCP, A2A, autonomous subagents, lifecycle hooks, history, continuation, and memory are disabled. Verifier and patch loops inherit command and network restrictions. They cannot run project commands, builds, tests, Python, fetch tools, or PoCs. Describe verification as source-only judgment, not executed exploit reproduction.
 
-Parse `recon.json`. For each bucket, render the prompt template (`references/audit-prompt-template.md`) into `$WORKSPACE/prompts/<bucket-id>.md`, then dispatch as one parallel call:
+The adapter explicitly grants AgentFS write-through access to the snapshot. For ChatGPT only, it also grants a dedicated auth-store directory inside HOME. The default store is `~/.config/litellm/chatgpt/auth.json`. Safe `CHATGPT_TOKEN_DIR` and basename-only `CHATGPT_AUTH_FILE` selections are supported. Broad, shared, linked, or source/artifact/runtime-overlapping stores fail closed, including future paths under HOME's `.agentfs` and service directories. The auth directory never enters Swival `--add-dir` or model-tool roots. The adapter collects artifacts from the snapshot after verified normal shutdown; it does not claim COW-only export. Upstream also grants built-in temporary, service, and session paths. On macOS, source and Git metadata must not overlap those exceptions, including `/tmp`, `/var/tmp`, `/private/var/folders`, and HOME's `Library`. The adapter checks canonical paths and directory identities before launch. See the [complete AgentFS restriction](../swival/references/agentfs.md). The original source and Git metadata remain protected. AgentFS does not provide host-read confidentiality or provider-process egress confinement. The extension and installed runtime remain trusted.
 
-```
-swival-subagent with
-  agent: "audit-worker"
-  concurrency: 3
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-  tasks: [
-    { agent: "audit-worker",
-      cwd:  "<repo absolute path>",
-      task: "/audit\n<contents of prompts/<bucket-id>.md>",
-      output: "$WORKSPACE/reports/<bucket-id>.report.md" },
-    ...one per bucket
-  ]
-```
+Snapshot and evidence limits are 4096 entries, 8 MiB per object/file, and 64 MiB total. Unsupported tracked links, unsafe paths, recognized credential content, protected configuration, and oversized inputs fail closed. Scanning cannot prove that source contains no secrets.
 
-The `audit-worker` agent is the bundled read-only auditor, at `../../agents/audit-worker.md` relative to this skill. The leading `/audit` is required by that agent.
+## Lifetime and evidence
 
-Set `concurrency` based on token budget and rate limits. Defaults: 3 for `frontier` profile, 4 for lighter.
+Timeout, cancellation, and normal Pi session shutdown stop the live owned process group with bounded TERM/KILL escalation. Before export, the adapter requires process-group absence, drained diagnostics, and no active AgentFS session. Unverified shutdown retains the snapshot without export.
 
-AgentFS parallel-dispatch warning: `audit-worker` runs under `sandbox: agentfs`, whose overlay state lives in a per-session SQLite database, so invocations sharing a session id fight over one lock and most workers die before reading anything. The bundled `audit-worker.md` sets `noSandboxAutoSession: true` to give each parallel invocation its own overlay; keep that flag if you fork the agent. The same rule applies to any `sandbox: agentfs` agent you fan out against a shared cwd — the dispatcher refuses parallel dispatch of write-capable agents there unless one escape is in effect: serial dispatch, per-task `cwd`, or `noSandboxAutoSession: true`.
+After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Native runs never resume from disk, signal recovered PIDs, or use a guardian. Preserve crash resources for manual inspection. Normal completion removes the snapshot and run-local configuration; AgentFS session metadata remains retained. Native artifact directories are not automatically pruned.
 
-Output contract per report: see `references/audit-prompt-template.md` § "Required finding format".
+The returned artifact directory contains `manifest.json`, `run-meta.json`, `diagnostics.json`, a terminal record, and `evidence/native-cli-report.json`. Audit state lives under `evidence/native-state/<audit-id>/state.json`; finding reports and patches live under `evidence/audit-findings/`. Diagnostics retain bounded counters, not raw login output. A failed terminal write uses `spawn-error.txt`; failure of both writes leaves completion unknown.
 
-After dispatch, run `git -C <repo> status --porcelain` and halt on any output. The audit-worker is read-only by command allowlist; uncommitted changes mean a worker violated its sandbox.
+Exit zero and a plausible answer are insufficient. Completion requires matching committed scope, CLI route and policy, `phase=done`, mandatory/deep coverage, terminal verification states, feasible finding lineage, unique report/patch pairs, and complete diagnostics without lost expansion warnings. Missing, empty, reused, symlinked, oversized, truncated, or incomplete evidence cannot attest completion. Complete zero-finding state means the pipeline finished, not that the code is secure.
 
-## Stage 3 — consolidation
+Compare source content, status, and refs with their initial values. Review patches manually. Do not apply patches or begin remediation without separate approval. Use `self-review-worker` only for approved implementation work.
 
-Dispatch one `security-consolidator` worker with read access to the reports directory.
+## Validation
 
-```
-swival-subagent with
-  agent: "security-consolidator"
-  cwd: "$WORKSPACE"
-  task: "<consolidation prompt — see below>"
-  output: "$WORKSPACE/consolidated-findings.md"
-  profileOverride: "frontier"
-  reasoningEffortOverride: "high"
-  temperatureOverride: 0.2
-  maxReviewRoundsOverride: 2
-  seedOverride: <int>
-```
+Run `npm run native-agentfs-integration` with existing prerequisites and isolated synthetic fixtures. It tests the production launcher/finalizer with real AgentFS, released API/local zero-finding audit producers and HTTP doubles, plus synthetic ChatGPT refresh/model-tool-denial controls. Full finding/verifier/patch phases run separately with real upstream route resolution and synthetic LLM responses. Synthetic nono registration proves availability, not authenticity. These tests make no live provider or auth calls.
 
-Consolidation prompt body:
-
-```
-Read every file under reports/. For each finding, dedupe across buckets
-and produce a consolidated report matching the contract.
-```
-
-Output contract: see `references/consolidation-contract.md`.
-
-After Stage 3:
-
-```bash
-shasum -a 256 "$WORKSPACE"/{recon.json,reports/*,consolidated-findings.md} \
-  > "$WORKSPACE/SHA256SUMS.txt"
-```
-
-Share `consolidated-findings.md` through whatever channel the audit consumer expects — a Google Doc, a tracking ticket, an internal wiki page. The pipeline produces a self-contained Markdown document; downstream distribution is out of scope for this skill.
-
-## Re-dispatch heuristics
-
-A worker returning "No concrete findings." is acceptable only if its coverage notes substantiate full scope review. If coverage notes are thin or absent, re-dispatch that single bucket once with `maxReviewRoundsOverride: 3`. Escalating beyond that requires a human decision.
-
-If two buckets report overlapping findings (same file:line), Stage 3 dedupes them. If two buckets report contradictory verdicts on the same file:line, halt and ask the human — that's a signal of buggy bucket boundaries.
-
-## Anti-patterns
-
-- Skipping recon and writing buckets in your head. Bucket choices are the single biggest determinant of audit quality and they need to be inspectable.
-- Letting one worker see another worker's output. The review boundary depends on independence.
-- Hardcoding model IDs in agent definitions or dispatches. Routing belongs in `~/.config/swival/config.toml`.
-- Accepting "No concrete findings" without coverage notes. That report is unverified, not negative.
-- Running consolidation in the orchestrator's context. The orchestrator has too much extra context; synthesis drifts. Use the dedicated agent.
-- Mixing audit and remediation in one pipeline. This skill is read-only. Backports are a separate flow that uses `self-review-worker`.
-
-## Cross-references
-
-- The companion `swival-audit` prompt template (`prompts/swival-audit.md` in this package) walks an interactive operator through the same pipeline as a slash-command-style invocation.
-- For implementing fixes from audit findings, dispatch a `self-review-worker` separately. This skill is read-only; remediation is a separate flow.
-
-## Reference files
-
-| File | Purpose |
-|---|---|
-| `references/recon-contract.md` | JSON schema for Stage 1 output |
-| `references/audit-prompt-template.md` | Template for per-bucket prompts in Stage 2 |
-| `references/consolidation-contract.md` | Output format for Stage 3 |
+Live provider or authentication tests require separate approval. Never install missing prerequisites, broaden network policy, or replace a rejected route to make a test pass.

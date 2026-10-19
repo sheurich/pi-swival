@@ -30,7 +30,14 @@ if ! command -v agentfs >/dev/null 2>&1; then
   exit 0
 fi
 
-base="$(mktemp -d)"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"
+temporary="$root/tests/.scratch/tmp"
+mkdir -p "$temporary"
+if [[ "$(cd "$temporary" && pwd -P)" != "$temporary" ]]; then
+  echo "FAIL: canary temporary directory escaped the worktree." >&2
+  exit 1
+fi
+base="$(mktemp -d "$temporary/agentfs-canary.XXXXXX")"
 session="${AGENTFS_CANARY_SESSION:-agentfs-ci-canary-$(python3 -c 'import secrets; print(secrets.token_hex(16))')}"
 run_dir="${HOME}/.agentfs/run/${session}"
 owns_run_dir=false
