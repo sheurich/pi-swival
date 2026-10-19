@@ -137,6 +137,15 @@ export interface SwivalAgentDiscoveryResult {
 }
 
 const MAX_DISCOVERY_DIAGNOSTICS = 12;
+
+/** Admit only identities that the bounded catalogue can display verbatim. */
+function isCatalogueAgentName(name: string | undefined): name is string {
+	// ESC is a control character, so rejecting controls also rejects ANSI sequences.
+	return name !== undefined && name.length > 0 && name.length <= 80 &&
+		!/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(name) &&
+		name.replace(/\s+/g, " ").trim() === name;
+}
+
 type RawFrontmatter = Record<string, unknown>;
 type Diagnose = (code: AgentDiscoveryCode, source: AgentSource, name?: string) => void;
 
@@ -252,9 +261,9 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 			reject("invalid_frontmatter");
 			continue;
 		}
-		const name = typeof fm.name === "string" && fm.name.trim() ? fm.name : undefined;
+		const name = typeof fm.name === "string" ? fm.name : undefined;
 		const description = typeof fm.description === "string" ? fm.description : "";
-		if (!name || !description.trim()) {
+		if (!isCatalogueAgentName(name) || !description.trim()) {
 			reject("invalid_definition", name);
 			continue;
 		}
