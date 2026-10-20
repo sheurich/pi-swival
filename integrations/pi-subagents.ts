@@ -89,6 +89,16 @@ export function createPiSubagentsAdapter(api: PiSubagentsObservationApi): AsyncO
 							known.set(row.runId, row);
 						}
 					}
+					// Deliver a displayed handle's terminal transition before live-first Fleet
+					// selection can remove it. This does not enlarge either bounded projection.
+					for (const [id, previous] of displayed) {
+						const row = known.get(id);
+						if (previous.state !== "running" || !row
+							|| (row.state !== "completed" && row.state !== "failed")) continue;
+						const patch: ExternalRunUpdate = { state: row.state, endedAt: row.endedAt };
+						api.updateExternalRun(sessionId, id, patch);
+						displayed.set(id, { ...previous, ...patch });
+					}
 					const sorted = [...known.values()].sort((left, right) =>
 						Number(right.state === "running") - Number(left.state === "running")
 						|| right.startedAt - left.startedAt || left.runId.localeCompare(right.runId));

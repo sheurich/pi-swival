@@ -93,7 +93,9 @@ Invalid admitted definitions fail closed. An identified invalid override blocks 
 
 ### Optional async observation
 
-Async launches save their owning session UUID. Observation exposes only bounded state, never task text, output, or PIDs. Recovered runs without terminal evidence remain `unknown`. Legacy runs without an owner remain available through explicit `status` and `resume` queries.
+Async launches save their owning session UUID even without an observation adapter. Without an adapter, pi-swival performs no observation scans, starts no observation timers, subscribes to no observation changes, and emits no observation wakes. Ownership and explicit `status`, `resume`, and same-process `interrupt` controls remain available.
+
+Observation exposes only bounded state, never task text, output, or PIDs. Recovered runs without terminal evidence remain `unknown`, which does not prove live execution. The adapter omits them from Fleet and active waits. Legacy runs without an owner remain available through explicit `status` and `resume` queries. Native audit artifacts are excluded from async observation.
 
 To include owned runs in pi-subagents Fleet and `bg_wait`, use the wrapper layout below. Install and review pi-subagents separately. Pi packages have separate module roots; installing both packages does not make their imports available to a user extension. pi-swival never discovers or installs the consumer.
 
@@ -143,7 +145,15 @@ In `~/.pi/agent/settings.json`, disable the package's default extension and enab
 
 Merge these entries into your existing settings. Replace the existing pi-swival entry with the object form, keeping its exact source and pin. Keep your existing pi-subagents source and other settings. Remove any separate entry that loads `pi-swival/extensions` directly, including project entries. The wrapper must be the only Swival extension entry point. Restart Pi or run `/reload`.
 
-The adapter uses the consumer's session file identity, with the UUID as its fallback. It caches at most 20 Fleet rows and 100 active wait items. Unknown activity has no consumer state and is omitted. Cancelling `bg_wait` does not stop a Swival run. Observation emits only the private `pi-swival:async-observation` reconciliation event; it never starts a model turn. Use explicit `status` or `resume` to retrieve results.
+The adapter receives only the four public functions shown above. It uses the consumer's session file identity, with the UUID as its fallback. Cancelling `bg_wait` cancels the wait without stopping or otherwise controlling Swival execution. Observation emits only the private `pi-swival:async-observation` reconciliation event; it never starts a model turn. Use explicit `status` or `resume` to retrieve results.
+
+The owner index retains live references and the newest 100 terminal references. Each observer projects at most 100 rows, prioritizing live runs; the adapter exposes at most 100 active wait items and 20 Fleet rows. With more than 100 live runs, selection is deterministic and live-only, with a truncation diagnostic. These display limits do not change execution. Selected runs deliver their validated terminal transition before removal, and overflow live work prevents a false idle snapshot.
+
+Recovery is progressive. Each observer reads at most 256 directory entries and 4 MiB of aggregate artifact data per pass. Continuations finish a stable, finite directory over multiple passes while retaining validated partial rows. A one-shot observation read performs one bounded pass, not an exhaustive scan. The cache retains at most 100 validated rows with stat fingerprints, never raw reports.
+
+The artifact root is absolute and fixed when the extension registers; new artifact paths are absolute too. Legacy relative paths are accepted only when their original resolution base is known and unchanged. Observation does not guess path provenance.
+
+Unchanged unresolved activity backs off through 1, 2, 4, 8, 16, and 30 seconds between polls. Local changes reset the delay and publish local state immediately. Polling stops after a complete scan with only terminal rows or no rows. Unverifiable terminal rows are omitted and may need an explicit refresh after their evidence becomes readable. Session replacement and shutdown dispose timers, subscriptions, directory handles, adapter registrations, and cached state.
 
 ### Skills
 
@@ -240,11 +250,26 @@ From the package root:
 
 ```bash
 npm test           # runs the already-installed local Vitest binary
-npm run typecheck  # checks extension types against the selected Pi peers
+npm run typecheck  # checks extensions and the adapter's portable API contract
 npm run smoke      # offline Pi resource-loader check; no model or credentials
 npm run native-agentfs-integration  # explicit real native bootstrap/export gate
 npm run ci         # typecheck + smoke + ordinary agentfs canary + vitest
 ```
+
+`tests/observationLoad.test.ts` loads the exact observation wrapper above with a synthetic consumer, offline and with child-process launches blocked. The default adapter tests also use a synthetic consumer. `npm run typecheck` includes `integrations/pi-subagents.ts` against the narrow public API contract in `tests/fixtures/piSubagentsPublicApi.d.ts`. A regression test verifies semantic inclusion and requires TS2345 for a malformed API call. This portable contract does not establish compatibility with an installed pi-subagents package.
+
+To check a real consumer, explicitly select its existing package root at test time:
+
+```bash
+PI_SWIVAL_TEST_CONSUMER_ROOT=/absolute/path/to/pi-subagents \
+  npm test -- piSubagentsAdapter.test.ts -t 'optional selected consumer'
+```
+
+Without `PI_SWIVAL_TEST_CONSUMER_ROOT`, this optional test is skipped. An invalid selection fails; the test never discovers, installs, or substitutes a consumer. The environment variable selects only this test; it does not configure runtime observation.
+
+The isolated subprocess imports the selected package's public `external-runs` and `background-work` exports and injects only the four adapter functions. It checks running and terminal states, unknown activity, ownership, replacement, and cleanup through public snapshots. A separate semantic check in that subprocess replaces the portable contract mapping with the selected package's actual exported declaration files.
+
+Temporary transpilation, script, and typecheck files are removed afterward. The subprocess uses fixed argv with no shell, a 60-second timeout, a 1 MiB output cap per stream, and synthetic session and home paths.
 
 The smoke test checks manifest paths and agent frontmatter, then creates isolated working and agent directories to load only this package through `DefaultResourceLoader` with in-memory settings. It checks the extension and `swival-subagent` tool, bundled skills and prompt without starting a session or reading stdin. It also runs the guarded offline catalogue loader test. Run setup separately; smoke never installs dependencies.
 

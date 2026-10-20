@@ -49,6 +49,10 @@ import {
 	MAX_OBSERVATION_ROWS,
 	captureAsyncOwner,
 	createAsyncObservation,
+	createRecoveryScan,
+	ObservationReadDeferred,
+	type ObservationReadBudget,
+	type AsyncRecoverySource,
 	isAsyncOwnerId,
 	isObservationText,
 	type AsyncObservation,
@@ -70,6 +74,7 @@ const STDERR_TAIL_LINES = 30;
 const STDOUT_RING_CHARS = 256 * 1024;
 // Artifacts are copied here before the per-run temp dir is deleted. Caller
 // sees report.json + trace JSONL under a timestamped subdir keyed by agent.
+const HISTORICAL_RESOLUTION_BASE = process.cwd();
 const ARTIFACT_ROOT = path.join(os.homedir(), ".pi", "agent", "swival-artifacts");
 const ASYNC_RUNNER_PATH = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -139,6 +144,40 @@ interface RunStateInfo {
  * artifact root.
  */
 const asyncRuns = new Map<string, AsyncRunEntry>();
+// Observation holds references only. Execution and manual controls retain their canonical registry.
+const asyncObservationOwners = new Map<string, {
+	live: Set<AsyncRunEntry>; terminal: AsyncRunEntry[];
+}>();
+const newestAsyncReference = (left: AsyncRunEntry, right: AsyncRunEntry) =>
+	right.meta.startedAt - left.meta.startedAt || left.meta.runId.localeCompare(right.meta.runId);
+
+function indexAsyncRun(entry: AsyncRunEntry): void {
+	const owner = entry.meta.ownerSessionId;
+	if (!isAsyncOwnerId(owner)) return;
+	let bucket = asyncObservationOwners.get(owner);
+	if (!bucket) {
+		bucket = { live: new Set(), terminal: [] };
+		asyncObservationOwners.set(owner, bucket);
+	}
+	if (!entry.exited) bucket.live.add(entry);
+	else {
+		bucket.live.delete(entry);
+		if (!bucket.terminal.includes(entry)) bucket.terminal.push(entry);
+		bucket.terminal.sort(newestAsyncReference);
+		bucket.terminal.length = Math.min(bucket.terminal.length, MAX_OBSERVATION_ROWS);
+	}
+}
+
+function unindexAsyncRun(entry: AsyncRunEntry): void {
+	const owner = entry.meta.ownerSessionId;
+	if (!owner) return;
+	const bucket = asyncObservationOwners.get(owner);
+	if (!bucket) return;
+	bucket.live.delete(entry);
+	const index = bucket.terminal.indexOf(entry);
+	if (index !== -1) bucket.terminal.splice(index, 1);
+	if (!bucket.live.size && !bucket.terminal.length) asyncObservationOwners.delete(owner);
+}
 const asyncObservationListeners = new Set<() => void>();
 
 function asyncRunChanged(): void {
@@ -1938,17 +1977,14 @@ export async function persistArtifacts(
 // ------------------------------------------------- artifact lifecycle --
 
 // Control classification requires native metadata/evidence, not an agent-name prefix.
-async function isNativeArtifact(directory: string): Promise<boolean> {
+async function isNativeArtifact(directory: string, knownMeta?: Record<string, unknown> | null): Promise<boolean> {
 	for (const name of ["snapshot", "request.json", path.join("evidence", "native-state")]) {
 		try { await fs.promises.lstat(path.join(directory, name)); return true; }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true; }
 	}
-	try {
-		const meta = path.join(directory, "run-meta.json");
-		const stat = await fs.promises.lstat(meta);
-		if (!stat.isFile() || stat.size > 65536) return false;
-		return JSON.parse(await fs.promises.readFile(meta, "utf8")).nativeAuditRequested === true;
-	} catch { return false; }
+	if (knownMeta !== undefined) return knownMeta?.nativeAuditRequested === true;
+	const meta = await readObservationJson(path.join(directory, "run-meta.json"), 65536);
+	return meta?.value.nativeAuditRequested === true;
 }
 
 /**
@@ -2159,27 +2195,37 @@ function validPersistedAsyncOwner(meta: Record<string, unknown>): boolean {
 }
 
 /** Read one regular artifact without following a leaf symlink or an unbounded growing file. */
-async function readObservationJson(file: string, cap: number): Promise<{
+async function readObservationJson(file: string, cap: number, budget?: ObservationReadBudget): Promise<{
 	value: Record<string, unknown>; mtimeMs: number;
 } | undefined> {
 	let handle: fs.promises.FileHandle | undefined;
 	try {
+		if (budget && (!budget.isCurrent() || budget.remaining === 0)) throw new ObservationReadDeferred();
 		handle = await fs.promises.open(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
 			| fs.constants.O_NONBLOCK);
+		if (budget && !budget.isCurrent()) throw new ObservationReadDeferred();
 		const stat = await handle.stat();
 		if (!stat.isFile() || stat.size > cap) return undefined;
-		const buffer = Buffer.alloc(cap + 1);
+		if (budget && (!budget.isCurrent() || stat.size + 1 > budget.remaining)) throw new ObservationReadDeferred();
+		const buffer = Buffer.alloc(Math.min(cap + 1, budget?.remaining ?? cap + 1));
 		let length = 0;
 		while (length < buffer.length) {
+			if (budget && !budget.isCurrent()) throw new ObservationReadDeferred();
 			const { bytesRead } = await handle.read(buffer, length, buffer.length - length, null);
+			if (budget) budget.remaining -= bytesRead;
 			if (bytesRead === 0) break;
 			length += bytesRead;
 		}
 		if (length > cap) return undefined;
+		if (length === buffer.length && buffer.length < cap + 1) throw new ObservationReadDeferred();
 		const value: unknown = JSON.parse(buffer.toString("utf8", 0, length));
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		return { value: value as Record<string, unknown>, mtimeMs: stat.mtimeMs };
-	} catch { return undefined; }
+	} catch (error) {
+		if (error instanceof ObservationReadDeferred
+			|| ["EINTR", "EIO"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+		return undefined;
+	}
 	finally { await handle?.close().catch(() => undefined); }
 }
 
@@ -2191,10 +2237,15 @@ function asyncObservationIdentity(meta: RunMeta) {
 	};
 }
 
-async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry): Promise<AsyncRunObservation> {
+async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry, budget?: ObservationReadBudget): Promise<AsyncRunObservation> {
 	const base = asyncObservationIdentity(meta);
 	if (entry && !entry.exited) return Object.freeze({ ...base, state: "running" });
-	const marker = await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024);
+	const [rootStat, artifactStat] = await Promise.all([
+		fs.promises.lstat(path.dirname(meta.artifactDir)).catch(() => undefined),
+		fs.promises.lstat(meta.artifactDir).catch(() => undefined),
+	]);
+	if (!rootStat?.isDirectory() || !artifactStat?.isDirectory()) return Object.freeze({ ...base, state: "unknown" });
+	const marker = await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024, budget);
 	const exitedAt = marker?.value.exitedAt;
 	const endedAt = typeof exitedAt === "string" &&
 		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(exitedAt)
@@ -2207,7 +2258,7 @@ async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry): Promise<As
 		&& endedAt >= meta.startedAt && marker.mtimeMs >= meta.startedAt && (code === null ||
 			(typeof code === "number" && Number.isSafeInteger(code) && code >= 0 && code <= 2147483647));
 	if (!entry && !validMarker) return Object.freeze({ ...base, state: "unknown" });
-	const raw = await readObservationJson(path.join(meta.artifactDir, "report.json"), 1024 * 1024);
+	const raw = await readObservationJson(path.join(meta.artifactDir, "report.json"), 1024 * 1024, budget);
 	let report: ReportSummary | undefined;
 	try {
 		if (raw && raw.mtimeMs >= meta.startedAt) report = summarizeReport(raw.value);
@@ -2233,67 +2284,165 @@ function eligibleAsyncObservationMeta(meta: RunMeta, ownerSessionId: string, roo
 		&& typeof meta.artifactDir === "string" && path.dirname(path.resolve(meta.artifactDir)) === root;
 }
 
-function selectLocalAsyncObservationEntries(ownerSessionId: string, root: string): AsyncRunEntry[] {
-	const live: AsyncRunEntry[] = [];
-	const terminal: AsyncRunEntry[] = [];
-	let inspected = 0;
-	for (const entry of asyncRuns.values()) {
-		if (++inspected > 256) break;
-		if (!eligibleAsyncObservationMeta(entry.meta, ownerSessionId, root)) continue;
-		(entry.exited ? terminal : live).push(entry);
+function selectLocalAsyncObservationEntries(
+	ownerSessionId: string, root: string, retainedRunIds: readonly string[] = [],
+	onTruncated?: () => void,
+): AsyncRunEntry[] {
+	const bucket = asyncObservationOwners.get(ownerSessionId);
+	if (!bucket) return [];
+	const eligible = (entry: AsyncRunEntry) => eligibleAsyncObservationMeta(entry.meta, ownerSessionId, root);
+	const live = [...bucket.live].filter(eligible).sort(newestAsyncReference);
+	if (live.length > MAX_OBSERVATION_ROWS) onTruncated?.();
+	// A previously published live handle gets one terminal publication, even if its
+	// start time is older than the retained history or overflow has filled every slot.
+	const terminalTransitions = retainedRunIds.slice(0, MAX_OBSERVATION_ROWS)
+		.map((id) => asyncRuns.get(id))
+		.filter((entry): entry is AsyncRunEntry => !!entry && entry.exited && eligible(entry))
+		.sort(newestAsyncReference);
+	const selected = new Set<AsyncRunEntry>();
+	for (const entry of [...terminalTransitions, ...live, ...bucket.terminal.filter(eligible)]) {
+		selected.add(entry);
+		if (selected.size === MAX_OBSERVATION_ROWS) break;
 	}
-	// Prioritize live handles within the inspection budget, not across an unbounded history.
-	return [...live, ...terminal].slice(0, MAX_OBSERVATION_ROWS);
+	return [...selected];
 }
 
 function readLocalAsyncRunObservations(
 	ownerSessionId: string,
 	artifactRoot: string,
+	retainedRunIds: readonly string[] = [],
+	onTruncated?: () => void,
 ): readonly AsyncRunObservation[] {
 	if (!isAsyncOwnerId(ownerSessionId)) return Object.freeze([]);
-	return Object.freeze(selectLocalAsyncObservationEntries(ownerSessionId, path.resolve(artifactRoot))
-		.filter((entry) => !entry.exited)
+	return Object.freeze(selectLocalAsyncObservationEntries(ownerSessionId, path.resolve(artifactRoot), retainedRunIds, onTruncated)
+		// Hold a selected exiting handle until asynchronous report validation publishes its terminal state.
+		.filter((entry) => !entry.exited || retainedRunIds.includes(entry.meta.runId))
 		.map((entry) => Object.freeze({
 			...asyncObservationIdentity(entry.meta), state: "running" as const,
 		})));
 }
 
-/** Bounded private state only. Recovered PIDs, tasks and output are never inspected or returned. */
+/** Only stat identities are retained by the observer, never metadata/report bodies.
+ * Directory identities and native sentinels are checked even on a cache hit. */
+async function asyncEvidenceFingerprint(root: string, artifactDir: string): Promise<string | undefined> {
+	try {
+		const identity = (stat: fs.Stats) => `${stat.dev}:${stat.ino}:${stat.mode}`;
+		const fingerprint = (stat: fs.Stats) => `${identity(stat)}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+		const [rootStat, directory] = await Promise.all([fs.promises.lstat(root), fs.promises.lstat(artifactDir)]);
+		if (!rootStat.isDirectory() || !directory.isDirectory() || path.dirname(artifactDir) !== root
+			|| await isNativeArtifact(artifactDir, null)) return undefined;
+		// A symlinked evidence parent must not hide a native-state sentinel.
+		const evidence = await fs.promises.lstat(path.join(artifactDir, "evidence")).catch((error: NodeJS.ErrnoException) => {
+			if (error.code !== "ENOENT") throw error;
+			return undefined;
+		});
+		if (evidence && !evidence.isDirectory()) return undefined;
+		const parts = [identity(rootStat), fingerprint(directory), evidence ? fingerprint(evidence) : "absent"];
+		for (const name of ["run-meta.json", "completed.json", "report.json", "spawn-error.txt"]) {
+			const stat = await fs.promises.lstat(path.join(artifactDir, name)).catch((error: NodeJS.ErrnoException) => {
+				if (error.code !== "ENOENT") throw error;
+				return undefined;
+			});
+			parts.push(stat ? fingerprint(stat) : "absent");
+		}
+		return parts.join("|");
+	} catch { return undefined; }
+}
+
+/** Filesystem operations stay here; continuation and retained rows belong to the observer. */
+function asyncRecoverySource(
+	ownerSessionId: string, root: string, resolutionBase: string,
+): AsyncRecoverySource {
+	let selectedLocalArtifacts = new Set<string>();
+	return {
+		local: (ids) => {
+			const entries = selectLocalAsyncObservationEntries(ownerSessionId, root, ids);
+			selectedLocalArtifacts = new Set(entries.map((entry) => entry.meta.artifactDir));
+			return entries.map((entry) => ({
+				key: entry.meta.artifactDir,
+				fingerprint: async () => {
+					const value = entry.exited ? await asyncEvidenceFingerprint(root, entry.meta.artifactDir) : undefined;
+					return value === undefined ? undefined : `local|${value}`;
+				},
+				read: (budget: ObservationReadBudget) => observeAsyncRun(entry.meta, entry, budget),
+			}));
+		},
+		async open() {
+			const empty = { read: async () => null, close: async () => {} };
+			const rootStat = await fs.promises.lstat(root).catch((error: NodeJS.ErrnoException) => {
+				if (error.code === "ENOENT") return undefined;
+				throw error;
+			});
+			if (!rootStat?.isDirectory()) return empty;
+			const directory = await fs.promises.opendir(root);
+			return {
+				close: () => directory.close(),
+				async read() {
+					const item = await directory.read();
+					if (!item) return null;
+					const artifactDir = path.join(root, item.name);
+					// Canonical locals were validated above; do not overwrite their cache
+					// identity with a skipped disk read or different recovery provenance.
+					const bucket = asyncObservationOwners.get(ownerSessionId);
+					if (selectedLocalArtifacts.has(artifactDir) || [...bucket?.live ?? [], ...bucket?.terminal ?? []].some((entry) =>
+						entry.meta.artifactDir === artifactDir && eligibleAsyncObservationMeta(entry.meta, ownerSessionId, root))) {
+						return { read: async () => undefined };
+					}
+					return { key: artifactDir,
+						fingerprint: async () => {
+							const value = await asyncEvidenceFingerprint(root, artifactDir);
+							return value === undefined ? undefined : `${process.cwd() === resolutionBase}|${value}`;
+						},
+						async read(budget: ObservationReadBudget) {
+						if (!item.isDirectory() || !budget.isCurrent()) return undefined;
+						const currentRoot = await fs.promises.lstat(root);
+						if (!currentRoot.isDirectory() || currentRoot.dev !== rootStat.dev || currentRoot.ino !== rootStat.ino) {
+							throw new Error("Async observation root changed.");
+						}
+						// Dirents can become stale during mutation. Never follow a replaced directory symlink.
+						const stat = await fs.promises.lstat(artifactDir).catch(() => undefined);
+						if (!stat?.isDirectory() || await isNativeArtifact(artifactDir, null)) return undefined;
+						const record = await readObservationJson(path.join(artifactDir, "run-meta.json"), 65536, budget);
+						if (!record || await isNativeArtifact(artifactDir, record.value)) return undefined;
+						const value = record.value;
+						if (typeof value.artifactDir !== "string") return undefined;
+						// No metadata records the old cwd. Relative paths are supported only while
+						// the known historical resolution base is unchanged, never guessed from root.
+						if (!path.isAbsolute(value.artifactDir) && process.cwd() !== resolutionBase) return undefined;
+						const normalized = path.resolve(resolutionBase, value.artifactDir);
+						if (normalized !== artifactDir || path.dirname(normalized) !== root) return undefined;
+						for (const key of ["stdoutFile", "stderrFile"] as const) {
+							if (!(key in value)) continue;
+							if (typeof value[key] !== "string") return undefined;
+							if (!path.isAbsolute(value[key]) && process.cwd() !== resolutionBase) return undefined;
+							if (path.dirname(path.resolve(resolutionBase, value[key])) !== artifactDir) return undefined;
+						}
+						const meta = { ...value, artifactDir: normalized } as unknown as RunMeta;
+						if (!eligibleAsyncObservationMeta(meta, ownerSessionId, root)) return undefined;
+						if (("agentFsRequested" in meta && typeof meta.agentFsRequested !== "boolean")
+							|| ("nonoRequested" in meta && typeof meta.nonoRequested !== "boolean")) return undefined;
+						return observeAsyncRun(meta, undefined, budget);
+					} };
+				},
+			};
+		},
+	};
+}
+
+/** One bounded page only, not an exhaustive snapshot. Fleet uses a disposable progressive scan. */
 export async function readAsyncRunObservations(
 	ownerSessionId: string,
 	artifactRoot: string = ARTIFACT_ROOT,
+	retainedRunIds: readonly string[] = [],
 ): Promise<readonly AsyncRunObservation[]> {
-	const rows: AsyncRunObservation[] = [];
-	if (!isAsyncOwnerId(ownerSessionId)) return Object.freeze(rows);
+	if (!isAsyncOwnerId(ownerSessionId)) return Object.freeze([]);
 	const root = path.resolve(artifactRoot);
-	const seen = new Set<string>();
-	for (const entry of selectLocalAsyncObservationEntries(ownerSessionId, root)) {
-		seen.add(entry.meta.runId);
-		rows.push(await observeAsyncRun(entry.meta, entry));
-	}
-	if (rows.length >= MAX_OBSERVATION_ROWS) return Object.freeze(rows);
-	try {
-		const directory = await fs.promises.opendir(root);
-		let scanned = 0;
-		for await (const item of directory) {
-			if (++scanned > 256 || rows.length >= MAX_OBSERVATION_ROWS) break;
-			if (!item.isDirectory()) continue;
-			const artifactDir = path.join(root, item.name);
-			const record = await readObservationJson(path.join(artifactDir, "run-meta.json"), 65536);
-			if (!record || record.value.artifactDir !== artifactDir) continue;
-			const meta = record.value as unknown as RunMeta;
-			if (!eligibleAsyncObservationMeta(meta, ownerSessionId, root) || seen.has(meta.runId)) continue;
-			if (("agentFsRequested" in meta && typeof meta.agentFsRequested !== "boolean")
-				|| ("nonoRequested" in meta && typeof meta.nonoRequested !== "boolean")) continue;
-			seen.add(meta.runId);
-			rows.push(await observeAsyncRun(meta));
-		}
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-			throw new Error("Async observation unavailable.");
-		}
-	}
-	return Object.freeze(rows);
+	const scan = createRecoveryScan(asyncRecoverySource(ownerSessionId, root, HISTORICAL_RESOLUTION_BASE));
+	try { return (await scan.pass(retainedRunIds)).rows; }
+	catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return Object.freeze([]);
+		throw new Error("Async observation unavailable.");
+	} finally { scan.dispose(); }
 }
 
 // ------------------------------------------------ async (background) --
@@ -2319,6 +2468,7 @@ export async function runSingleSwivalAsync(
 	artifactRoot: string = ARTIFACT_ROOT,
 	owner?: AsyncOwner,
 ): Promise<{ runId: string; artifactDir: string }> {
+	artifactRoot = path.resolve(artifactRoot);
 	const runOwner = captureAsyncOwner({
 		getSessionId: () => owner?.ownerSessionId,
 		getSessionFile: () => owner?.ownerSessionFile,
@@ -2402,6 +2552,7 @@ export async function runSingleSwivalAsync(
 	};
 	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
+	indexAsyncRun(entry);
 
 	// Attach lifecycle handlers before any await. ChildProcess does not replay
 	// early close/error events, and an unhandled spawn error can terminate Pi.
@@ -2411,21 +2562,25 @@ export async function runSingleSwivalAsync(
 		if (ttlScheduled) return;
 		ttlScheduled = true;
 		setTimeout(() => {
-			if (asyncRuns.get(runId) === entry) { asyncRuns.delete(runId); asyncRunChanged(); }
+			if (asyncRuns.get(runId) === entry) {
+				asyncRuns.delete(runId); unindexAsyncRun(entry); asyncRunChanged();
+			}
 		}, ASYNC_RUN_TTL_MS).unref?.();
 	};
 	proc.once("close", (code) => {
 		const current = asyncRuns.get(runId);
-		if (current) {
-			current.exited = true;
-			current.exitCode = code;
-		}
+		if (!current || current.exited) return;
+		current.exited = true;
+		current.exitCode = code;
+		indexAsyncRun(current);
 		scheduleExpiry();
 		asyncRunChanged();
 	});
 	proc.once("error", (err) => {
 		const current = asyncRuns.get(runId);
-		if (current) current.exited = true;
+		if (!current || current.exited) return;
+		current.exited = true;
+		indexAsyncRun(current);
 		void fs.promises.writeFile(
 			path.join(artifactDir, "spawn-error.txt"),
 			`async runner failed to start: ${err.message}`,
@@ -2454,6 +2609,8 @@ export async function runSingleSwivalAsync(
 			: false;
 		if (terminated) {
 			asyncRuns.delete(runId);
+			unindexAsyncRun(entry);
+			asyncRunChanged();
 			await fs.promises.rm(artifactDir, { recursive: true, force: true }).catch(() => undefined);
 			throw err;
 		}
@@ -3316,7 +3473,8 @@ export interface SwivalExtensionOptions {
 }
 
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
-	const artifactRoot = options.artifactRoot ?? ARTIFACT_ROOT;
+	const resolutionBase = process.cwd();
+	const artifactRoot = path.resolve(resolutionBase, options.artifactRoot ?? ARTIFACT_ROOT);
 	let observation: { owner: AsyncOwner; observer: AsyncObservation } | undefined;
 	let observationOwnerSessionId: string | undefined;
 	let observationGeneration = 0;
@@ -3325,11 +3483,18 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			&& observation?.owner.ownerSessionFile === owner?.ownerSessionFile) return;
 		observation?.observer.dispose();
 		observation = undefined;
-		if (!owner) return;
+		if (!owner || !options.observationAdapter) return;
+		let truncationReported = false;
+		const onTruncated = () => {
+			if (truncationReported) return;
+			truncationReported = true;
+			try { options.onObservationDiagnostic?.("Async observation truncated; showing 100 live runs."); }
+			catch { /* Observation cannot affect execution. */ }
+		};
 		const observer = createAsyncObservation({
 			owner, adapter: options.observationAdapter,
-			readLocalSnapshot: () => readLocalAsyncRunObservations(owner.ownerSessionId, artifactRoot),
-			readSnapshot: () => readAsyncRunObservations(owner.ownerSessionId, artifactRoot),
+			readLocalSnapshot: (ids) => readLocalAsyncRunObservations(owner.ownerSessionId, artifactRoot, ids, onTruncated),
+			recovery: asyncRecoverySource(owner.ownerSessionId, artifactRoot, resolutionBase),
 			subscribe(callback) {
 				asyncObservationListeners.add(callback);
 				return () => { asyncObservationListeners.delete(callback); };

@@ -4,10 +4,33 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-it("observationLoad: Pi loads the exact README wrapper with selected local packages offline", async () => {
+it("observationLoad: the README wrapper imports exactly the four injected consumer functions", () => {
+	const section = fs.readFileSync(path.join(packageRoot, "README.md"), "utf8")
+		.split("### Optional async observation\n")[1]!.split("\n### Skills")[0]!;
+	const wrapper = section.match(/```typescript\n([\s\S]*?)\n```/)![1]!;
+	const emitted = ts.transpileModule(wrapper, {
+		compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+	}).outputText;
+	const tree = ts.createSourceFile("wrapper.js", emitted, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
+	const imports = tree.statements.filter(ts.isImportDeclaration).map((statement) => ({
+		from: (statement.moduleSpecifier as ts.StringLiteral).text,
+		names: statement.importClause?.namedBindings && ts.isNamedImports(statement.importClause.namedBindings)
+			? statement.importClause.namedBindings.elements.map((element) => element.name.text) : [],
+		default: statement.importClause?.name?.text,
+	}));
+	expect(imports).toEqual([
+		{ from: "pi-swival/extensions/index.ts", names: [], default: "registerSwival" },
+		{ from: "pi-swival/integrations/pi-subagents.ts", names: ["createPiSubagentsAdapter"], default: undefined },
+		{ from: "pi-subagents/external-runs", names: ["registerExternalRun", "updateExternalRun", "unregisterExternalRun"], default: undefined },
+		{ from: "pi-subagents/background-work", names: ["registerBackgroundWorkProvider"], default: undefined },
+	]);
+});
+
+it("observationLoad: Pi loads the exact README wrapper offline with a synthetic consumer", async () => {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "swival-observation-load-")));
 	const cwd = path.join(root, "project");
 	const home = path.join(root, "home");

@@ -9,8 +9,10 @@
     "types": ["node"],
     "paths": {
       "@earendil-works/*": ["./node_modules/@earendil-works/*"],
-      "typebox": ["./node_modules/typebox"]
+      "typebox": ["./node_modules/typebox"],
+      "pi-subagents/external-runs": ["./fixtures/piSubagentsPublicApi.d.ts"],
+      "pi-subagents/background-work": ["./fixtures/piSubagentsPublicApi.d.ts"]
     }
   },
-  "include": ["../extensions/**/*.ts"]
+  "include": ["../extensions/**/*.ts", "../integrations/pi-subagents.ts"]
 }
