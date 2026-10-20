@@ -557,7 +557,107 @@ describe("session-scoped async observation lifecycle", () => {
 	});
 });
 
+describe("Unicode observation labels", () => {
+	it.each(["alpha\u200bbeta", "\u200b".repeat(80), "分析-équipe"])(
+		"dispatches the exact admitted selector %j and publishes safe live work before acknowledgement", async (name) => {
+			const f = await indexedFixture();
+			const agentDir = path.join(fs.realpathSync(f.root), "user", "swival-agents");
+			fs.mkdirSync(agentDir, { recursive: true });
+			vi.stubEnv("PI_CODING_AGENT_DIR", path.dirname(agentDir));
+			fs.writeFileSync(path.join(agentDir, "unicode.md"),
+				`---\nname: ${JSON.stringify(name)}\ndescription: Synthetic Unicode agent\n---\nExact selection prompt`);
+			const { discoverSwivalAgents } = await import("../extensions/agents.js");
+			expect(discoverSwivalAgents(f.root, "user").agents.find((agent) => agent.name === name)).toBeDefined();
+			await f.start();
+			const proc = new EventEmitter() as any; proc.unref = vi.fn();
+			execution.spawn.mockReturnValue(proc);
+			disposers.push(() => proc.emit("close", 1));
+			const write = fs.promises.writeFile.bind(fs.promises);
+			let release!: () => void; let entered!: (meta: RunMeta) => void;
+			const writing = new Promise<RunMeta>((resolve) => { entered = resolve; });
+			vi.spyOn(fs.promises, "writeFile").mockImplementation(async (file: any, ...args: any[]) => {
+				if (String(file).endsWith("run-meta.json")) {
+					entered(JSON.parse(String(args[0]))); await new Promise<void>((resolve) => { release = resolve; });
+				}
+				return (write as any)(file, ...args);
+			});
+			const ctx = { ...f.r.ctx(), cwd: f.root };
+			const pending = f.r.tool.execute("unicode", { agent: name, task: "synthetic task", agentScope: "user", async: true },
+				undefined, undefined, ctx);
+			const meta = await writing;
+			try {
+				expect(meta.agent).toBe(name);
+				expect((execution.spawn.mock.calls as any).at(-1)[1]).toContain("Exact selection prompt");
+				expect.soft(f.provider().listActiveWork()).toEqual([{ id: meta.runId, sessionId: f.owner.ownerSessionFile }]);
+				const rows = await f.fresh.readAsyncRunObservations(OWNER, f.root);
+				expect(rows).toHaveLength(1);
+				expect(rows[0]).toMatchObject({ runId: meta.runId, state: "running" });
+				expect(observation.isObservationText(rows[0].agent, 160)).toBe(true);
+				if (name === "分析-équipe") expect(rows[0].agent).toBe(name);
+				else expect(rows[0].agent).not.toMatch(/\p{Cf}/u);
+			} finally { release(); await pending; }
+			expect(JSON.parse(fs.readFileSync(path.join(meta.artifactDir, "run-meta.json"), "utf8")).agent).toBe(name);
+		},
+	);
+
+	it.each(["unknown", "completed", "failed"])("recovers canonical Cf identities as safe bounded %s observations", async (state) => {
+		const root = rootDir(); const meta = artifact(root, "unicode-recovery");
+		meta.agent = "alpha\u200bbeta";
+		fs.writeFileSync(path.join(meta.artifactDir, "run-meta.json"), JSON.stringify(meta));
+		if (state !== "unknown") complete(meta, state === "completed" ? "success" : "failed", state === "completed" ? 0 : 1);
+		const rows = await extension.readAsyncRunObservations(OWNER, root);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ runId: meta.runId, ownerSessionId: OWNER, state });
+		expect(observation.isObservationText(rows[0].agent, 160)).toBe(true);
+		expect(JSON.stringify(rows)).not.toMatch(/\p{Cf}/u);
+		expect(JSON.parse(fs.readFileSync(path.join(meta.artifactDir, "run-meta.json"), "utf8")).agent).toBe(meta.agent);
+	});
+
+	it.each(["分析-équipe", "x".repeat(160), "legacy  label"])("preserves safe legacy observation label %j", async (agent) => {
+		const root = rootDir(); const meta = artifact(root, "legacy-label");
+		fs.writeFileSync(path.join(meta.artifactDir, "run-meta.json"), JSON.stringify({ ...meta, agent }));
+		expect(await extension.readAsyncRunObservations(OWNER, root)).toMatchObject([{ agent, state: "unknown" }]);
+	});
+
+	it.each(["bad\nname", "bad\u0000name", "bad\u001b[31mname", " alpha\u200bbeta", "alpha  \u200bbeta", "alpha\u202ebeta", "\u200b".repeat(81), 123, null])(
+		"rejects malformed or noncanonical unsafe recovered identity %j", async (agent) => {
+			const root = rootDir(); const meta = artifact(root, "invalid-label");
+			fs.writeFileSync(path.join(meta.artifactDir, "run-meta.json"), JSON.stringify({ ...meta, agent }));
+			expect(await extension.readAsyncRunObservations(OWNER, root)).toEqual([]);
+		},
+	);
+
+	it.each(["runId", "ownerSessionFile"])("still rejects Cf in recovered %s", async (field) => {
+		const root = rootDir(); const meta = artifact(root, "unsafe-identity");
+		fs.writeFileSync(path.join(meta.artifactDir, "run-meta.json"), JSON.stringify({ ...meta, [field]: "alpha\u200bbeta" }));
+		expect(await extension.readAsyncRunObservations(OWNER, root)).toEqual([]);
+		expect(observation.captureAsyncOwner({ getSessionId: () => OWNER, getSessionFile: () => "/bad\u200bfile" }))
+			.toEqual({ ownerSessionId: OWNER });
+	});
+});
+
 describe("B1/B2 opt-in and owner-index regressions", () => {
+	it("keeps admitted Unicode agent names visible as proven local live work", async () => {
+		const f = await indexedFixture();
+		const agentDir = path.join(fs.realpathSync(f.root), "user", "swival-agents");
+		fs.mkdirSync(agentDir, { recursive: true });
+		vi.stubEnv("PI_CODING_AGENT_DIR", path.dirname(agentDir));
+		const name = "alpha\u200bbeta";
+		fs.writeFileSync(path.join(agentDir, "unicode.md"),
+			`---\nname: ${JSON.stringify(name)}\ndescription: Synthetic Unicode agent\n---\nSynthetic prompt`);
+		const { discoverSwivalAgents } = await import("../extensions/agents.js");
+		const agent = discoverSwivalAgents(f.root, "user").agents.find((entry) => entry.name === name);
+		expect(agent).toBeDefined();
+		await f.start();
+		const proc = new EventEmitter() as any; proc.unref = vi.fn();
+		execution.spawn.mockReturnValue(proc);
+		disposers.push(() => proc.emit("close", 1));
+		const run = await f.fresh.runSingleSwivalAsync(f.root, [agent!], name, "synthetic task",
+			undefined, {}, f.root, f.owner);
+		expect(f.provider().listActiveWork()).toContainEqual({
+			id: run.runId, sessionId: f.owner.ownerSessionFile,
+		});
+	});
 	it.each(["session_start", "first launch"])("does no observation work without an adapter at %s", async (entry) => {
 		vi.resetModules();
 		const standalone = await import("../extensions/index.js");

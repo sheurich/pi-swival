@@ -41,6 +41,7 @@ import { captureNativeRuntime, inspectNativeAudit, prepareNativeAudit, validateN
 import {
 	type AgentScope,
 	discoverSwivalAgents,
+	isCatalogueAgentName,
 	type SwivalAgentConfig,
 	type SwivalAgentDiscoveryResult,
 } from "./agents.js";
@@ -2233,7 +2234,9 @@ function asyncObservationIdentity(meta: RunMeta) {
 	return {
 		runId: meta.runId, ownerSessionId: meta.ownerSessionId!,
 		...(meta.ownerSessionFile ? { ownerSessionFile: meta.ownerSessionFile } : {}),
-		agent: meta.agent, startedAt: meta.startedAt,
+		// Observation labels are not dispatch selectors; execution metadata stays exact.
+		agent: isObservationText(meta.agent, 160) ? meta.agent : "Swival agent",
+		startedAt: meta.startedAt,
 	};
 }
 
@@ -2278,7 +2281,9 @@ async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry, budget?: Ob
 function eligibleAsyncObservationMeta(meta: RunMeta, ownerSessionId: string, root: string): boolean {
 	return meta.ownerSessionId === ownerSessionId
 		&& validPersistedAsyncOwner(meta as unknown as Record<string, unknown>)
-		&& isObservationText(meta.runId, 160) && isObservationText(meta.agent, 160)
+		&& isObservationText(meta.runId, 160)
+		&& (isObservationText(meta.agent, 160)
+			|| (typeof meta.agent === "string" && isCatalogueAgentName(meta.agent)))
 		&& Number.isSafeInteger(meta.startedAt) && meta.startedAt >= 0
 		&& meta.startedAt <= 8_640_000_000_000_000
 		&& typeof meta.artifactDir === "string" && path.dirname(path.resolve(meta.artifactDir)) === root;
@@ -3201,7 +3206,6 @@ const SwivalParams = Type.Object({
 });
 
 const MAX_CATALOGUE_ROWS = 20;
-const MAX_CATALOGUE_NAME_CHARS = 80;
 const MAX_CATALOGUE_DESCRIPTION_CHARS = 160;
 const MAX_CATALOGUE_TEXT_CHARS = 8192;
 
@@ -3219,7 +3223,7 @@ function buildAgentCatalogue(discovery: SwivalAgentDiscoveryResult, agentScope: 
 		total: discovery.agents.length,
 		omitted: Math.max(0, discovery.agents.length - MAX_CATALOGUE_ROWS),
 		agents: discovery.agents.slice(0, MAX_CATALOGUE_ROWS).map((agent) => ({
-			name: catalogueText(agent.name, MAX_CATALOGUE_NAME_CHARS),
+			name: agent.name,
 			description: catalogueText(agent.description, MAX_CATALOGUE_DESCRIPTION_CHARS),
 			source: agent.source,
 			reviewer: {

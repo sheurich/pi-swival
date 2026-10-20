@@ -50,6 +50,16 @@ afterEach(() => {
 });
 
 describe("swival-subagent action:list", () => {
+	it.each([undefined, ""])("fails closed for an unresolved empty definition with selector %j", async (agent) => {
+		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
+		const listed = await execute({ action: "list" });
+		expect.soft(listed.details.dispatchBlocked).toBe(true);
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		const result = await execute({ task: "synthetic task", ...(agent === undefined ? {} : { agent }) });
+		expect.soft(result.isError).toBe(true);
+		expect(spawn).not.toHaveBeenCalled();
+	});
 	it.each(yamlWarningFixtures)("contains $label without leaking source or launching", async ({ frontmatter }) => {
 		write(userDir, "warning.md", frontmatter);
 		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
@@ -131,9 +141,9 @@ describe("swival-subagent action:list", () => {
 		expect(result.content[0].text).toMatch(/interrupt.*same.process/i);
 	});
 
-	it("caps rows, names, descriptions and text, with exact omitted counts and stable order", async () => {
+	it("caps rows, descriptions and text, with exact omitted counts and stable order", async () => {
 		for (let i = 39; i >= 0; i--) {
-			write(userDir, `${40 - i}.md`, `name: agent-${String(i).padStart(2, "0")}-${"n".repeat(100)}\ndescription: ${"d".repeat(1000)}`);
+			write(userDir, `${40 - i}.md`, `name: agent-${String(i).padStart(2, "0")}-${"n".repeat(71)}\ndescription: ${"d".repeat(1000)}`);
 		}
 		const result = await execute({ action: "list" });
 		const total = discoverSwivalAgents(root, "user").agents.length;
@@ -149,6 +159,35 @@ describe("swival-subagent action:list", () => {
 		expect(result.content[0].text.length).toBeLessThanOrEqual(8192);
 		expect(result.content[0].text).toContain(`${total - 20} omitted`);
 		expect((await execute({ action: "list" })).details).toEqual(result.details);
+	});
+
+	it.each([
+		"ordinary-helper", "alpha beta", "助手 café", "cafe\u0301",
+		"a".repeat(80), "😀".repeat(40), `${"a".repeat(78)}😀`,
+	])("lists the exact admitted selector %j", async (name) => {
+		write(userDir, "identity.md", `name: ${JSON.stringify(name)}\ndescription: helper`);
+		const result = await execute({ action: "list" });
+		expect(result.details.agents.find((a: any) => a.name === name)).toMatchObject({ name, source: "user" });
+		expect(result.content[0].text).toContain(`${name} (user):`);
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		"a".repeat(81), `${"a".repeat(79)}😀`, "😀".repeat(41),
+		" leading", "trailing ", "alpha  beta", "alpha\tbeta", "alpha\u0007beta",
+		"\u001b[31malpha\u001b[0m", "\t\u0007",
+	])("omits invalid selectors without silently renaming them: %j", async (name) => {
+		write(userDir, "valid.md", 'name: "alpha beta"\ndescription: valid sibling');
+		write(projectDir, "invalid.md", `name: ${JSON.stringify(name)}\ndescription: invalid override`);
+		const result = await execute({ action: "list", agentScope: "both" });
+		expect(result.details.agents.filter((a: any) => a.source !== "bundled"))
+			.toEqual([expect.objectContaining({ name: "alpha beta", source: "user" })]);
+		expect(result.details).toMatchObject({
+			dispatchBlocked: false, diagnostics: [{ code: "invalid_definition", source: "project" }],
+		});
+		expect(JSON.stringify(result)).not.toContain("invalid override");
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
 	});
 
 	it("removes control characters from catalogue display fields", async () => {
@@ -242,6 +281,130 @@ const modes = [
 ] as const;
 
 describe("discovery dispatch validation", () => {
+	it.each([undefined, ""])("blocks a whitespace-only definition with selector %j", async (agent) => {
+		write(userDir, "blank.md", 'name: "   "\ndescription: PRIVATE_DESCRIPTION');
+		const listed = await execute({ action: "list" });
+		expect.soft(listed.details).toMatchObject({
+			dispatchBlocked: true, diagnostics: [{ code: "invalid_definition", source: "user" }],
+		});
+		expect(JSON.stringify(listed)).not.toMatch(/PRIVATE|blank\.md/);
+		expect(JSON.stringify(listed)).not.toContain(root);
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		const result = await execute({ task: "task", ...(agent === undefined ? {} : { agent }) });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+	});
+
+	it.each(modes)("blocks an empty definition before any child process in %s", async (_mode, params) => {
+		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
+		write(userDir, "valid.md", "name: valid\ndescription: visible helper");
+		const result = await execute(params);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+	});
+
+	it("dispatches the default swival agent when the healthy catalogue selector is omitted", async () => {
+		write(userDir, "default.md", "name: swival\ndescription: default helper\nfiles: none\ncommands: none");
+		const launches: string[][] = [];
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		vi.mocked(spawn).mockImplementation(((_exe: string, args: string[], options: any) => {
+			launches.push(args);
+			expect(options).toMatchObject({ cwd: root, shell: false });
+			const proc: any = new EventEmitter();
+			proc.stdout = new PassThrough();
+			proc.stderr = new PassThrough();
+			proc.stdin = new PassThrough();
+			proc.kill = vi.fn();
+			queueMicrotask(() => {
+				fs.writeFileSync(args[args.indexOf("--report") + 1], JSON.stringify({
+					result: { outcome: "success", answer: "DEFAULT_OK", exit_code: 0 },
+				}));
+				proc.stdout.end();
+				proc.stderr.end();
+				proc.emit("close", 0);
+			});
+			return proc;
+		}) as any);
+		const result = await execute({ task: "exercise omitted selector" });
+		expect(result.isError, JSON.stringify(result)).not.toBe(true);
+		expect(result.details.results[0]).toMatchObject({ agent: "swival", finalOutput: "DEFAULT_OK" });
+		expect(launches).toHaveLength(1);
+		expect(launches[0][launches[0].indexOf("--system-prompt") + 1]).toBe("PRIVATE_PROMPT");
+	});
+
+	it.each(["alpha  beta", " leading", "\t\u0007", "alpha\tbeta", "alpha\u0007beta", "a".repeat(81)])(
+		"blocks the exact invalid identity before launch: %j", async (name) => {
+			write(userDir, "lower.md", `name: ${JSON.stringify(name)}\ndescription: lower`);
+			write(projectDir, "higher.md", `name: ${JSON.stringify(name)}\ndescription: []`);
+			const result = await execute({ agent: name, task: "task", agentScope: "both" });
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toMatch(/invalid agent definition shadows a requested name/i);
+			expect(spawn).not.toHaveBeenCalled();
+		},
+	);
+
+	it("blocks an invalid same-name project override instead of launching the listed user definition", async () => {
+		write(userDir, "custom.md", 'name: "alpha beta"\ndescription: user helper\nfiles: none\ncommands: none');
+		const listed = await execute({ action: "list" });
+		const name = listed.details.agents.find((a: any) => a.source === "user").name;
+		write(projectDir, "custom.md", `name: ${JSON.stringify(name)}\ndescription: []`);
+		const result = await execute({ agent: name, task: "task", agentScope: "both" });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/invalid agent definition shadows a requested name/i);
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
+	it("dispatches a listed normal custom selector using its higher-priority repair's prompt and config", async () => {
+		write(userDir, "custom.md", 'name: "alpha beta"\ndescription: broken lower\nmaxTurns: []');
+		fs.writeFileSync(path.join(projectDir, "custom.md"), [
+			"---", 'name: "alpha beta"', "description: repaired helper", "files: none", "commands: none",
+			"maxTurns: 17", "temperature: 0.25", "---", "SELECTED_REPAIR_PROMPT",
+		].join("\n"));
+		const listed = await execute({ action: "list", agentScope: "both" });
+		const row = listed.details.agents.find((a: any) => a.name === "alpha beta");
+		expect(row).toMatchObject({ source: "project" });
+		expect(spawn).not.toHaveBeenCalled();
+		const launches: string[][] = [];
+		vi.mocked(spawn).mockImplementation(((_exe: string, args: string[], options: any) => {
+			const proc: any = new EventEmitter();
+			proc.stdout = new PassThrough();
+			proc.stderr = new PassThrough();
+			proc.stdin = new PassThrough();
+			proc.kill = vi.fn();
+			if (!args.includes("--version")) {
+				launches.push(args);
+				expect(options).toMatchObject({ cwd: root, shell: false });
+			}
+			queueMicrotask(() => {
+				if (args.includes("--version")) proc.stdout.write("1.0.45");
+				else fs.writeFileSync(args[args.indexOf("--report") + 1], JSON.stringify({
+					result: { outcome: "success", answer: "SELECTED_REPAIR_OK", exit_code: 0 },
+					sandbox: { mode: "agentfs", agentfs_version: "synthetic-test-version" },
+				}));
+				proc.stdout.end();
+				proc.stderr.end();
+				proc.emit("close", 0);
+			});
+			return proc;
+		}) as any);
+		const result = await tool.execute("identity-dispatch", {
+			agent: row.name, task: "exercise listed selector", agentScope: "both",
+		}, undefined, undefined, { cwd: root, hasUI: true, ui: { confirm: vi.fn(async () => true) } });
+		expect(result.isError, JSON.stringify(result)).not.toBe(true);
+		expect(result.details.results[0]).toMatchObject({ agent: row.name, finalOutput: "SELECTED_REPAIR_OK" });
+		expect(launches).toHaveLength(1);
+		const args = launches[0];
+		expect(args[args.indexOf("--system-prompt") + 1]).toBe("SELECTED_REPAIR_PROMPT");
+		expect(args[args.indexOf("--max-turns") + 1]).toBe("17");
+		expect(args[args.indexOf("--temperature") + 1]).toBe("0.25");
+		expect(args).not.toContain("PRIVATE_PROMPT");
+	});
 	for (const { label, frontmatter } of yamlWarningFixtures) {
 		it.each(modes)(`blocks ${label} before any child process in %s`, async (_mode, params) => {
 			write(userDir, "warning.md", frontmatter);
