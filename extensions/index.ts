@@ -2866,7 +2866,6 @@ const SwivalParams = Type.Object({
 });
 
 const MAX_CATALOGUE_ROWS = 20;
-const MAX_CATALOGUE_NAME_CHARS = 80;
 const MAX_CATALOGUE_DESCRIPTION_CHARS = 160;
 const MAX_CATALOGUE_TEXT_CHARS = 8192;
 
@@ -2884,7 +2883,7 @@ function buildAgentCatalogue(discovery: SwivalAgentDiscoveryResult, agentScope: 
 		total: discovery.agents.length,
 		omitted: Math.max(0, discovery.agents.length - MAX_CATALOGUE_ROWS),
 		agents: discovery.agents.slice(0, MAX_CATALOGUE_ROWS).map((agent) => ({
-			name: catalogueText(agent.name, MAX_CATALOGUE_NAME_CHARS),
+			name: agent.name,
 			description: catalogueText(agent.description, MAX_CATALOGUE_DESCRIPTION_CHARS),
 			source: agent.source,
 			reviewer: {
