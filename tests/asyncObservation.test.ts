@@ -81,6 +81,16 @@ function rootDir() {
 	return root;
 }
 
+// B1 uses canonical configured roots. Count root and descendant reads, not late
+// I/O from a retired runtime rooted elsewhere. Keep this detector shared with its
+// real-opendir negative control so an over-broad filter cannot make B1 vacuous.
+function directoryReadsWithin(calls: ReadonlyArray<ReadonlyArray<unknown>>, root: string) {
+	return calls.filter(([directory]) => {
+		const relative = path.relative(root, path.resolve(String(directory)));
+		return relative === "" || (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`));
+	});
+}
+
 function artifact(root: string, id: string, owner: string | null = OWNER) {
 	const artifactDir = path.join(root, id);
 	fs.mkdirSync(artifactDir);
@@ -658,43 +668,109 @@ describe("B1/B2 opt-in and owner-index regressions", () => {
 			id: run.runId, sessionId: f.owner.ownerSessionFile,
 		});
 	});
-	it.each(["session_start", "first launch"])("does no observation work without an adapter at %s", async (entry) => {
-		vi.resetModules();
-		const standalone = await import("../extensions/index.js");
-		const standaloneObservation = await import("../extensions/async-observation.js");
-		await standalone.preflightSwivalVersion(async () => "1.0.45");
-		const root = fs.realpathSync(rootDir()); artifact(root, "owned-unknown");
-		const agentDir = path.join(root, ".pi", "swival-agents");
-		fs.mkdirSync(agentDir, { recursive: true });
-		fs.writeFileSync(path.join(agentDir, "test.md"), "---\nname: test\ndescription: Synthetic\n---\nSynthetic prompt");
-		const create = vi.spyOn(standaloneObservation, "createAsyncObservation");
-		const scan = vi.spyOn(fs.promises, "opendir"); // prune uses readdir, not observation's opendir
-		const timer = vi.spyOn(globalThis, "setTimeout");
-		const diagnostic = vi.fn();
-		const r = runtime({ artifactRoot: root, trustProjectAgents: true, onObservationDiagnostic: diagnostic }, standalone);
-		const ctx = { ...r.ctx(), cwd: root };
-		disposers.push(() => r.handlers.get("session_shutdown")!({}, ctx));
-		if (entry === "session_start") await r.handlers.get("session_start")!({}, ctx);
-		else {
-			const proc = new EventEmitter() as any; proc.unref = vi.fn(); execution.spawn.mockReturnValue(proc);
-			const result = await r.tool.execute("call", { agent: "test", task: "task", agentScope: "project", async: true }, undefined, undefined, ctx);
-			expect(result.isError).not.toBe(true);
-			const dir = (execution.spawn.mock.calls as any).at(-1)[1][1];
-			expect(JSON.parse(fs.readFileSync(path.join(dir, "run-meta.json"), "utf8"))).toMatchObject({ ownerSessionId: OWNER });
-			disposers.push(() => proc.emit("close", 1));
+	it.each(["session_start", "first launch", "retired observer pending open"])("does no observation work without an adapter at %s", async (entry) => {
+		// Hold a real recovery source.open at its lstat await, then retire its runtime.
+		// Its late opendir must not be attributed to the new no-adapter runtime.
+		let retired: { root: string; release: () => void; pending: Promise<any>; update: ReturnType<typeof vi.fn>; r: ReturnType<typeof runtime> } | undefined;
+		if (entry === "retired observer pending open") {
+			const foreignRoot = fs.realpathSync(rootDir());
+			const lstat = fs.promises.lstat.bind(fs.promises);
+			let entered!: () => void; let release!: () => void;
+			const waiting = new Promise<void>((resolve) => { entered = resolve; });
+			const gate = new Promise<void>((resolve) => { release = resolve; });
+			vi.spyOn(fs.promises, "lstat").mockImplementation(async (...args: any[]) => {
+				const stat = await (lstat as any)(...args);
+				if (String(args[0]) === foreignRoot) { entered(); await gate; }
+				return stat;
+			});
+			const update = vi.fn();
+			const r = runtime({ artifactRoot: foreignRoot, observationAdapter: () => ({ update, dispose() {} }) });
+			const pending = r.handlers.get("session_start")!({}, r.ctx());
+			disposers.push(release);
+			await waiting;
+			await r.handlers.get("session_shutdown")!({}, r.ctx());
+			// The live observer may publish its initial empty local snapshot before lstat.
+			update.mockClear(); r.pi.events.emit.mockClear();
+			retired = { root: foreignRoot, release, pending, update, r };
 		}
-		expect.soft(create).not.toHaveBeenCalled(); expect.soft(scan).not.toHaveBeenCalled();
-		expect.soft(timer.mock.calls.filter(([, delay]) => delay === 1000)).toHaveLength(0);
-		expect.soft(r.pi.events.emit).not.toHaveBeenCalled(); expect(diagnostic).not.toHaveBeenCalled();
-		complete(artifact(root, "owned-complete"));
-		for (const action of ["status", "resume"]) {
-			const result = await r.tool.execute("manual", { action, id: "owned-complete" }, undefined, undefined, ctx);
-			expect(result.isError).not.toBe(true);
-			if (action === "resume") expect(result.content[0].text).toContain("private output");
+		try {
+			vi.resetModules();
+			const standalone = await import("../extensions/index.js");
+			const standaloneObservation = await import("../extensions/async-observation.js");
+			await standalone.preflightSwivalVersion(async () => "1.0.45");
+			const root = fs.realpathSync(rootDir()); artifact(root, "owned-unknown");
+			const agentDir = path.join(root, ".pi", "swival-agents");
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.writeFileSync(path.join(agentDir, "test.md"), "---\nname: test\ndescription: Synthetic\n---\nSynthetic prompt");
+			const create = vi.spyOn(standaloneObservation, "createAsyncObservation");
+			const scan = vi.spyOn(fs.promises, "opendir"); // prune uses readdir, not observation's opendir
+			const timer = vi.spyOn(globalThis, "setTimeout");
+			const diagnostic = vi.fn();
+			const r = runtime({ artifactRoot: root, trustProjectAgents: true, onObservationDiagnostic: diagnostic }, standalone);
+			const ctx = { ...r.ctx(), cwd: root };
+			disposers.push(() => r.handlers.get("session_shutdown")!({}, ctx));
+			if (entry !== "first launch") await r.handlers.get("session_start")!({}, ctx);
+			else {
+				const proc = new EventEmitter() as any; proc.unref = vi.fn(); execution.spawn.mockReturnValue(proc);
+				const result = await r.tool.execute("call", { agent: "test", task: "task", agentScope: "project", async: true }, undefined, undefined, ctx);
+				expect(result.isError).not.toBe(true);
+				const dir = (execution.spawn.mock.calls as any).at(-1)[1][1];
+				expect(JSON.parse(fs.readFileSync(path.join(dir, "run-meta.json"), "utf8"))).toMatchObject({ ownerSessionId: OWNER });
+				disposers.push(() => proc.emit("close", 1));
+			}
+			expect.soft(create).not.toHaveBeenCalled(); expect.soft(directoryReadsWithin(scan.mock.calls, root)).toHaveLength(0);
+			expect.soft(timer.mock.calls.filter(([, delay]) => delay === 1000)).toHaveLength(0);
+			expect.soft(r.pi.events.emit).not.toHaveBeenCalled(); expect(diagnostic).not.toHaveBeenCalled();
+			complete(artifact(root, "owned-complete"));
+			for (const action of ["status", "resume"]) {
+				const result = await r.tool.execute("manual", { action, id: "owned-complete" }, undefined, undefined, ctx);
+				expect(result.isError).not.toBe(true);
+				if (action === "resume") expect(result.content[0].text).toContain("private output");
+			}
+			if (retired) {
+				retired.release(); await retired.pending;
+				expect(retired.update).not.toHaveBeenCalled();
+				expect(retired.r.pi.events.emit).not.toHaveBeenCalled();
+				const reads = scan.mock.calls.map(([directory]) => String(directory));
+				console.info("no-adapter read attribution", JSON.stringify({ configuredRoot: root, retiredRoot: retired.root,
+					owned: reads.filter((directory) => directory === root).length,
+					foreign: reads.filter((directory) => directory === retired!.root).length, reads }));
+				expect(reads.filter((directory) => directory === retired!.root)).toHaveLength(1);
+				const lateOpen = scan.mock.results[reads.indexOf(retired.root)];
+				const lateDirectory = await lateOpen.value;
+				await expect(lateDirectory.read()).rejects.toMatchObject({ code: "ERR_DIR_CLOSED" });
+			}
+			expect(create).not.toHaveBeenCalled(); expect(directoryReadsWithin(scan.mock.calls, root)).toHaveLength(0);
+			expect(timer.mock.calls.filter(([, delay]) => delay === 1000)).toHaveLength(0);
+			expect(r.pi.events.emit).not.toHaveBeenCalled();
+			await r.handlers.get("session_shutdown")!({}, ctx);
+		} finally {
+			// Drain the held real FS operation even if a no-adapter assertion fails.
+			if (retired) { retired.release(); await retired.pending; }
 		}
-		expect(create).not.toHaveBeenCalled(); expect(scan).not.toHaveBeenCalled();
-		expect(r.pi.events.emit).not.toHaveBeenCalled();
-		await r.handlers.get("session_shutdown")!({}, ctx);
+	});
+
+	it("detects real own-root directory reads in the no-adapter scan guard (negative control)", async () => {
+		const root = fs.realpathSync(rootDir());
+		const foreign = fs.realpathSync(rootDir());
+		const child = path.join(root, "child"); fs.mkdirSync(child);
+		// A prefix sibling is foreign too: startsWith(root) would misattribute it.
+		const sibling = `${root}-sibling`; fs.mkdirSync(sibling); roots.push(sibling);
+		const scan = vi.spyOn(fs.promises, "opendir");
+		const r = runtime({ artifactRoot: root });
+		disposers.push(() => r.handlers.get("session_shutdown")!({}, r.ctx()));
+		await r.handlers.get("session_start")!({}, r.ctx());
+		expect(directoryReadsWithin(scan.mock.calls, root)).toHaveLength(0);
+		for (const directory of [foreign, sibling]) {
+			const handle = await fs.promises.opendir(directory); await handle.close();
+		}
+		expect(directoryReadsWithin(scan.mock.calls, root)).toHaveLength(0);
+		const handle = await fs.promises.opendir(root); await handle.close();
+		expect(directoryReadsWithin(scan.mock.calls, root)).toEqual([[root]]);
+		const nested = await fs.promises.opendir(child); await nested.close();
+		expect(directoryReadsWithin(scan.mock.calls, root)).toEqual([[root], [child]]);
+		console.info("no-adapter detector negative control", JSON.stringify({ owned: 2, foreign: 2,
+			detected: directoryReadsWithin(scan.mock.calls, root).length }));
 	});
 
 	it.each([99, 100, 101, 256, 257])("publishes the newest launch and its terminal after %i earlier terminals", async (count) => {
