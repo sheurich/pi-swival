@@ -154,7 +154,7 @@ describe("discoverSwivalAgents exact catalogue identities", () => {
 		" leading", "trailing ", "alpha  beta", "alpha\tbeta", "alpha\nbeta",
 		"alpha\u0000beta", "alpha\u0007beta", "alpha\u007fbeta", "alpha\u0085beta",
 		"\u001b[31malpha\u001b[0m", "\u001b]0;alpha\u0007", "alpha\u202ebeta", "alpha\u2066beta",
-		"alpha\u00a0beta", "", "   ", "\t\u0007",
+		"alpha\u00a0beta", "\t\u0007",
 	])("rejects a changed or overlong selector and retains its raw identity: %j", (name) => {
 		write(userDir, "identity.md", `name: ${JSON.stringify(name)}\ndescription: helper`);
 		const result = discoverSwivalAgents(root, "user");
@@ -173,12 +173,34 @@ describe("discoverSwivalAgents exact catalogue identities", () => {
 		expect(result.invalidAgentNames).toEqual(["alpha  beta"]);
 	});
 
-	it("blocks the raw whitespace identity of an invalid higher-priority override", () => {
-		write(userDir, "lower.md", 'name: "  "\ndescription: lower');
-		write(projectDir, "higher.md", 'name: "  "\ndescription: []');
+	it.each([
+		["empty", 'name: ""'],
+		["spaces only", 'name: "   "'],
+		["tabs and newlines only", 'name: "\\t\\n"'],
+		["Unicode whitespace only", 'name: "\\u00a0\\u2003"'],
+		["missing", ""],
+		["null", "name: null"],
+		["number", "name: 42"],
+		["boolean", "name: false"],
+		["array", "name: []"],
+		["object", "name: {}"],
+	])("fails closed for an unresolved %s name", (_label, field) => {
+		write(userDir, "identity.md", `${field}\ndescription: PRIVATE_DESCRIPTION`);
+		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
+		const result = discoverSwivalAgents(root, "user");
+		expect(result.dispatchBlocked).toBe(true);
+		expect(result.invalidAgentNames).toEqual([]);
+		expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
+		expect(result.agents.some((a) => a.name === "valid")).toBe(true);
+		expect(JSON.stringify(result.diagnostics)).not.toMatch(/PRIVATE|identity\.md/);
+	});
+
+	it("blocks the raw nonblank whitespace identity of an invalid higher-priority override", () => {
+		write(userDir, "lower.md", 'name: " leading"\ndescription: lower');
+		write(projectDir, "higher.md", 'name: " leading"\ndescription: []');
 		const result = discoverSwivalAgents(root, "both");
-		expect(result.agents.some((a) => a.name === "  ")).toBe(false);
-		expect(result.invalidAgentNames).toEqual(["  "]);
+		expect(result.agents.some((a) => a.name === " leading")).toBe(false);
+		expect(result.invalidAgentNames).toEqual([" leading"]);
 		expect(result.dispatchBlocked).toBe(false);
 	});
 });

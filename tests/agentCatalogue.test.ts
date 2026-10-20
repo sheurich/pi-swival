@@ -50,6 +50,16 @@ afterEach(() => {
 });
 
 describe("swival-subagent action:list", () => {
+	it.each([undefined, ""])("fails closed for an unresolved empty definition with selector %j", async (agent) => {
+		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
+		const listed = await execute({ action: "list" });
+		expect.soft(listed.details.dispatchBlocked).toBe(true);
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		const result = await execute({ task: "synthetic task", ...(agent === undefined ? {} : { agent }) });
+		expect.soft(result.isError).toBe(true);
+		expect(spawn).not.toHaveBeenCalled();
+	});
 	it.each(yamlWarningFixtures)("contains $label without leaking source or launching", async ({ frontmatter }) => {
 		write(userDir, "warning.md", frontmatter);
 		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
@@ -165,7 +175,7 @@ describe("swival-subagent action:list", () => {
 	it.each([
 		"a".repeat(81), `${"a".repeat(79)}😀`, "😀".repeat(41),
 		" leading", "trailing ", "alpha  beta", "alpha\tbeta", "alpha\u0007beta",
-		"\u001b[31malpha\u001b[0m", "   ",
+		"\u001b[31malpha\u001b[0m", "\t\u0007",
 	])("omits invalid selectors without silently renaming them: %j", async (name) => {
 		write(userDir, "valid.md", 'name: "alpha beta"\ndescription: valid sibling');
 		write(projectDir, "invalid.md", `name: ${JSON.stringify(name)}\ndescription: invalid override`);
@@ -271,7 +281,64 @@ const modes = [
 ] as const;
 
 describe("discovery dispatch validation", () => {
-	it.each(["alpha  beta", "   ", "alpha\tbeta", "alpha\u0007beta", "a".repeat(81)])(
+	it.each([undefined, ""])("blocks a whitespace-only definition with selector %j", async (agent) => {
+		write(userDir, "blank.md", 'name: "   "\ndescription: PRIVATE_DESCRIPTION');
+		const listed = await execute({ action: "list" });
+		expect.soft(listed.details).toMatchObject({
+			dispatchBlocked: true, diagnostics: [{ code: "invalid_definition", source: "user" }],
+		});
+		expect(JSON.stringify(listed)).not.toMatch(/PRIVATE|blank\.md/);
+		expect(JSON.stringify(listed)).not.toContain(root);
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		const result = await execute({ task: "task", ...(agent === undefined ? {} : { agent }) });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+	});
+
+	it.each(modes)("blocks an empty definition before any child process in %s", async (_mode, params) => {
+		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
+		write(userDir, "valid.md", "name: valid\ndescription: visible helper");
+		const result = await execute(params);
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+	});
+
+	it("dispatches the default swival agent when the healthy catalogue selector is omitted", async () => {
+		write(userDir, "default.md", "name: swival\ndescription: default helper\nfiles: none\ncommands: none");
+		const launches: string[][] = [];
+		const { preflightSwivalVersion } = await import("../extensions/index.js");
+		await preflightSwivalVersion(async () => "1.0.46");
+		vi.mocked(spawn).mockImplementation(((_exe: string, args: string[], options: any) => {
+			launches.push(args);
+			expect(options).toMatchObject({ cwd: root, shell: false });
+			const proc: any = new EventEmitter();
+			proc.stdout = new PassThrough();
+			proc.stderr = new PassThrough();
+			proc.stdin = new PassThrough();
+			proc.kill = vi.fn();
+			queueMicrotask(() => {
+				fs.writeFileSync(args[args.indexOf("--report") + 1], JSON.stringify({
+					result: { outcome: "success", answer: "DEFAULT_OK", exit_code: 0 },
+				}));
+				proc.stdout.end();
+				proc.stderr.end();
+				proc.emit("close", 0);
+			});
+			return proc;
+		}) as any);
+		const result = await execute({ task: "exercise omitted selector" });
+		expect(result.isError, JSON.stringify(result)).not.toBe(true);
+		expect(result.details.results[0]).toMatchObject({ agent: "swival", finalOutput: "DEFAULT_OK" });
+		expect(launches).toHaveLength(1);
+		expect(launches[0][launches[0].indexOf("--system-prompt") + 1]).toBe("PRIVATE_PROMPT");
+	});
+
+	it.each(["alpha  beta", " leading", "\t\u0007", "alpha\tbeta", "alpha\u0007beta", "a".repeat(81)])(
 		"blocks the exact invalid identity before launch: %j", async (name) => {
 			write(userDir, "lower.md", `name: ${JSON.stringify(name)}\ndescription: lower`);
 			write(projectDir, "higher.md", `name: ${JSON.stringify(name)}\ndescription: []`);

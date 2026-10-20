@@ -261,7 +261,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 			reject("invalid_frontmatter");
 			continue;
 		}
-		const name = typeof fm.name === "string" ? fm.name : undefined;
+		const name = typeof fm.name === "string" && fm.name.trim() ? fm.name : undefined;
 		const description = typeof fm.description === "string" ? fm.description : "";
 		if (!isCatalogueAgentName(name) || !description.trim()) {
 			reject("invalid_definition", name);
