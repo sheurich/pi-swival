@@ -139,7 +139,7 @@ export interface SwivalAgentDiscoveryResult {
 const MAX_DISCOVERY_DIAGNOSTICS = 12;
 
 /** Admit only identities that the bounded catalogue can display verbatim. */
-function isCatalogueAgentName(name: string | undefined): name is string {
+export function isCatalogueAgentName(name: string | undefined): name is string {
 	// ESC is a control character, so rejecting controls also rejects ANSI sequences.
 	return name !== undefined && name.length > 0 && name.length <= 80 &&
 		!/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/.test(name) &&
