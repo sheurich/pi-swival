@@ -238,6 +238,8 @@ def _admit_route(args, profile, routing):
     from litellm.utils import ProviderConfigManager
     # Pinned adapters without a dynamic models handler must not expose a singleton
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
+    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.105.3) return None
+    # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
     adapter = LlmProviders(provider)
     if (ProviderConfigManager.get_provider_model_info(None, adapter) is not None
             or len(set(litellm.models_by_provider.get(provider, []))) == 1):
