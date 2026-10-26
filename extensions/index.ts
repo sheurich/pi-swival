@@ -487,6 +487,72 @@ export function isReexecSandboxRequested(args: readonly string[]): boolean {
 }
 
 /**
+ * Resolve optional child-process environment overrides for a Swival launch.
+ * Bridges Pi's `fastly-arc` API key from `~/.pi/agent/auth.json` into
+ * `OPENAI_API_KEY` when an `arc-*` profile or `arc.fastly.app` base URL is
+ * selected and `OPENAI_API_KEY` is not already set in the environment.
+ * Returns `undefined` when no environment override is needed.
+ */
+export function resolveSwivalChildEnv(
+	args: readonly string[],
+	baseEnv: NodeJS.ProcessEnv = process.env,
+	homeDir: string = os.homedir(),
+	runCwd: string = process.cwd(),
+): NodeJS.ProcessEnv | undefined {
+	if (baseEnv.OPENAI_API_KEY) return undefined;
+	const profile = lastCliOptionValue(args, "--profile");
+	const baseUrl = lastCliOptionValue(args, "--base-url");
+	const reviewer = lastCliOptionValue(args, "--reviewer");
+	const provider = lastCliOptionValue(args, "--provider");
+	if (baseUrl !== undefined && !/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(baseUrl)) {
+		return undefined;
+	}
+	// Fail closed when <base-dir>/swival.toml exists, since Swival merges project
+	// swival.toml with project-wins precedence and could redirect base_url.
+	const configuredBaseDir = lastCliOptionValue(args, "--base-dir") ?? runCwd;
+	const effectiveBaseDir = path.resolve(runCwd, configuredBaseDir);
+	try {
+		fs.lstatSync(path.join(effectiveBaseDir, "swival.toml"));
+		return undefined;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+	}
+	let isArcRoute =
+		(typeof profile === "string" && profile.startsWith("arc-")) ||
+		(typeof baseUrl === "string" && /^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(baseUrl)) ||
+		(typeof reviewer === "string" &&
+			(/(?:^|\s)--profile(?:=|\s+)["']?arc-[A-Za-z0-9_-]*/.test(reviewer) ||
+				/https:\/\/arc\.fastly\.app(?:\/|$)/i.test(reviewer)));
+	if (!isArcRoute && !profile && !provider) {
+		try {
+			const cfgPath = path.join(homeDir, ".config", "swival", "config.toml");
+			const stat = fs.lstatSync(cfgPath);
+			if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 128 * 1024) {
+				const raw = fs.readFileSync(cfgPath, "utf-8");
+				const tableMatch = /(?:^|\n)\s*\[/.exec(raw);
+				const rootPart = tableMatch ? raw.slice(0, tableMatch.index) : raw;
+				if (/^\s*active_profile\s*=\s*["']arc-[A-Za-z0-9_-]+["']/m.test(rootPart)) {
+					isArcRoute = true;
+				}
+			}
+		} catch { /* ignore */ }
+	}
+	if (!isArcRoute) return undefined;
+	try {
+		const authPath = path.join(homeDir, ".pi", "agent", "auth.json");
+		const stat = fs.lstatSync(authPath);
+		if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) return undefined;
+		const parsed = JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<string, unknown>;
+		const arcEntry = parsed?.["fastly-arc"] as Record<string, unknown> | undefined;
+		const key = typeof arcEntry?.key === "string" ? arcEntry.key.trim() : "";
+		if (!key) return undefined;
+		return { ...baseEnv, OPENAI_API_KEY: key };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Enforce bootstrap evidence when consuming a completed async report. The
  * persisted value covers CLI intent; report.sandbox.mode also covers AgentFS
  * selected by Swival configuration and legacy metadata.
@@ -2529,10 +2595,12 @@ export async function runSingleSwivalAsync(
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		throw err;
 	}
+	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
 	let proc: ChildProcess;
 	try {
 		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
 			cwd: runCwd,
+			...(childEnv ? { env: childEnv } : {}),
 			shell: false,
 			stdio: ["ignore", stdoutFd, stderrFd],
 			detached: true,
@@ -2793,10 +2861,12 @@ async function runSingleSwival(
 		args.push("--");
 	}
 
+	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn("swival", args, {
 				cwd: runCwd,
+				...(childEnv ? { env: childEnv } : {}),
 				shell: false,
 				stdio: [isReexec ? "ignore" : "pipe", "pipe", "pipe"],
 			});

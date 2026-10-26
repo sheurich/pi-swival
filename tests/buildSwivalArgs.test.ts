@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -636,5 +639,92 @@ describe("buildSwivalArgs", () => {
 		const args = buildSwivalArgs(makeAgent({ a2aConfig: "a2a.toml" }), "/tmp/r.json", "/repo");
 		expect(args).not.toContain("--network");
 		expect(args).toContain("--a2a-config");
+	});
+});
+
+describe("resolveSwivalChildEnv", () => {
+	it("bridges fastly-arc key from auth.json into OPENAI_API_KEY for arc-* profiles, base-url, reviewer, and active_profile", () => {
+		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
+		try {
+			const agentDir = path.join(tmpHome, ".pi", "agent");
+			const cfgDir = path.join(tmpHome, ".config", "swival");
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.mkdirSync(cfgDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(agentDir, "auth.json"),
+				JSON.stringify({ "fastly-arc": { type: "api_key", key: "synthetic-arc-token" } }),
+			);
+			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
+				PATH: "/usr/bin",
+				OPENAI_API_KEY: "synthetic-arc-token",
+			});
+			expect(
+				resolveSwivalChildEnv(["--base-url", "https://arc.fastly.app/v1", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome),
+			).toEqual({
+				PATH: "/usr/bin",
+				OPENAI_API_KEY: "synthetic-arc-token",
+			});
+			expect(
+				resolveSwivalChildEnv(
+					["--reviewer", "swival --profile arc-glm-cyber --reviewer-mode", "--"],
+					{ PATH: "/usr/bin" },
+					tmpHome,
+					tmpHome,
+				),
+			).toEqual({
+				PATH: "/usr/bin",
+				OPENAI_API_KEY: "synthetic-arc-token",
+			});
+			fs.writeFileSync(path.join(cfgDir, "config.toml"), 'active_profile = "arc-glm-cyber"\n[profiles.arc-glm-cyber]\nprovider = "generic"\n');
+			expect(resolveSwivalChildEnv(["--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
+				PATH: "/usr/bin",
+				OPENAI_API_KEY: "synthetic-arc-token",
+			});
+		} finally {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed on non-arc routes, existing OPENAI_API_KEY, non-arc base-url, project swival.toml, or symlinked auth.json", () => {
+		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
+		try {
+			const agentDir = path.join(tmpHome, ".pi", "agent");
+			const cfgDir = path.join(tmpHome, ".config", "swival");
+			const repoDir = path.join(tmpHome, "repo");
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.mkdirSync(cfgDir, { recursive: true });
+			fs.mkdirSync(repoDir, { recursive: true });
+			const authFile = path.join(agentDir, "auth.json");
+			fs.writeFileSync(
+				authFile,
+				JSON.stringify({ "fastly-arc": { type: "api_key", key: "synthetic-arc-token" } }),
+			);
+			expect(resolveSwivalChildEnv(["--profile", "vertex-gemini-flash", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(
+				resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], { OPENAI_API_KEY: "existing" }, tmpHome, repoDir),
+			).toBeUndefined();
+			expect(
+				resolveSwivalChildEnv(
+					["--profile", "arc-glm-cyber", "--base-url", "https://attacker.example/v1", "--"],
+					{},
+					tmpHome,
+					repoDir,
+				),
+			).toBeUndefined();
+			// First-line table header must not match active_profile as root
+			fs.writeFileSync(path.join(cfgDir, "config.toml"), '[profiles.other]\nactive_profile = "arc-glm-cyber"\n');
+			expect(resolveSwivalChildEnv(["--"], {}, tmpHome, repoDir)).toBeUndefined();
+			// Project swival.toml in base-dir fails closed
+			fs.writeFileSync(path.join(repoDir, "swival.toml"), 'base_url = "https://attacker.example/v1"\n');
+			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			fs.unlinkSync(path.join(repoDir, "swival.toml"));
+			// Symlinked auth.json fails closed
+			const targetAuth = path.join(tmpHome, "real-auth.json");
+			fs.renameSync(authFile, targetAuth);
+			fs.symlinkSync(targetAuth, authFile);
+			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+		} finally {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		}
 	});
 });

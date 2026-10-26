@@ -402,7 +402,7 @@ AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on t
 
 ## Native source-only audit
 
-Use the explicit `audit` API from Pi's configured Git repository root. Read `auditing-with-swival` for scope, routing, and completion rules. It invokes the upstream AgentFS CLI on an independent committed snapshot. Required versions are Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, and AgentFS 0.6.4, with upstream's nono profile installed. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified.
+Use the explicit `audit` API from Pi's configured Git repository root. Read `auditing-with-swival` for scope, routing, and completion rules. It invokes the upstream AgentFS CLI on an independent committed snapshot. Required versions are Swival 1.0.48, LiteLLM 1.105.3, Python 3.13+, and AgentFS 0.6.4, with upstream's nono profile installed. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified.
 
 ```json
 {"audit":{"all":true}}
@@ -416,7 +416,7 @@ Consult installation guidance before execution. With no specialist selected, nat
 
 The name is illustrative, not bundled. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not infer specialization from vendor/model names or send source to probe access. Inherit effort unless an override is explicitly authorized.
 
-Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Swival 1.0.48 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
 Native support requires Swival-supported routes meeting the pinned policy contract. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint with its own key and context limit. Dynamic model-list adapters are refused because upstream can replace a model after NotFound. Other routes fail for concrete missing capabilities or credential authority, not unfamiliar vendors. Ordinary delegation retains its existing providers and behavior.
 
