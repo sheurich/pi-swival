@@ -32,7 +32,7 @@ it("refuses spawn when aborted inside the last asynchronous runtime-path check",
 	const home = path.join(root, "home"); fs.mkdirSync(home);
 	const runtime = { ...captureNativeRuntime(), python, cli, agentfs, nono, environment: { HOME: home },
 		searchPath: ["/usr/bin", "/bin"].join(path.delimiter) };
-	const route = { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: "openrouter",
+	const route = { version: 2, runtime: { swival: "1.0.48", litellm: "1.105.3" }, provider: "openrouter",
 		model: "example/concrete", endpoint: null, profile: null, reasoningEffort: null, options: {},
 		selection: { profileSource: null, explicitFields: [] }, reportIdentity: { provider: "openrouter", model: "example/concrete" },
 		scope: { mandatory_files: ["code.py"] } };

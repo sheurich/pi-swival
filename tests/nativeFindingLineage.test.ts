@@ -26,7 +26,7 @@ function lineage(scenario: string, artifactPairMode?: ArtifactPairMode, patchCon
 	const expectedDecisions: Record<string, string[]> = { keep: ["keep"], rewrite: ["keep_with_changes"], drop: ["drop"],
 		mixed: ["keep_with_changes", "drop"], "projection-collision": ["keep_with_changes", "drop"] };
 	if (scenario in expectedDecisions) {
-		expect(generated.producer).toEqual({ package: "swival", version: "1.0.46",
+		expect(generated.producer).toEqual({ package: "swival", version: "1.0.48",
 			audit_sha256: "be7f711d303c8929a1ed388e80c569b0e851587c72f0154d24e7e3a8546f4902",
 			lineage_function: "swival.audit._phase45_adjudicate",
 			persistence_function: "swival.audit.AuditRunState.save",
@@ -130,7 +130,7 @@ describe("released Swival finding lineage", () => {
 				timeout: 10_000, maxBuffer: 1024 * 1024, shell: false,
 				env: { HOME: root, PATH: process.env.PATH, TMPDIR: root, LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
 			}).toString());
-		expect(generated.producer).toEqual({ version: "1.0.46",
+		expect(generated.producer).toEqual({ version: "1.0.48",
 			audit_sha256: "be7f711d303c8929a1ed388e80c569b0e851587c72f0154d24e7e3a8546f4902" });
 		expect(generated.triage).toMatchObject({ priority: "SKIP", confidence: "high", triage_failure_mode: null });
 		expect(generated.transport_calls).toBe(2);

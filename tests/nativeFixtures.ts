@@ -29,7 +29,7 @@ export function fixtureRepository(root: string): string {
 }
 export function completeNativeFixture(root: string, stateOverride: Record<string, unknown> = {}) {
 	const scope = { branch: "main", commit: "1".repeat(40), tracked_files: ["code.py"], mandatory_files: ["code.py"], focus: [] };
-	const route = { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: "chatgpt", model: "gpt-offline", options: {}, reasoningEffort: null,
+	const route = { version: 2, runtime: { swival: "1.0.48", litellm: "1.105.3" }, provider: "chatgpt", model: "gpt-offline", options: {}, reasoningEffort: null,
 		endpoint: null, profile: null, selection: { profileSource: null, explicitFields: [] }, reportIdentity: { provider: "chatgpt", model: "gpt-offline" } };
 	const state = { scope, reviewed_files: ["code.py"], candidate_files: ["code.py"], deep_reviewed_files: ["code.py"],
 		phase: "done", truncated_files: {}, metrics: {}, artifact_state: {}, proposed_findings: [], verification_state: {}, verified_findings: [], ...stateOverride };

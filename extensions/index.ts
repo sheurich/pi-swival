@@ -486,6 +486,231 @@ export function isReexecSandboxRequested(args: readonly string[]): boolean {
 	return mode !== "builtin";
 }
 
+function readSafeRegularText(
+	filePath: string,
+	maxBytes: number,
+	requirePrivatePerms: boolean,
+): string | undefined {
+	if (typeof fs.constants.O_NOFOLLOW !== "number") return undefined;
+	let fd: number | undefined;
+	try {
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+		fd = fs.openSync(filePath, flags);
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.nlink !== 1 || stat.size <= 0 || stat.size > maxBytes) {
+			return undefined;
+		}
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+			return undefined;
+		}
+		if (requirePrivatePerms && (stat.mode & 0o022) !== 0) {
+			return undefined;
+		}
+		const buf = Buffer.alloc(stat.size);
+		const bytesRead = fs.readSync(fd, buf, 0, stat.size, 0);
+		return buf.toString("utf-8", 0, bytesRead);
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try { fs.closeSync(fd); } catch { /* ignore */ }
+		}
+	}
+}
+
+function parseUniqueTomlString(sectionText: string, key: string): string | null | undefined {
+	if (/^\s*["']/m.test(sectionText)) return null;
+	const anyKeyRe = new RegExp(`^\\s*${key}\\s*=`, "gm");
+	const matches = sectionText.match(anyKeyRe);
+	if (!matches || matches.length === 0) return undefined;
+	if (matches.length > 1) return null;
+	const strictRe = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"\\\\]*)"|'([^']*)')\\s*(?:#.*)?$`, "m");
+	const m = strictRe.exec(sectionText);
+	if (!m) return null;
+	return m[1] ?? m[2];
+}
+
+function extractTomlProfileSection(raw: string, profileName: string): string | undefined {
+	if (!/^[A-Za-z0-9_-]+$/.test(profileName)) return undefined;
+	const escaped = profileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const anyHeaderRe = new RegExp(`(?:^|\\n)\\s*\\[profiles\\.(?:${escaped}|"${escaped}"|'${escaped}')\\]\\s*(?:#.*)?(?:\\n|$)`, "g");
+	const first = anyHeaderRe.exec(raw);
+	if (!first || anyHeaderRe.exec(raw) !== null) return undefined;
+	const strictHeaderRe = new RegExp(`(?:^|\\n)\\s*\\[profiles\\.${escaped}\\]\\s*(?:#.*)?(?:\\n|$)`);
+	if (!strictHeaderRe.test(first[0])) return undefined;
+	const start = first.index + first[0].length;
+	const rest = raw.slice(start);
+	const nextHeader = /(?:^|\n)\s*\[/.exec(rest);
+	return nextHeader ? rest.slice(0, nextHeader.index) : rest;
+}
+
+const VALUE_CLI_OPTIONS = new Set([
+	"--model",
+	"--profile",
+	"--provider",
+	"--base-url",
+	"--reviewer",
+	"--review-prompt",
+	"--verify",
+	"--max-review-rounds",
+	"--temperature",
+	"--top-p",
+	"--seed",
+	"--reasoning-effort",
+	"--max-output-tokens",
+	"--max-turns",
+	"--cache-dir",
+	"--trace-dir",
+	"--network",
+	"--command-middleware",
+	"--max-output-kb",
+	"--max-output-lines",
+	"--skills-dir",
+	"--a2a-config",
+	"--provider-timeout",
+	"--initial-tool-choice",
+	"--base-dir",
+	"--add-dir",
+	"--add-dir-ro",
+	"--report",
+	"--system-prompt",
+	"--sandbox",
+	"--sandbox-session",
+	"--files",
+	"--commands",
+]);
+
+function parseSwivalOptionMap(args: readonly string[]): Map<string, string> | undefined {
+	const map = new Map<string, string>();
+	for (let i = 0; i < args.length; i++) {
+		const token = args[i];
+		if (token === "--") break;
+		if (!token.startsWith("-")) continue;
+		const eqIdx = token.indexOf("=");
+		if (eqIdx !== -1) {
+			map.set(token.slice(0, eqIdx), token.slice(eqIdx + 1));
+			continue;
+		}
+		if (VALUE_CLI_OPTIONS.has(token)) {
+			const next = args[i + 1];
+			if (next === undefined || next === "--") return undefined;
+			map.set(token, next);
+			i++;
+		}
+	}
+	return map;
+}
+
+/**
+ * Resolve optional child-process environment overrides for a Swival launch.
+ * Bridges Pi's `fastly-arc` API key from `~/.pi/agent/auth.json` into
+ * `OPENAI_API_KEY` when the effective Swival route resolves to
+ * `provider = "generic"` and `base_url = "https://arc.fastly.app..."`, no
+ * external `--reviewer` subprocess is configured, and `OPENAI_API_KEY` is not
+ * already set in the environment.
+ * Returns `undefined` when no environment override is needed.
+ */
+export function resolveSwivalChildEnv(
+	args: readonly string[],
+	baseEnv: NodeJS.ProcessEnv = process.env,
+	homeDir: string = os.homedir(),
+	runCwd: string = process.cwd(),
+): NodeJS.ProcessEnv | undefined {
+	if (baseEnv.OPENAI_API_KEY) return undefined;
+	const optionMap = parseSwivalOptionMap(args);
+	if (!optionMap) return undefined;
+	// Fail closed when an external --reviewer subprocess is configured, since
+	// Swival passes child_env() (including OPENAI_API_KEY) to reviewer processes.
+	if (optionMap.has("--reviewer")) return undefined;
+
+	const cliProfile = optionMap.get("--profile");
+	const cliBaseUrl = optionMap.get("--base-url");
+	const cliProvider = optionMap.get("--provider");
+	if (cliProvider !== undefined && cliProvider !== "generic") {
+		return undefined;
+	}
+	if (cliBaseUrl !== undefined && !/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(cliBaseUrl)) {
+		return undefined;
+	}
+	// Fail closed when <base-dir>/swival.toml exists, since Swival merges project
+	// swival.toml with project-wins precedence and could redirect base_url.
+	const configuredBaseDir = optionMap.get("--base-dir") ?? runCwd;
+	const effectiveBaseDir = path.resolve(runCwd, configuredBaseDir);
+	try {
+		fs.lstatSync(path.join(effectiveBaseDir, "swival.toml"));
+		return undefined;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+	}
+
+	let cfgProvider: string | undefined;
+	let cfgBaseUrl: string | undefined;
+	const configRoot = baseEnv.XDG_CONFIG_HOME || path.join(homeDir, ".config");
+	if (!path.isAbsolute(configRoot)) return undefined;
+	const cfgPath = path.join(configRoot, "swival", "config.toml");
+	let cfgExists = false;
+	try {
+		fs.lstatSync(cfgPath);
+		cfgExists = true;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+	}
+	const cfgRaw = cfgExists ? readSafeRegularText(cfgPath, 128 * 1024, false) : undefined;
+	if (cfgExists && cfgRaw === undefined) return undefined;
+	if (cfgRaw !== undefined) {
+		const tableMatch = /(?:^|\n)\s*\[/.exec(cfgRaw);
+		const rootPart = tableMatch ? cfgRaw.slice(0, tableMatch.index) : cfgRaw;
+		const rootReviewer = parseUniqueTomlString(rootPart, "reviewer");
+		if (rootReviewer !== undefined) return undefined;
+		const rootActiveProfile = parseUniqueTomlString(rootPart, "active_profile");
+		const rootProvider = parseUniqueTomlString(rootPart, "provider");
+		const rootBaseUrl = parseUniqueTomlString(rootPart, "base_url");
+		if (rootActiveProfile === null || rootProvider === null || rootBaseUrl === null) {
+			return undefined;
+		}
+		const selectedProfile = cliProfile ?? rootActiveProfile;
+		if (selectedProfile) {
+			const profileSection = extractTomlProfileSection(cfgRaw, selectedProfile);
+			if (!profileSection) return undefined;
+			const profProvider = parseUniqueTomlString(profileSection, "provider");
+			const profBaseUrl = parseUniqueTomlString(profileSection, "base_url");
+			if (profProvider === null || profBaseUrl === null) return undefined;
+			// Require explicit provider and base_url in the selected profile section
+			// rather than falling back to root values.
+			cfgProvider = profProvider;
+			cfgBaseUrl = profBaseUrl;
+		} else {
+			cfgProvider = rootProvider;
+			cfgBaseUrl = rootBaseUrl;
+		}
+	} else if (cliProfile !== undefined) {
+		return undefined;
+	}
+
+	const effectiveProvider = cliProvider ?? cfgProvider;
+	const effectiveBaseUrl = cliBaseUrl ?? cfgBaseUrl;
+	if (
+		effectiveProvider !== "generic" ||
+		typeof effectiveBaseUrl !== "string" ||
+		!/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(effectiveBaseUrl)
+	) {
+		return undefined;
+	}
+
+	const authRaw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "auth.json"), 65536, true);
+	if (authRaw === undefined) return undefined;
+	try {
+		const parsed = JSON.parse(authRaw) as Record<string, unknown>;
+		const arcEntry = parsed?.["fastly-arc"] as Record<string, unknown> | undefined;
+		if (arcEntry?.type !== undefined && arcEntry.type !== "api_key") return undefined;
+		const key = typeof arcEntry?.key === "string" ? arcEntry.key.trim() : "";
+		if (!key) return undefined;
+		return { ...baseEnv, OPENAI_API_KEY: key };
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Enforce bootstrap evidence when consuming a completed async report. The
  * persisted value covers CLI intent; report.sandbox.mode also covers AgentFS
@@ -2529,10 +2754,12 @@ export async function runSingleSwivalAsync(
 		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
 		throw err;
 	}
+	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
 	let proc: ChildProcess;
 	try {
 		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
 			cwd: runCwd,
+			...(childEnv ? { env: childEnv } : {}),
 			shell: false,
 			stdio: ["ignore", stdoutFd, stderrFd],
 			detached: true,
@@ -2793,10 +3020,12 @@ async function runSingleSwival(
 		args.push("--");
 	}
 
+	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn("swival", args, {
 				cwd: runCwd,
+				...(childEnv ? { env: childEnv } : {}),
 				shell: false,
 				stdio: [isReexec ? "ignore" : "pipe", "pipe", "pipe"],
 			});

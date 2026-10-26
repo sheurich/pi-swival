@@ -36,7 +36,7 @@ class NativeAuditError(Exception):
         return result
 
 
-RUNTIME_VERSIONS = {"swival": "1.0.46", "litellm": "1.103.4"}
+RUNTIME_VERSIONS = {"swival": "1.0.48", "litellm": "1.105.3"}
 OVERRIDE_KEYS = {
     "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
@@ -236,11 +236,13 @@ def _admit_route(args, profile, routing):
     import litellm
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
-    # Pinned adapters without a dynamic models handler must keep a multi-model
+    # Pinned adapters without a dynamic models handler must not expose a singleton
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
+    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.105.3) return None
+    # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
     adapter = LlmProviders(provider)
     if (ProviderConfigManager.get_provider_model_info(None, adapter) is not None
-            or len(set(litellm.models_by_provider.get(provider, []))) < 2):
+            or len(set(litellm.models_by_provider.get(provider, []))) == 1):
         raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
     return {"version": 2, "runtime": RUNTIME_VERSIONS, "provider": provider, "model": model,
             "reasoningEffort": args.reasoning_effort, "options": options, "profile": profile,

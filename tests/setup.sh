@@ -59,5 +59,5 @@ if [[ ! -d .venv ]]; then
 fi
 uv --no-config pip sync --python .venv/bin/python --only-binary :all: \
 	--require-hashes requirements.txt
-.venv/bin/python -c 'import sys, importlib.metadata; assert sys.version_info[:2] == (3, 13); assert importlib.metadata.version("swival") == "1.0.46"'
+.venv/bin/python -c 'import sys, importlib.metadata; assert sys.version_info[:2] == (3, 13); assert importlib.metadata.version("swival") == "1.0.48"'
 echo "Test dependencies, selected Pi peers, and pinned Swival are ready. Run: npm run ci"

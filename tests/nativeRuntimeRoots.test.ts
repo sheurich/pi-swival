@@ -161,7 +161,7 @@ describe("native runtime configuration roots", () => {
 			const safe = path.join(f.root, "trusted-runtime"); fs.mkdirSync(safe); fs.symlinkSync(safe, selected);
 			const original = vi.mocked(execFile).getMockImplementation()!;
 			const probes: string[] = [];
-			const route = { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: "openrouter",
+			const route = { version: 2, runtime: { swival: "1.0.48", litellm: "1.105.3" }, provider: "openrouter",
 				model: "example/concrete", endpoint: null, profile: null, reasoningEffort: null, options: {},
 				selection: { profileSource: null, explicitFields: [] }, reportIdentity: { provider: "openrouter", model: "example/concrete" } };
 			vi.mocked(execFile).mockImplementation(((exe: string, args: string[], options: any, callback: any) => {

@@ -178,7 +178,7 @@ describe("native audit documentation and migration", () => {
 		"%s distinguishes inherited same-route policy-error retries from terminal failure", (file) => {
 			const doc = read(join(PACKAGE_ROOT, file));
 			for (const required of [
-				"Swival 1.0.46 can retry the same request on the same provider, model, and endpoint",
+				"Swival 1.0.48 can retry the same request on the same provider, model, and endpoint",
 				"including recognized policy errors", "A later attempt can succeed.",
 				"does not guarantee all-phase fail-fast or uniform retry-budget propagation",
 				"Never substitute a route or rewrite a refused request",
@@ -216,7 +216,7 @@ describe("native audit documentation and migration", () => {
 		});
 	it.each(["README.md", "examples/demo.md", "skills/swival/references/setup.md"])("%s names tested native versions", (file) => {
 		const doc = read(join(PACKAGE_ROOT, file));
-		for (const version of ["1.0.46", "1.103.4", "0.6.4"]) expect(doc).toContain(version);
+		for (const version of ["1.0.48", "1.105.3", "0.6.4"]) expect(doc).toContain(version);
 		expect(doc).toMatch(/macOS/); expect(doc).toMatch(/unverified|not validated/);
 	});
 	it("documents scope, tool permissions, completion evidence, and manual patch review", () => {

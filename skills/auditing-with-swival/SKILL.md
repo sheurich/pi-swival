@@ -12,7 +12,7 @@ Use the structured `audit` API from Pi at the target Git repository root. The ad
 - Confirm scope and the operator's provider and data boundaries before sending source to a provider.
 - Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
 - With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
-- Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
+- Require Swival 1.0.48, LiteLLM 1.105.3, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
 - Configuration inspection does not prove account access. Do not send repository content to probe specialist access. There is no fallback to another model, provider, endpoint, account, profile, or sandbox.
 
 ## Dispatch
@@ -31,7 +31,7 @@ Select an existing operator-configured specialist profile when installation poli
 
 `security-specialist` is illustrative, not bundled or reserved. Explicit profile selection outranks `active_profile`. Authorized explicit field overrides outrank profile values. Do not add provider/model/effort overrides automatically; inherit selected settings. Reject conflicts with installation policy before execution. Ordinary inherited effort is best-effort; auxiliary phases can omit it.
 
-Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Swival 1.0.48 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
 ## Route capabilities
 

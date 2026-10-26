@@ -1,6 +1,6 @@
 # AgentFS sandbox
 
-[AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.0.46 invokes it with `--no-default-allows --allow <base-dir>`. That absolute base directory has write-through access to the host. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
+[AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.0.48 invokes it with `--no-default-allows --allow <base-dir>`. That absolute base directory has write-through access to the host. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
 
 For native audit, the adapter launches upstream AgentFS directly with `--no-default-allows` and a disposable committed snapshot grant. ChatGPT alone also receives a dedicated auth-store directory grant inside HOME. API-key/local routes receive no ChatGPT directory grant. Auth cannot overlap source, artifacts, or prospective AgentFS/service state, including all of HOME's `.agentfs`. These explicit grants are not the entire upstream write policy. The auth directory never enters Swival `--add-dir` or model-tool roots. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap. Original source and Git metadata stay outside the writable scope. After verified shutdown, the adapter reads bounded artifacts from the snapshot. It does not export from guessed delta paths or automatically apply patches.
 
@@ -52,7 +52,7 @@ Do not delete session data or signal recorded PIDs while a process may still use
 
 ## Strict-read isolation
 
-`--sandbox-strict-read` is unsupported and refused by Swival 1.0.46 with AgentFS 0.6.4. No released AgentFS version in the tested contract supplies this feature. Do not describe it as an effective read boundary.
+`--sandbox-strict-read` is unsupported and refused by Swival 1.0.48 with AgentFS 0.6.4. No released AgentFS version in the tested contract supplies this feature. Do not describe it as an effective read boundary.
 
 ## Native validation
 

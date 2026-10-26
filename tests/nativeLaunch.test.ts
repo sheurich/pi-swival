@@ -59,13 +59,13 @@ describe("native CLI launch contract", () => {
 			expect(() => parse(output, false)).toThrow(/preflight|configuration/i);
 			try { parse(output, false); } catch (error) { expect(String(error)).not.toContain("synthetic-secret"); }
 		}
-		const route = { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: "openrouter", model: "example/concrete",
+		const route = { version: 2, runtime: { swival: "1.0.48", litellm: "1.105.3" }, provider: "openrouter", model: "example/concrete",
 			endpoint: null, profile: null, reasoningEffort: null, options: {}, selection: { profileSource: null, explicitFields: [] },
 			reportIdentity: { provider: "openrouter", model: "example/concrete" } };
 		expect(parse(JSON.stringify(route), true).route).toEqual(route);
 		for (const mutation of [{ version: 1 }, { endpoint: "http://user:synthetic-secret@offline.invalid" },
 			{ provider: "synthetic\nsecret" }, { options: { api_key: "synthetic-secret" } },
-			{ runtime: { swival: "unproved", litellm: "1.103.4" } }, { selection: { profileSource: "explicit", explicitFields: [] } },
+			{ runtime: { swival: "unproved", litellm: "1.105.3" } }, { selection: { profileSource: "explicit", explicitFields: [] } },
 			{ reportIdentity: { provider: "openrouter", model: "replacement" } },
 			{ selection: { profileSource: null, explicitFields: ["baseUrl"] } }]) {
 			expect(() => parse(JSON.stringify({ ...route, ...mutation }), true)).toThrow(/preflight/i);
