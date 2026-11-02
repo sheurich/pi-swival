@@ -32,10 +32,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { StringEnum as PiStringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type TUnsafe, Type } from "typebox";
 import { captureNativeRuntime, inspectNativeAudit, prepareNativeAudit, validateNativeAuditParams, parseNativeRoute,
 	type NativeAuditResult, type NativeAuditLaunch } from "./native-audit.js";
 import {
@@ -61,6 +61,13 @@ import {
 	type AsyncOwner,
 	type AsyncRunObservation,
 } from "./async-observation.js";
+
+function StringEnum<T extends readonly string[]>(
+	values: T,
+	options?: { description?: string; default?: T[number] },
+): TUnsafe<T[number]> {
+	return PiStringEnum(values, options) as unknown as TUnsafe<T[number]>;
+}
 
 // Maximum array size of tasks[] and chain[] params.
 const MAX_PARALLEL_TASKS = 8;
@@ -882,6 +889,7 @@ export interface SwivalOverrides {
 	a2aConfig?: string;
 	providerTimeout?: number;
 	initialToolChoice?: "auto" | "required";
+	installedSwivalVersion?: string;
 }
 
 export function buildSwivalArgs(
@@ -912,6 +920,10 @@ export function buildSwivalArgs(
 		throw new SwivalArgumentError(`Project-scope agent "${agent.name}" cannot enable A2A.`);
 	}
 	if (agent.noA2a !== false && !effectiveA2a) args.push("--no-a2a");
+	const supportsWebSearchFlag =
+		overrides.installedSwivalVersion === undefined ||
+		compareSemver(overrides.installedSwivalVersion, "1.9.0") >= 0;
+	if (agent.noWebSearch !== false && supportsWebSearchFlag) args.push("--no-web-search");
 	if (agent.noHistory !== false) args.push("--no-history");
 	if (agent.noContinue !== false) args.push("--no-continue");
 	if (agent.noMemory !== false) args.push("--no-memory");
@@ -1783,7 +1795,7 @@ export interface SwivalVersionCheck {
 	errorMessage?: string;
 }
 
-export const RECOMMENDED_SWIVAL_VERSION = "1.0.45";
+export const RECOMMENDED_SWIVAL_VERSION = "1.9.1";
 export const MIN_COMPATIBLE_SWIVAL_VERSION = "1.0.44";
 
 export function parseSemver(v: string): [number, number, number] | null {
@@ -2729,7 +2741,11 @@ export async function runSingleSwivalAsync(
 	const reportPath = path.join(artifactDir, "report.json");
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
-	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir };
+	const effectiveOverrides: SwivalOverrides = {
+		...overrides,
+		traceDir,
+		installedSwivalVersion: overrides.installedSwivalVersion ?? versionCheck.installedVersion,
+	};
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
 	const nonoRequested = isNonoRequested(args);
@@ -3002,7 +3018,11 @@ async function runSingleSwival(
 	const started = Date.now();
 	// Attach our internal trace-dir override only if the caller hasn't already
 	// requested one (overrides.traceDir outranks us; mostly useful for tests).
-	const effectiveOverrides: SwivalOverrides = { ...overrides, traceDir: overrides.traceDir ?? traceDir };
+	const effectiveOverrides: SwivalOverrides = {
+		...overrides,
+		traceDir: overrides.traceDir ?? traceDir,
+		installedSwivalVersion: overrides.installedSwivalVersion ?? versionCheck.installedVersion,
+	};
 	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
 	const agentFsRequested = isAgentFsRequested(args);
 	const nonoRequested = isNonoRequested(args);

@@ -142,6 +142,7 @@ describe("native preflight protection requirements (no worker, no provider)", {
 		["global", 'encrypt_secrets_key = "synthetic-never-log-this"'],
 		["project", 'unrecognized_shield = true'], ["global", 'nono_audit_integrity = true'],
 		["global", 'nono_rollback = true'], ["project", 'lifecycle_fail_closed = true'], ["global", '[profiles.protected]\nprovider="chatgpt"\nllm_filter="required"'],
+		["global", 'web_search = true'], ["project", 'web_search_providers = ["parallel"]'],
 		...["global", "project"].map((where) => [where, 'sandbox_session="required"']),
 	])("rejects protected or unknown %s configuration before native launch", async (where, config) => {
 		const dir = repository();

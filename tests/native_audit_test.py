@@ -94,6 +94,7 @@ class NativeEntryTests(unittest.TestCase):
             "--oneshot-commands", "--no-sandbox-auto-session", "--no-instructions",
             "--no-skills", "--no-metaskills", "--no-mcp", "--no-a2a", "--no-subagents",
             "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+            "--no-web-search", "--no-model-routing", "--no-decisions",
             *[item for key, value in self.routing.items() for item in
               ["--" + bridge.OVERRIDE_KEYS.get(key, key).replace("_", "-"), str(value)]],
             "--report", str(self.repo / "native-cli-report.json"), "--", command,
@@ -223,7 +224,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_configured_defaults_and_specialist_precedence(self):
         self.write_config('provider="openrouter"\nmodel="example/default"\n'
-            'active_profile="ordinary"\nmax_context_tokens=128000\n'
+            'active_profile="ordinary"\nmax_context_tokens=128000\nweb_search=false\n'
             '[profiles.ordinary]\nprovider="chatgpt"\nmodel="chatgpt/gpt-active"\n'
             '[profiles.specialist]\nprovider="openrouter"\nmodel="example/specialist"\n'
             'reasoning_effort="high"\n')
@@ -294,6 +295,14 @@ class NativeEntryTests(unittest.TestCase):
             ('provider="openrouter"\nmodel="openrouter/auto"', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
             ('provider="openrouter"\nmodel="openrouter/openrouter/auto:floor"',
                 {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\nmodel_routing=true', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\nrouting_profiles=["test"]\n[profiles.test]\n' + chatgpt,
+                {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_model="typesafe/jev-latest"', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_base_url="http://127.0.0.1:8000/v1"',
+                {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_api_key="synthetic-secret"',
+                {}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
             ('api_key="synthetic-secret"\n[profiles.test]\nprovider="openrouter"\nmodel="concrete"',
                 {"profile": "test"}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
             ('base_url="https://offline.invalid/v1"\n[profiles.test]\n' + chatgpt,
@@ -314,7 +323,8 @@ class NativeEntryTests(unittest.TestCase):
                 bridge.resolve_native_config(self.request())
 
     def test_nonpropagated_policy_fields_are_value_free(self):
-        for key, value in {"encrypt_secrets": "true", "llm_filter": '"synthetic-secret"',
+        for key, value in {"encrypt_secrets": "true", "web_search": "true",
+            "llm_filter": '"synthetic-secret"',
             "secret_shield": "true", "extra_body": '{ routing="synthetic-secret" }',
             "prompt_cache": "false", "sanitize_thinking": "true", "show_thinking": "true",
             "sandbox_strict_read": "true", "sandbox_session": '"synthetic-secret"',
@@ -560,7 +570,7 @@ class NativeEntryTests(unittest.TestCase):
             return httpx.Response(200, json=response)
         client = httpx.Client(transport=httpx.MockTransport(handler))
         self.addCleanup(client.close)
-        self.enterContext(patch.object(authenticator, "_get_httpx_client", return_value=client))
+        self.enterContext(patch.object(authenticator, "get_httpx_client", return_value=client))
         self.enterContext(patch.object(authenticator.time, "time", return_value=100))
         auth = authenticator.Authenticator()
         return auth, calls
@@ -593,7 +603,7 @@ class NativeEntryTests(unittest.TestCase):
         with self.assertRaises(authenticator.GetDeviceCodeError):
             auth.get_access_token()
         self.assertFalse(Path(auth.auth_file).exists())
-        with patch.object(authenticator, "_get_httpx_client", side_effect=KeyboardInterrupt):
+        with patch.object(authenticator, "get_httpx_client", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 auth.get_access_token()
 

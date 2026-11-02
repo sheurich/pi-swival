@@ -17,11 +17,12 @@ function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfi
 }
 
 describe("buildSwivalArgs", () => {
-	it("always disables lifecycle / MCP / A2A / history / continue / memory / subagents by default", () => {
+	it("always disables lifecycle / MCP / A2A / web-search / history / continue / memory / subagents by default", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
 		expect(args).toContain("--no-lifecycle");
 		expect(args).toContain("--no-mcp");
 		expect(args).toContain("--no-a2a");
+		expect(args).toContain("--no-web-search");
 		expect(args).toContain("--no-history");
 		expect(args).toContain("--no-continue");
 		expect(args).toContain("--no-memory");
@@ -37,15 +38,23 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("--no-subagents");
 	});
 
-	it("respects explicit noLifecycle=false / noMcp=false / noA2a=false", () => {
+	it("respects explicit noLifecycle=false / noMcp=false / noA2a=false / noWebSearch=false", () => {
 		const args = buildSwivalArgs(
-			makeAgent({ noLifecycle: false, noMcp: false, noA2a: false }),
+			makeAgent({ noLifecycle: false, noMcp: false, noA2a: false, noWebSearch: false }),
 			"/tmp/r.json",
 			"/cwd",
 		);
 		expect(args).not.toContain("--no-lifecycle");
 		expect(args).not.toContain("--no-mcp");
 		expect(args).not.toContain("--no-a2a");
+		expect(args).not.toContain("--no-web-search");
+	});
+
+	it("omits --no-web-search when installedSwivalVersion is older than 1.9.0", () => {
+		const pre19Args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { installedSwivalVersion: "1.0.48" });
+		expect(pre19Args).not.toContain("--no-web-search");
+		const v19Args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { installedSwivalVersion: "1.9.0" });
+		expect(v19Args).toContain("--no-web-search");
 	});
 
 	it("omits --no-history / --no-continue / --no-memory when agent opts out", () => {
