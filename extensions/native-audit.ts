@@ -20,13 +20,16 @@ const NATIVE_FIELDS = new Set([
 	"audit", "async", "timeoutMs", "maxInlineBytes", "profileOverride", "modelOverride",
 	"providerOverride", "reasoningEffortOverride", "temperatureOverride",
 	"topPOverride", "seedOverride", "maxTurnsOverride", "maxOutputTokensOverride",
-	"providerTimeoutOverride",
+	"providerTimeoutOverride", "encryptSecretsOverride",
 ]);
 
 export function validateNativeAuditParams(params: Record<string, unknown>): NativeAuditOptions {
 	if (params.async === true) throw new Error("Native async is unsupported; native audits are synchronous.");
 	for (const key of Object.keys(params)) {
 		if (!NATIVE_FIELDS.has(key)) throw new Error(`Native audit cannot be combined with ${key}.`);
+	}
+	if (params.encryptSecretsOverride !== undefined && params.encryptSecretsOverride !== false) {
+		throw new Error("Native audit cannot be combined with encryptSecretsOverride unless false.");
 	}
 	const audit = params.audit;
 	if (!audit || typeof audit !== "object" || Array.isArray(audit)) throw new Error("Native audit requires an audit object.");
@@ -183,13 +186,54 @@ export async function prepareNativeAuthStore(input: NodeJS.ProcessEnv,
 	return { directory, filename };
 }
 
+/** Read Pi's stored Anthropic OAuth or API key from ~/.pi/agent/auth.json safely. */
+function readNativeAnthropicToken(homeDir: string): string | undefined {
+	if (typeof fsSync.constants.O_NOFOLLOW !== "number") return undefined;
+	const authPath = path.join(homeDir, ".pi", "agent", "auth.json");
+	let fd: number | undefined;
+	try {
+		fd = fsSync.openSync(authPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const stat = fsSync.fstatSync(fd);
+		if (!stat.isFile() || stat.nlink !== 1 || stat.size <= 0 || stat.size > 65536) return undefined;
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return undefined;
+		if ((stat.mode & 0o022) !== 0) return undefined;
+		const buf = Buffer.alloc(stat.size);
+		const bytesRead = fsSync.readSync(fd, buf, 0, stat.size, 0);
+		const parsed = JSON.parse(buf.toString("utf-8", 0, bytesRead)) as Record<string, unknown>;
+		const antEntry = parsed?.["anthropic"] as Record<string, unknown> | undefined;
+		if (!antEntry || typeof antEntry !== "object") return undefined;
+		if (antEntry.type === "oauth") {
+			const expires = antEntry.expires;
+			if (typeof expires === "number" && Number.isFinite(expires) && expires <= Date.now()) return undefined;
+			const access = typeof antEntry.access === "string" ? antEntry.access.trim() : "";
+			return access.startsWith("sk-ant-oat") ? access : undefined;
+		}
+		if (antEntry.type === undefined || antEntry.type === "api_key") {
+			const key = typeof antEntry.key === "string" ? antEntry.key.trim() : "";
+			return key ? key : undefined;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try { fsSync.closeSync(fd); } catch { /* ignore */ }
+		}
+	}
+}
+
 /** Forward only the selected upstream credential interface, never execution hooks. */
-export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, provider?: string): NodeJS.ProcessEnv {
+export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, provider?: string,
+	anthropicShimDir?: string): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	const credentials = provider === "chatgpt" ? ["CHATGPT_TOKEN_DIR", "CHATGPT_AUTH_FILE", "CHATGPT_API_KEY"] :
-		provider === "openrouter" ? ["OPENROUTER_API_KEY"] : [];
+		provider === "openrouter" ? ["OPENROUTER_API_KEY"] :
+		provider === "anthropic" ? ["ANTHROPIC_API_KEY"] : [];
 	for (const key of ["HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", ...credentials]) {
 		if (input[key] !== undefined) env[key] = input[key];
+	}
+	if (provider === "anthropic" && anthropicShimDir) {
+		env.PYTHONPATH = anthropicShimDir;
 	}
 	return { ...env, PATH: searchPath, LITELLM_MODE: "PRODUCTION", LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1",
 		NO_COLOR: "1", TERM: "dumb", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -202,8 +246,10 @@ export function nativePreflightEnvironment(input: NodeJS.ProcessEnv, searchPath:
 	for (const key of Object.keys(input)) {
 		if (["http_proxy", "https_proxy", "all_proxy"].includes(key.toLowerCase()) ||
 			["USE_LITELLM_PROXY", "SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD",
-				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
-				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE"].includes(key)) {
+				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+				"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
+				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
+				"ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"].includes(key)) {
 			env[key] = input[key] ? "present" : "";
 		}
 	}
@@ -229,7 +275,7 @@ const routeIdentifier = (value: unknown, limit = 160): value is string => typeof
 const routeOptions = new Set(["max_output_tokens", "max_turns", "provider_timeout", "retries",
 	"temperature", "top_p", "seed", "max_context_tokens"]);
 const explicitRouteFields = new Set(["profile", "provider", "model", "reasoningEffort",
-	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout"]);
+	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout", "encryptSecrets"]);
 const routeFailure = () => new Error("Native audit configuration preflight failed: invalid or unsupported metadata. No native worker/provider was started.");
 
 export function parseNativeRoute(value: unknown): NativeRoute {
@@ -687,6 +733,10 @@ export async function prepareNativeAudit(
 	if (!Number.isInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > maxTimeoutMs) {
 		throw new Error(`Native timeoutMs must be an integer from 1 to ${maxTimeoutMs}.`);
 	}
+	if (!input.ANTHROPIC_API_KEY) {
+		const bridgedAnthropic = readNativeAnthropicToken(input.HOME!);
+		if (bridgedAnthropic) input.ANTHROPIC_API_KEY = bridgedAnthropic;
+	}
 	const preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	const routing: Record<string, unknown> = {};
 	for (const field of NATIVE_FIELDS) {
@@ -699,7 +749,13 @@ export async function prepareNativeAudit(
 	};
 	const { route } = await preflight();
 	checkCancelled();
-	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider);
+	let anthropicShimDir: string | undefined;
+	if (route.provider === "anthropic") {
+		anthropicShimDir = await canonicalRuntimePath(path.join(scriptRoot, "anthropic_oauth_shim"));
+		await assertTrustedRuntimePath(anthropicShimDir, protectedRoots);
+		await assertTrustedRuntimePath(path.join(anthropicShimDir, "sitecustomize.py"), protectedRoots);
+	}
+	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider, anthropicShimDir);
 	const authStore = route.provider === "chatgpt" ? await prepareNativeAuthStore(input, [...protectedRoots, runDir]) : undefined;
 	if (authStore) {
 		env.CHATGPT_TOKEN_DIR = authStore.directory;

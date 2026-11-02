@@ -835,4 +835,79 @@ describe("resolveSwivalChildEnv", () => {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		}
 	});
+
+	it("bridges Anthropic OAuth token and prepends ANTHROPIC_OAUTH_SHIM_DIR to PYTHONPATH for anthropic routes", () => {
+		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-ant-env-"));
+		try {
+			const agentDir = path.join(tmpHome, ".pi", "agent");
+			const cfgDir = path.join(tmpHome, ".config", "swival");
+			const repoDir = path.join(tmpHome, "repo");
+			fs.mkdirSync(agentDir, { recursive: true });
+			fs.mkdirSync(cfgDir, { recursive: true });
+			fs.mkdirSync(repoDir, { recursive: true });
+			fs.writeFileSync(
+				path.join(agentDir, "auth.json"),
+				JSON.stringify({
+					anthropic: {
+						type: "oauth",
+						access: "sk-ant-oat01-synthetic-token",
+						expires: Date.now() + 3_600_000,
+					},
+				}),
+				{ mode: 0o600 },
+			);
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				[
+					'active_profile = "vertex-gemini-flash"',
+					"[profiles.anthropic-claude-mythos]",
+					'provider = "anthropic"',
+					'model = "claude-mythos-5-1"',
+					"max_context_tokens = 1000000",
+					'reasoning_effort = "high"',
+				].join("\n"),
+			);
+			const env = resolveSwivalChildEnv(
+				["--profile", "anthropic-claude-mythos", "--"],
+				{ PATH: "/usr/bin" },
+				tmpHome,
+				repoDir,
+			);
+			expect(env).toBeDefined();
+			expect(env?.ANTHROPIC_API_KEY).toBe("sk-ant-oat01-synthetic-token");
+			expect(env?.PYTHONPATH).toContain("anthropic_oauth_shim");
+			// Ambient ANTHROPIC_API_BASE / ANTHROPIC_BASE_URL fail closed
+			expect(
+				resolveSwivalChildEnv(
+					["--profile", "anthropic-claude-mythos", "--"],
+					{ PATH: "/usr/bin", ANTHROPIC_API_BASE: "https://attacker.example" },
+					tmpHome,
+					repoDir,
+				),
+			).toBeUndefined();
+			expect(
+				resolveSwivalChildEnv(
+					["--profile", "anthropic-claude-mythos", "--"],
+					{ PATH: "/usr/bin", ANTHROPIC_BASE_URL: "https://attacker.example" },
+					tmpHome,
+					repoDir,
+				),
+			).toBeUndefined();
+			// Inherited non-canonical root base_url fails closed when profile omits base_url
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				[
+					'base_url = "https://attacker.example/v1"',
+					"[profiles.anthropic-claude-mythos]",
+					'provider = "anthropic"',
+					'model = "claude-mythos-5-1"',
+				].join("\n"),
+			);
+			expect(
+				resolveSwivalChildEnv(["--profile", "anthropic-claude-mythos", "--"], { PATH: "/usr/bin" }, tmpHome, repoDir),
+			).toBeUndefined();
+		} finally {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		}
+	});
 });
