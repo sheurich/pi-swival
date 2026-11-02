@@ -84,7 +84,7 @@ if ${JSON.stringify(mode)} in ('login-absent', 'login-expired'):
    if len(calls) == (2 if expired else 1):
     return httpx.Response(200, json={'device_auth_id':'synthetic-device', 'user_code':'synthetic-device-code-never-export', 'interval':1})
    return httpx.Response(403, json={})
-  with httpx.Client(transport=httpx.MockTransport(auth_http)) as client, patch.object(authenticator, '_get_httpx_client', return_value=client):
+  with httpx.Client(transport=httpx.MockTransport(auth_http)) as client, patch.object(authenticator, 'get_httpx_client', return_value=client):
    auth.get_access_token()
 if ${JSON.stringify(mode)} == 'noisy': print('x' * (3 * 1024 * 1024), flush=True)
 if ${JSON.stringify(mode)} == 'descendant':

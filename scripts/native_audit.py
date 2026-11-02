@@ -36,7 +36,7 @@ class NativeAuditError(Exception):
         return result
 
 
-RUNTIME_VERSIONS = {"swival": "1.0.48", "litellm": "1.105.3"}
+RUNTIME_VERSIONS = {"swival": "1.9.1", "litellm": "1.106.5"}
 OVERRIDE_KEYS = {
     "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
@@ -46,7 +46,8 @@ OVERRIDE_KEYS = {
 ROUTING_KEYS = {
     *OVERRIDE_KEYS.values(), "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
     "project", "location", "max_context_tokens", "retries", "prompt_cache",
-    "sanitize_thinking", "show_thinking",
+    "sanitize_thinking", "show_thinking", "decision_model", "decision_base_url",
+    "decision_api_key", "model_routing", "routing_profiles",
 }
 OPTION_KEYS = ("max_output_tokens", "max_turns", "provider_timeout", "retries",
                "temperature", "top_p", "seed", "max_context_tokens")
@@ -59,6 +60,8 @@ AMBIENT_ENDPOINTS = {"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE", "OPENAI_API_
 def _unpropagated_policy(key, value):
     if key.startswith("encrypt_secrets") and value is not False:
         return "encrypt_secrets"
+    if (key == "web_search" and value is not False) or (key == "web_search_providers" and value):
+        return "web_search"
     if key in {"llm_filter", "secret_shield", "extra_body", "user_agent"}:
         return key if value not in (None, False, "", {}) else None
     if (key == "prompt_cache" and value is False) or (key == "retries" and value != 5):
@@ -75,6 +78,10 @@ def _requirements(raw):
         field = _unpropagated_policy(key, value)
         if field:
             raise NativeAuditError("POLICY_NOT_PROPAGATED", field)
+        if key == "decision_api_key" and value is not None:
+            raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED", "api_key")
+        if key in {"model_routing", "routing_profiles", "decision_model", "decision_base_url"} and value:
+            raise NativeAuditError("ROUTE_SELECTOR_UNSUPPORTED")
         if (key in {"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain",
                     "nono_network_profile", "nono_credential", "nono_audit_integrity"}
                 and value) or (
@@ -201,7 +208,7 @@ def resolve_native_config(request):
 
 
 def _credential_capability(args):
-    if args.api_key is not None:
+    if args.api_key is not None or getattr(args, "decision_api_key", None) is not None:
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED", "api_key")
     if any(getattr(args, key, None) for key in ("aws_profile", "gcp_project", "location")):
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
@@ -238,7 +245,7 @@ def _admit_route(args, profile, routing):
     from litellm.utils import ProviderConfigManager
     # Pinned adapters without a dynamic models handler must not expose a singleton
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
-    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.105.3) return None
+    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.106.5) return None
     # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
     adapter = LlmProviders(provider)
     if (ProviderConfigManager.get_provider_model_info(None, adapter) is not None

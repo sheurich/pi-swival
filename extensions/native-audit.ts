@@ -61,6 +61,7 @@ export function buildNativeAuditArgs(snapshot: string, route: Record<string, any
 		"--commands", "none", "--files", "some", "--oneshot-commands",
 		"--no-sandbox-auto-session", "--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp",
 		"--no-a2a", "--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+		"--no-web-search", "--no-model-routing", "--no-decisions",
 		"--provider", route.provider, "--model", route.model, "--report", path.join(snapshot, "native-cli-report.json")];
 	if (route.endpoint != null) args.push("--base-url", route.endpoint);
 	if (route.reasoningEffort != null) args.push("--reasoning-effort", route.reasoningEffort);
@@ -235,7 +236,7 @@ export function parseNativeRoute(value: unknown): NativeRoute {
 	if (!isPlainRecord(value) || value.version !== 2 ||
 		!hasOnlyFields(value, new Set(["version", "runtime", "provider", "model", "endpoint", "profile",
 			"reasoningEffort", "options", "selection", "reportIdentity"])) ||
-		!isDeepStrictEqual(value.runtime, { swival: "1.0.48", litellm: "1.105.3" }) ||
+		!isDeepStrictEqual(value.runtime, { swival: "1.9.1", litellm: "1.106.5" }) ||
 		!routeIdentifier(value.provider, 40) || !routeIdentifier(value.model) ||
 		!(value.profile === null || routeIdentifier(value.profile, 80)) ||
 		!(value.reasoningEffort === null || ["none", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value.reasoningEffort)) ||
@@ -265,7 +266,7 @@ export function parseNativeRoute(value: unknown): NativeRoute {
 		if (!routeOptions.has(key) || !(option === null || typeof option === "number" && Number.isFinite(option) && Math.abs(option) <= Number.MAX_SAFE_INTEGER)) throw routeFailure();
 		options[key] = option;
 	}
-	return { version: 2, runtime: { swival: "1.0.48", litellm: "1.105.3" }, provider: value.provider,
+	return { version: 2, runtime: { swival: "1.9.1", litellm: "1.106.5" }, provider: value.provider,
 		model: value.model, endpoint: value.endpoint, profile: value.profile, reasoningEffort: value.reasoningEffort,
 		options, selection: { profileSource: selection.profileSource, explicitFields: [...selection.explicitFields] },
 		reportIdentity: { provider: value.reportIdentity.provider, model: value.reportIdentity.model } };
@@ -280,7 +281,7 @@ const preflightReasons: Record<string, string> = {
 	ROUTE_SELECTOR_UNSUPPORTED: "Automatic or multi-model selection is unsupported; select a concrete model.",
 	COMMAND_EXECUTION_REQUIRED: "Selected provider requires command execution, incompatible with commands-none.",
 	CONFIG_INVALID: "Native configuration is invalid or contains unknown requirements.",
-	RUNTIME_UNSUPPORTED: "Native runtime is unsupported; require Swival 1.0.48 and LiteLLM 1.105.3.",
+	RUNTIME_UNSUPPORTED: "Native runtime is unsupported; require Swival 1.9.1 and LiteLLM 1.106.5.",
 	TRANSPORT_REQUIREMENT_UNSUPPORTED: "Unsupported native transport proxy requirements.",
 	ENDPOINT_REQUIREMENT_UNSUPPORTED: "Selected or ambient endpoint requirements are unsupported; no fallback.",
 	PROJECT_ROUTING_UNSUPPORTED: "Project-supplied native routing is unsupported.",
@@ -288,7 +289,8 @@ const preflightReasons: Record<string, string> = {
 const policyFields = new Set(["encrypt_secrets", "secret_shield", "llm_filter", "extra_body", "user_agent", "prompt_cache",
 	"sanitize_thinking", "show_thinking", "sandbox_strict_read", "sandbox_session", "lifecycle_fail_closed",
 	"reasoning_effort_all_phases", "retries_all_phases", "retries", "network", "files", "sandbox", "max_context_tokens",
-	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity"]);
+	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity",
+	"web_search"]);
 
 export function parseNativePreflight(output: string, success: boolean): { route: NativeRoute; scope?: unknown } {
 	let value: unknown;
@@ -772,7 +774,7 @@ export async function prepareNativeAudit(
 	const completion = new Promise<NativeTerminal>((resolve, reject) => { settle = resolve; fail = reject; });
 	const closed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
 	const consumeLine = (line: string, index: number) => {
-		// LiteLLM 1.105.3 prints this fixed header before its device-code challenge.
+		// LiteLLM 1.106.5 prints this fixed header before its device-code challenge.
 		if (line.trim() === "Sign in with ChatGPT using device code:") {
 			cancel("Native ChatGPT login is required. Authenticate with upstream Swival outside Pi, then rerun the audit.");
 		}
@@ -887,7 +889,7 @@ const pythonAsciiString = (value: string) => JSON.stringify(value).replace(/[\u0
 	(character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const pythonStringList = (value: string[]) => `[${value.map(pythonAsciiString).join(", ")}]`;
 
-/** Match Swival 1.0.48 `_finding_key` for the released FindingRecord schema only. */
+/** Match Swival 1.9.1 `_finding_key` for the released FindingRecord schema only. */
 export function nativeFindingKey(value: unknown): string | undefined {
 	const finding = releasedFinding(value);
 	if (!finding) return undefined;

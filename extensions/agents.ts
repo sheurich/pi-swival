@@ -100,6 +100,7 @@ export interface SwivalAgentConfig {
 	noLifecycle?: boolean;
 	noMcp?: boolean;
 	noA2a?: boolean;
+	noWebSearch?: boolean;
 	noHistory?: boolean;
 	noContinue?: boolean;
 	noSubagents?: boolean;
@@ -328,6 +329,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 				noLifecycle: asBool(fm.noLifecycle),
 				noMcp: asBool(fm.noMcp),
 				noA2a: asBool(fm.noA2a),
+				noWebSearch: asBool(fm.noWebSearch),
 				noHistory: asBool(fm.noHistory),
 				noContinue: asBool(fm.noContinue),
 				noSubagents: asBool(fm.noSubagents),
@@ -386,6 +388,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 			agentConfig.a2aConfig = undefined;
 			agentConfig.allowA2a = undefined;
 			agentConfig.noA2a = true;
+			agentConfig.noWebSearch = true;
 			// Force AgentFS for every project agent, including "nono" — the prior
 			// check only forced agentfs when sandbox was unset or "builtin",
 			// letting `sandbox: nono` pass through unmodified.

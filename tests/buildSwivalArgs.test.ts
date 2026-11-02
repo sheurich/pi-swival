@@ -17,11 +17,12 @@ function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfi
 }
 
 describe("buildSwivalArgs", () => {
-	it("always disables lifecycle / MCP / A2A / history / continue / memory / subagents by default", () => {
+	it("always disables lifecycle / MCP / A2A / web-search / history / continue / memory / subagents by default", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
 		expect(args).toContain("--no-lifecycle");
 		expect(args).toContain("--no-mcp");
 		expect(args).toContain("--no-a2a");
+		expect(args).toContain("--no-web-search");
 		expect(args).toContain("--no-history");
 		expect(args).toContain("--no-continue");
 		expect(args).toContain("--no-memory");
@@ -37,15 +38,23 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("--no-subagents");
 	});
 
-	it("respects explicit noLifecycle=false / noMcp=false / noA2a=false", () => {
+	it("respects explicit noLifecycle=false / noMcp=false / noA2a=false / noWebSearch=false", () => {
 		const args = buildSwivalArgs(
-			makeAgent({ noLifecycle: false, noMcp: false, noA2a: false }),
+			makeAgent({ noLifecycle: false, noMcp: false, noA2a: false, noWebSearch: false }),
 			"/tmp/r.json",
 			"/cwd",
 		);
 		expect(args).not.toContain("--no-lifecycle");
 		expect(args).not.toContain("--no-mcp");
 		expect(args).not.toContain("--no-a2a");
+		expect(args).not.toContain("--no-web-search");
+	});
+
+	it("omits --no-web-search when installedSwivalVersion is older than 1.9.0", () => {
+		const pre19Args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { installedSwivalVersion: "1.0.48" });
+		expect(pre19Args).not.toContain("--no-web-search");
+		const v19Args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { installedSwivalVersion: "1.9.0" });
+		expect(v19Args).toContain("--no-web-search");
 	});
 
 	it("omits --no-history / --no-continue / --no-memory when agent opts out", () => {
@@ -663,13 +672,13 @@ describe("resolveSwivalChildEnv", () => {
 					'active_profile = "vertex-gemini-flash"',
 					"[profiles.vertex-gemini-flash]",
 					'provider = "geap"',
-					"[profiles.arc-glm-cyber]",
+					"[profiles.arc-gpt-sol]",
 					'provider = "generic"',
 					'base_url = "https://arc.fastly.app/v1"',
 				].join("\n"),
 			);
 			// 1. Explicit --profile resolving to generic + https://arc.fastly.app/v1 in config.toml
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
 				PATH: "/usr/bin",
 				OPENAI_API_KEY: "synthetic-arc-token",
 			});
@@ -688,7 +697,7 @@ describe("resolveSwivalChildEnv", () => {
 			// 3. active_profile in XDG_CONFIG_HOME/swival/config.toml
 			fs.writeFileSync(
 				path.join(xdgDir, "config.toml"),
-				['active_profile = "arc-glm-cyber"', "[profiles.arc-glm-cyber]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
+				['active_profile = "arc-gpt-sol"', "[profiles.arc-gpt-sol]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
 			);
 			expect(
 				resolveSwivalChildEnv(["--"], { PATH: "/usr/bin", XDG_CONFIG_HOME: path.join(tmpHome, "xdg") }, tmpHome, tmpHome),
@@ -727,15 +736,15 @@ describe("resolveSwivalChildEnv", () => {
 					"[profiles.arc-misleading]",
 					'provider = "generic"',
 					'base_url = "https://attacker.example/v1"',
-					"[profiles.arc-glm-cyber]",
+					"[profiles.arc-gpt-sol]",
 					'provider = "generic"',
 					'base_url = "https://arc.fastly.app/v1"',
 				].join("\n"),
 			);
-			// External --reviewer fails closed even when main profile is arc-glm-cyber
+			// External --reviewer fails closed even when main profile is arc-gpt-sol
 			expect(
 				resolveSwivalChildEnv(
-					["--profile", "arc-glm-cyber", "--reviewer", "swival --profile local-qwen --reviewer-mode", "--"],
+					["--profile", "arc-gpt-sol", "--reviewer", "swival --profile local-qwen --reviewer-mode", "--"],
 					{},
 					tmpHome,
 					repoDir,
@@ -745,24 +754,24 @@ describe("resolveSwivalChildEnv", () => {
 			expect(resolveSwivalChildEnv(["--profile", "arc-misleading", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			// Existing OPENAI_API_KEY is preserved
 			expect(
-				resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], { OPENAI_API_KEY: "existing" }, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], { OPENAI_API_KEY: "existing" }, tmpHome, repoDir),
 			).toBeUndefined();
 			// Non-generic --provider override fails closed
 			expect(
-				resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--provider", "google", "--"], {}, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--provider", "google", "--"], {}, tmpHome, repoDir),
 			).toBeUndefined();
 			// Non-arc --base-url override fails closed
 			expect(
 				resolveSwivalChildEnv(
-					["--profile", "arc-glm-cyber", "--base-url", "https://attacker.example/v1", "--"],
+					["--profile", "arc-gpt-sol", "--base-url", "https://attacker.example/v1", "--"],
 					{},
 					tmpHome,
 					repoDir,
 				),
 			).toBeUndefined();
-			// --system-prompt value containing "--profile=arc-glm-cyber" does not spoof CLI flags
+			// --system-prompt value containing "--profile=arc-gpt-sol" does not spoof CLI flags
 			expect(
-				resolveSwivalChildEnv(["--system-prompt", "--profile=arc-glm-cyber", "--"], {}, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--system-prompt", "--profile=arc-gpt-sol", "--"], {}, tmpHome, repoDir),
 			).toBeUndefined();
 			// Profile with quoted TOML key or omitted base_url must NOT fall back to root base_url
 			fs.writeFileSync(
@@ -773,7 +782,7 @@ describe("resolveSwivalChildEnv", () => {
 					"[profiles.arc-quoted]",
 					'provider = "generic"',
 					'"base_url" = "http://127.0.0.1:8000/v1"',
-					"[profiles.arc-glm-cyber]",
+					"[profiles.arc-gpt-sol]",
 					'provider = "generic"',
 					'base_url = "https://arc.fastly.app/v1"',
 				].join("\n"),
@@ -796,32 +805,32 @@ describe("resolveSwivalChildEnv", () => {
 				path.join(cfgDir, "config.toml"),
 				[
 					'reviewer = "swival --profile local-qwen --reviewer-mode"',
-					"[profiles.arc-glm-cyber]",
+					"[profiles.arc-gpt-sol]",
 					'provider = "generic"',
 					'base_url = "https://arc.fastly.app/v1"',
 				].join("\n"),
 			);
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
-				["[profiles.arc-glm-cyber]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
+				["[profiles.arc-gpt-sol]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
 			);
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toEqual({
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toEqual({
 				OPENAI_API_KEY: "synthetic-arc-token",
 			});
 			// Project swival.toml in base-dir fails closed
 			fs.writeFileSync(path.join(repoDir, "swival.toml"), 'base_url = "https://attacker.example/v1"\n');
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.unlinkSync(path.join(repoDir, "swival.toml"));
 			// Group-writable auth.json fails closed
 			fs.chmodSync(authFile, 0o620);
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.chmodSync(authFile, 0o600);
 			// Symlinked auth.json fails closed
 			const targetAuth = path.join(tmpHome, "real-auth.json");
 			fs.renameSync(authFile, targetAuth);
 			fs.symlinkSync(targetAuth, authFile);
-			expect(resolveSwivalChildEnv(["--profile", "arc-glm-cyber", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 		} finally {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		}

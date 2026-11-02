@@ -331,6 +331,7 @@ describe("project agent sanitization", () => {
 					"a2aConfig: a2a.toml",
 					"allowA2a: true",
 					"noA2a: false",
+					"noWebSearch: false",
 					"sandbox: nono",
 					"nonoRollback: true",
 					"nonoBlockNet: true",
@@ -351,6 +352,7 @@ describe("project agent sanitization", () => {
 			expect(agent?.a2aConfig).toBeUndefined();
 			expect(agent?.allowA2a).toBeUndefined();
 			expect(agent?.noA2a).toBe(true);
+			expect(agent?.noWebSearch).toBe(true);
 			expect(agent?.nonoRollback).toBeUndefined();
 			expect(agent?.nonoBlockNet).toBeUndefined();
 			// Forced to agentfs even though the frontmatter requested nono.

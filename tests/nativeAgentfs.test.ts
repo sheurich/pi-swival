@@ -202,7 +202,7 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
   def auth_http(request):
    requests.append(request)
    return httpx.Response(200, json={'access_token':'synthetic-refreshed','id_token':'synthetic-id','refresh_token':'synthetic-new-refresh'})
-  with httpx.Client(transport=httpx.MockTransport(auth_http)) as client, patch.object(authenticator, '_get_httpx_client', return_value=client):
+  with httpx.Client(transport=httpx.MockTransport(auth_http)) as client, patch.object(authenticator, 'get_httpx_client', return_value=client):
    auth = authenticator.Authenticator()
    returned = auth.get_access_token() == 'synthetic-refreshed'
    persisted = auth._read_auth_file().get('access_token') == 'synthetic-refreshed'
