@@ -162,7 +162,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_released_tool_and_isolated_loop_denials(self):
         session = Session(base_dir=str(self.repo), files="some", commands="none",
-            network="provider-only",
+            network="provider-only", web_search=False,
             no_instructions=True, no_skills=True, memory=False, history=False,
                 subagents=False, lifecycle_enabled=False)
         with patch.object(agent, "resolve_provider", return_value=("gpt-offline", None, None,
@@ -176,6 +176,8 @@ class NativeEntryTests(unittest.TestCase):
             network_mode=None)
         self.assertEqual(isolated["files_mode"], "some")
         self.assertEqual(isolated["network_mode"], "provider-only")
+        self.assertIsNone(context.loop_kwargs["web_search_policy"])
+        self.assertIsNone(isolated["web_search_policy"])
         self.assertFalse(isolated["shell_allowed"])
         self.assertEqual(isolated["command_policy"].mode, "none")
         with patch.object(subprocess, "Popen",
@@ -183,10 +185,12 @@ class NativeEntryTests(unittest.TestCase):
             for name, args in [("run_command", {"command": ["id"]}), ("run_python",
                 {"code": "print(42)"}),
                                ("run_shell_command", {"command": "id"}), ("fetch_url",
-                                   {"url": "https://offline.invalid"})]:
-                result = tools.dispatch(name, args, str(self.repo), **{k: v for k,
-                    v in isolated.items() if k != "base_dir"})
-                self.assertTrue(result.startswith("error:"), name)
+                                   {"url": "https://offline.invalid"}), ("web_search",
+                                       {"query": "offline"})]:
+                for loop_kwargs in (context.loop_kwargs, isolated):
+                    result = tools.dispatch(name, args, str(self.repo), **{k: v for k,
+                        v in loop_kwargs.items() if k != "base_dir"})
+                    self.assertTrue(result.startswith("error:"), name)
 
     def test_chatgpt_not_found_never_replaces_model(self):
         self.assertGreater(len(set(agent._list_server_models("chatgpt", None, None))), 1)
