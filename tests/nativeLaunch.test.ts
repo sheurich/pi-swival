@@ -83,5 +83,9 @@ describe("native CLI launch contract", () => {
 		expect(env).toMatchObject({ HOME: "/synthetic/home", PATH: "/trusted/bin", CHATGPT_TOKEN_DIR: "/synthetic/auth",
 			LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" });
 		for (const name of ["NODE_OPTIONS", "PYTHONPATH", "AGENTFS", "NONO_ACTIVE", "SWIVAL_AGENTFS_ACTIVE", "UNRELATED_TOKEN"]) expect(env[name]).toBeUndefined();
+		const antEnv = environment({ HOME: "/synthetic/home", PATH: "/trusted/bin", ANTHROPIC_API_KEY: "sk-ant-oat01-synthetic",
+			PYTHONPATH: "/hostile" }, "/trusted/bin", "anthropic", "/trusted/shim");
+		expect(antEnv).toMatchObject({ HOME: "/synthetic/home", PATH: "/trusted/bin", ANTHROPIC_API_KEY: "sk-ant-oat01-synthetic",
+			PYTHONPATH: "/trusted/shim" });
 	});
 });

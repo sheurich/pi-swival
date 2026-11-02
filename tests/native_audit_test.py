@@ -914,6 +914,113 @@ class NativeEntryTests(unittest.TestCase):
     def test_released_triage_promotion_preserves_full_deep_review(self):
         self.released_finding("# Synthetic source-only report\n", recovery="triage-promoted")
 
+    def test_anthropic_mythos_profile_admission_and_oauth_shim(self):
+        self.write_config(
+            'active_profile="vertex-gemini-flash"\nencrypt_secrets=false\n'
+            'web_search=false\n'
+            '[profiles.vertex-gemini-flash]\nprovider="geap"\nmodel="gemini-3.8-flash"\n'
+            'project="p"\nlocation="global"\n'
+            '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
+            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+            'reasoning_effort="high"\n'
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
+            route = bridge.resolve_native_config(
+                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+            )
+        self.assertEqual(route["provider"], "anthropic")
+        self.assertEqual(route["model"], "claude-mythos-5-1")
+        self.assertEqual(route["reasoningEffort"], "high")
+        self.assertEqual(route["options"]["max_context_tokens"], 1000000)
+
+        # Global encrypt_secrets=true remains rejected with POLICY_NOT_PROPAGATED unless encryptSecrets=False
+        self.write_config(
+            'encrypt_secrets=true\n'
+            '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
+            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}), \
+             self.assertRaises(bridge.NativeAuditError) as raised:
+            bridge.resolve_native_config(
+                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+            )
+        self.assertEqual(raised.exception.reason, "POLICY_NOT_PROPAGATED")
+        self.assertEqual(raised.exception.field, "encrypt_secrets")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
+            overridden = bridge.resolve_native_config(
+                {
+                    "source": str(self.repo),
+                    "routing": {"profile": "anthropic-claude-mythos", "encryptSecrets": False},
+                }
+            )
+        self.assertEqual(overridden["provider"], "anthropic")
+        self.assertIn("encryptSecrets", overridden["selection"]["explicitFields"])
+
+        shim_path = WORKTREE / "scripts" / "anthropic_oauth_shim" / "sitecustomize.py"
+        shim_spec = importlib.util.spec_from_file_location("anthropic_oauth_shim", shim_path)
+        shim_mod = importlib.util.module_from_spec(shim_spec)
+        captured = {}
+        def fake_completion(*args, **kwargs):
+            captured.update(kwargs)
+            return "ok"
+        with patch.object(litellm, "completion", side_effect=fake_completion):
+            shim_spec.loader.exec_module(shim_mod)
+            litellm.completion(
+                model="anthropic/claude-mythos-5-1",
+                api_key="sk-ant-oat01-synthetic",
+                messages=[{"role": "system", "content": "Audit instructions"}],
+                extra_headers={"User-Agent": "swival/1.9.1"},
+            )
+        self.assertEqual(captured["extra_headers"]["User-Agent"], "claude-cli/2.1.280")
+        self.assertEqual(captured["extra_headers"]["x-app"], "cli")
+        self.assertIn("claude-code-20250219", captured["extra_headers"]["anthropic-beta"])
+        self.assertIn("oauth-2025-04-20", captured["extra_headers"]["anthropic-beta"])
+        self.assertEqual(
+            captured["messages"][0]["content"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+        )
+        self.assertEqual(captured["messages"][0]["content"][1]["text"], "Audit instructions")
+
+        # Verify shim disables get_valid_models and Swival NotFound model replacement
+        self.assertEqual(
+            litellm.get_valid_models(
+                check_provider_endpoint=True,
+                custom_llm_provider="anthropic",
+                api_key="sk-ant-oat01-synthetic",
+            ),
+            [],
+        )
+        self.assertEqual(
+            agent._list_server_models("anthropic", None, "sk-ant-oat01-synthetic"),
+            [],
+        )
+        failure = litellm.NotFoundError(
+            "synthetic missing anthropic model",
+            llm_provider="anthropic",
+            model="claude-mythos-5-1",
+        )
+        with patch.object(litellm, "completion", side_effect=failure) as completion:
+            with self.assertRaises(agent.AgentError):
+                agent.call_llm(
+                    None,
+                    "claude-mythos-5-1",
+                    [{"role": "user", "content": "synthetic"}],
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    api_key="sk-ant-oat01-synthetic",
+                    provider="anthropic",
+                    max_retries=1,
+                )
+        self.assertEqual(
+            {call.kwargs["model"] for call in completion.call_args_list},
+            {"anthropic/claude-mythos-5-1"},
+        )
+        self.assertFalse(agent._MODEL_AUTOFIX)
+
 
 def zero_finding_reply(captured):
     """Bind each CLI run's request capture without sharing mutable defaults."""

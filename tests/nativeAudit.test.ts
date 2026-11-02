@@ -88,7 +88,7 @@ describe("native audit dispatch boundary", () => {
 	});
 	it.each([
 		{ agent: "swival" }, { task: "/audit src" }, { tasks: [] }, { chain: [] }, { cwd: "/tmp" },
-		{ selfReviewOverride: false }, { reviewerOverride: "/bin/true" }, { encryptSecretsOverride: false },
+		{ selfReviewOverride: false }, { reviewerOverride: "/bin/true" }, { encryptSecretsOverride: true },
 		{ networkOverride: "full" }, { extraArgs: ["--yolo"] }, { subagentsOverride: true },
 		{ instructionsFullOverride: true }, { output: "/tmp/out" },
 		{ baseUrlOverride: "https://caller.invalid/v1" }, { baseUrlOverride: "http://127.0.0.1:8444/v1" },

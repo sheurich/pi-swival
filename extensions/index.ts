@@ -608,13 +608,48 @@ function parseSwivalOptionMap(args: readonly string[]): Map<string, string> | un
 	return map;
 }
 
+export const ANTHROPIC_OAUTH_SHIM_DIR = path.resolve(
+	path.dirname(fileURLToPath(import.meta.url)),
+	"../scripts/anthropic_oauth_shim",
+);
+
+export function readAnthropicAuthToken(homeDir: string): string | undefined {
+	const authRaw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "auth.json"), 65536, true);
+	if (authRaw === undefined) return undefined;
+	try {
+		const parsed = JSON.parse(authRaw) as Record<string, unknown>;
+		const antEntry = parsed?.["anthropic"] as Record<string, unknown> | undefined;
+		if (!antEntry || typeof antEntry !== "object") return undefined;
+		if (antEntry.type === "oauth") {
+			const expires = antEntry.expires;
+			if (typeof expires === "number" && Number.isFinite(expires) && expires <= Date.now()) {
+				return undefined;
+			}
+			const access = typeof antEntry.access === "string" ? antEntry.access.trim() : "";
+			return access.startsWith("sk-ant-oat") ? access : undefined;
+		}
+		if (antEntry.type === undefined || antEntry.type === "api_key") {
+			const key = typeof antEntry.key === "string" ? antEntry.key.trim() : "";
+			return key ? key : undefined;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Resolve optional child-process environment overrides for a Swival launch.
- * Bridges Pi's `fastly-arc` API key from `~/.pi/agent/auth.json` into
- * `OPENAI_API_KEY` when the effective Swival route resolves to
- * `provider = "generic"` and `base_url = "https://arc.fastly.app..."`, no
- * external `--reviewer` subprocess is configured, and `OPENAI_API_KEY` is not
- * already set in the environment.
+ * - Bridges Pi's `fastly-arc` API key from `~/.pi/agent/auth.json` into
+ *   `OPENAI_API_KEY` when the effective Swival route resolves to
+ *   `provider = "generic"` and `base_url = "https://arc.fastly.app..."`.
+ * - Bridges Pi's `anthropic` OAuth/API token from `~/.pi/agent/auth.json` into
+ *   `ANTHROPIC_API_KEY` (and prepends the Anthropic OAuth compatibility shim to
+ *   `PYTHONPATH` for `sk-ant-oat...` tokens) when the effective Swival route
+ *   resolves to `provider = "anthropic"` against the default or canonical
+ *   Anthropic API endpoint.
+ * Fails closed when an external `--reviewer` subprocess or project `swival.toml`
+ * is present.
  * Returns `undefined` when no environment override is needed.
  */
 export function resolveSwivalChildEnv(
@@ -623,20 +658,23 @@ export function resolveSwivalChildEnv(
 	homeDir: string = os.homedir(),
 	runCwd: string = process.cwd(),
 ): NodeJS.ProcessEnv | undefined {
-	if (baseEnv.OPENAI_API_KEY) return undefined;
 	const optionMap = parseSwivalOptionMap(args);
 	if (!optionMap) return undefined;
 	// Fail closed when an external --reviewer subprocess is configured, since
-	// Swival passes child_env() (including OPENAI_API_KEY) to reviewer processes.
+	// Swival passes child_env() (including OPENAI_API_KEY / ANTHROPIC_API_KEY)
+	// to reviewer processes.
 	if (optionMap.has("--reviewer")) return undefined;
 
 	const cliProfile = optionMap.get("--profile");
 	const cliBaseUrl = optionMap.get("--base-url");
 	const cliProvider = optionMap.get("--provider");
-	if (cliProvider !== undefined && cliProvider !== "generic") {
+	if (cliProvider !== undefined && cliProvider !== "generic" && cliProvider !== "anthropic") {
 		return undefined;
 	}
-	if (cliBaseUrl !== undefined && !/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(cliBaseUrl)) {
+	if (
+		cliBaseUrl !== undefined &&
+		!/^https:\/\/(?:arc\.fastly\.app|api\.anthropic\.com)(?:\/|$)/i.test(cliBaseUrl)
+	) {
 		return undefined;
 	}
 	// Fail closed when <base-dir>/swival.toml exists, since Swival merges project
@@ -652,6 +690,7 @@ export function resolveSwivalChildEnv(
 
 	let cfgProvider: string | undefined;
 	let cfgBaseUrl: string | undefined;
+	let cfgRootBaseUrl: string | undefined;
 	const configRoot = baseEnv.XDG_CONFIG_HOME || path.join(homeDir, ".config");
 	if (!path.isAbsolute(configRoot)) return undefined;
 	const cfgPath = path.join(configRoot, "swival", "config.toml");
@@ -675,6 +714,7 @@ export function resolveSwivalChildEnv(
 		if (rootActiveProfile === null || rootProvider === null || rootBaseUrl === null) {
 			return undefined;
 		}
+		cfgRootBaseUrl = rootBaseUrl;
 		const selectedProfile = cliProfile ?? rootActiveProfile;
 		if (selectedProfile) {
 			const profileSection = extractTomlProfileSection(cfgRaw, selectedProfile);
@@ -682,8 +722,8 @@ export function resolveSwivalChildEnv(
 			const profProvider = parseUniqueTomlString(profileSection, "provider");
 			const profBaseUrl = parseUniqueTomlString(profileSection, "base_url");
 			if (profProvider === null || profBaseUrl === null) return undefined;
-			// Require explicit provider and base_url in the selected profile section
-			// rather than falling back to root values.
+			// Require explicit provider (and base_url for generic) in the selected
+			// profile section rather than falling back to root values.
 			cfgProvider = profProvider;
 			cfgBaseUrl = profBaseUrl;
 		} else {
@@ -696,26 +736,64 @@ export function resolveSwivalChildEnv(
 
 	const effectiveProvider = cliProvider ?? cfgProvider;
 	const effectiveBaseUrl = cliBaseUrl ?? cfgBaseUrl;
-	if (
-		effectiveProvider !== "generic" ||
-		typeof effectiveBaseUrl !== "string" ||
-		!/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(effectiveBaseUrl)
-	) {
-		return undefined;
+	if (effectiveProvider === "generic") {
+		if (baseEnv.OPENAI_API_KEY) return undefined;
+		if (
+			typeof effectiveBaseUrl !== "string" ||
+			!/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(effectiveBaseUrl)
+		) {
+			return undefined;
+		}
+		const authRaw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "auth.json"), 65536, true);
+		if (authRaw === undefined) return undefined;
+		try {
+			const parsed = JSON.parse(authRaw) as Record<string, unknown>;
+			const arcEntry = parsed?.["fastly-arc"] as Record<string, unknown> | undefined;
+			if (arcEntry?.type !== undefined && arcEntry.type !== "api_key") return undefined;
+			const key = typeof arcEntry?.key === "string" ? arcEntry.key.trim() : "";
+			if (!key) return undefined;
+			return { ...baseEnv, OPENAI_API_KEY: key };
+		} catch {
+			return undefined;
+		}
 	}
 
-	const authRaw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "auth.json"), 65536, true);
-	if (authRaw === undefined) return undefined;
-	try {
-		const parsed = JSON.parse(authRaw) as Record<string, unknown>;
-		const arcEntry = parsed?.["fastly-arc"] as Record<string, unknown> | undefined;
-		if (arcEntry?.type !== undefined && arcEntry.type !== "api_key") return undefined;
-		const key = typeof arcEntry?.key === "string" ? arcEntry.key.trim() : "";
-		if (!key) return undefined;
-		return { ...baseEnv, OPENAI_API_KEY: key };
-	} catch {
-		return undefined;
+	if (effectiveProvider === "anthropic") {
+		if (baseEnv.ANTHROPIC_API_BASE !== undefined || baseEnv.ANTHROPIC_BASE_URL !== undefined) {
+			return undefined;
+		}
+		const inheritedAnthropicBaseUrl = effectiveBaseUrl ?? cfgRootBaseUrl;
+		if (
+			inheritedAnthropicBaseUrl !== undefined &&
+			!/^https:\/\/api\.anthropic\.com(?:\/|$)/i.test(inheritedAnthropicBaseUrl)
+		) {
+			return undefined;
+		}
+		const existingKey = typeof baseEnv.ANTHROPIC_API_KEY === "string" ? baseEnv.ANTHROPIC_API_KEY.trim() : "";
+		const token = existingKey || readAnthropicAuthToken(homeDir);
+		if (!token) return undefined;
+		const nextEnv: NodeJS.ProcessEnv = { ...baseEnv };
+		let changed = false;
+		if (!existingKey) {
+			nextEnv.ANTHROPIC_API_KEY = token;
+			changed = true;
+		}
+		if (token.startsWith("sk-ant-oat")) {
+			const existingPyPath = baseEnv.PYTHONPATH ?? "";
+			const entries = existingPyPath.split(path.delimiter).filter(Boolean);
+			if (entries[0] !== ANTHROPIC_OAUTH_SHIM_DIR) {
+				const reordered = [
+					ANTHROPIC_OAUTH_SHIM_DIR,
+					...entries.filter((entry) => entry !== ANTHROPIC_OAUTH_SHIM_DIR),
+				];
+				nextEnv.PYTHONPATH = reordered.join(path.delimiter);
+				changed = true;
+			}
+		}
+		return changed ? nextEnv : undefined;
 	}
+
+	return undefined;
 }
 
 /**
