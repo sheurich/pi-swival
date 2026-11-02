@@ -781,10 +781,12 @@ export function resolveSwivalChildEnv(
 		if (token.startsWith("sk-ant-oat")) {
 			const existingPyPath = baseEnv.PYTHONPATH ?? "";
 			const entries = existingPyPath.split(path.delimiter).filter(Boolean);
-			if (!entries.includes(ANTHROPIC_OAUTH_SHIM_DIR)) {
-				nextEnv.PYTHONPATH = existingPyPath
-					? `${ANTHROPIC_OAUTH_SHIM_DIR}${path.delimiter}${existingPyPath}`
-					: ANTHROPIC_OAUTH_SHIM_DIR;
+			if (entries[0] !== ANTHROPIC_OAUTH_SHIM_DIR) {
+				const reordered = [
+					ANTHROPIC_OAUTH_SHIM_DIR,
+					...entries.filter((entry) => entry !== ANTHROPIC_OAUTH_SHIM_DIR),
+				];
+				nextEnv.PYTHONPATH = reordered.join(path.delimiter);
 				changed = true;
 			}
 		}

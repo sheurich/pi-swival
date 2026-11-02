@@ -734,8 +734,14 @@ export async function prepareNativeAudit(
 		throw new Error(`Native timeoutMs must be an integer from 1 to ${maxTimeoutMs}.`);
 	}
 	if (!input.ANTHROPIC_API_KEY) {
-		const bridgedAnthropic = readNativeAnthropicToken(input.HOME!);
-		if (bridgedAnthropic) input.ANTHROPIC_API_KEY = bridgedAnthropic;
+		const authFilePath = path.join(input.HOME!, ".pi", "agent", "auth.json");
+		try {
+			await assertTrustedRuntimePath(authFilePath, protectedRoots);
+			const bridgedAnthropic = readNativeAnthropicToken(input.HOME!);
+			if (bridgedAnthropic) input.ANTHROPIC_API_KEY = bridgedAnthropic;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 	}
 	const preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	const routing: Record<string, unknown> = {};

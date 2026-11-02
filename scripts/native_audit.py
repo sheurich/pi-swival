@@ -45,7 +45,8 @@ OVERRIDE_KEYS = {
     "encryptSecrets": "encrypt_secrets",
 }
 ROUTING_KEYS = {
-    *OVERRIDE_KEYS.values(), "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
+    *{v for v in OVERRIDE_KEYS.values() if v != "encrypt_secrets"},
+    "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
     "project", "location", "max_context_tokens", "retries", "prompt_cache",
     "sanitize_thinking", "show_thinking", "decision_model", "decision_base_url",
     "decision_api_key", "model_routing", "routing_profiles",
