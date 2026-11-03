@@ -201,9 +201,9 @@ Consult installation guidance before execution. When it selects a specialist, us
 
 The profile name is illustrative, not bundled or reserved. With no specialist selected, native audit uses configured Swival provider/model defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not detect specialization by vendor/model names or probe access with repository content. Inherit effort unless the operator authorizes an override.
 
-Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Swival 1.9.1 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Native audit requires Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
+Native audit requires Swival 1.9.1, LiteLLM 1.106.5, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
 
 For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks auth-store metadata, never its contents. API-key/local routes forward only the selected credential interface and receive no ChatGPT directory grant. Required encryption, filtering, strict-read isolation, proxies, unknown policy, and incompatible routing fail closed. These native restrictions do not change ordinary delegation.
 
@@ -215,6 +215,27 @@ Native async is unsupported. Timeout, cancellation, and normal session shutdown 
 
 Completion requires matching committed scope, route/policy, native `phase=done`, mandatory/deep coverage, terminal verification, finding lineage, unique report/patch pairs, and complete diagnostics without lost expansion warnings. Exit zero or an ordinary answer is insufficient. Limits are 4096 entries, 8 MiB per file, and 64 MiB total. See [`auditing-with-swival`](skills/auditing-with-swival/SKILL.md) for options, artifacts, and migration. The retired custom audit orchestration has no aliases. Generic reviews remain separate from native completion evidence.
 
+#### Native-only tool: `swival-native-audit`
+
+`extensions/index.ts` also exports `registerNativeAuditTool(pi, options)`. It registers one tool, `swival-native-audit`, and nothing else: no general dispatch, no parallel or chain modes, no `action` controls, no catalogue. The package manifest never loads it; the default extension still registers only `swival-subagent`. Use it from an explicitly configured wrapper extension, in the same layout as the observation wrapper above, when a session must be able to run a native audit but must not receive general Swival delegation:
+
+```typescript
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerNativeAuditTool } from "pi-swival/extensions/index.ts";
+
+export default function (pi: ExtensionAPI) {
+  registerNativeAuditTool(pi, {});
+}
+```
+
+Disable the package's default extension as in the observation-wrapper setup (`"extensions": []` on the pi-swival package entry, with any direct `pi-swival/extensions` entries removed), so this wrapper is the only Swival extension entry point.
+
+The tool takes the same `audit` object as `swival-subagent`, required rather than optional, plus the native selection and bounding fields the native validator accepts: `profileOverride`, `modelOverride`, `providerOverride`, `reasoningEffortOverride`, `temperatureOverride`, `topPOverride`, `seedOverride`, `maxTurnsOverride`, `maxOutputTokensOverride`, `providerTimeoutOverride`, `maxInlineBytes`, `timeoutMs`, and `encryptSecretsOverride`. `encryptSecretsOverride` accepts only `false`; the schema declares it as the constant `false` and the validator rejects every other value, including `true`, `"false"`, `0`, and `null` on direct calls. Passing `false` admits a global `encrypt_secrets = true` Swival configuration for the audit, exactly as it does through `swival-subagent`: the run's inert configuration never enables encryption, project configuration, `SWIVAL_ENCRYPT_KEY`, filters, proxies, and every other preflight guard stay fail-closed, and no file, auth, or process grant changes. `maxInlineBytes` defaults to 65536 characters and truncates loudly with a marker pointing at the artifact evidence. `timeoutMs` defaults to the smaller of 15 minutes and the native ceiling (30 minutes unless the wrapper sets `nativeMaxTimeoutMs`) and may not exceed that ceiling. The schema declares no other properties and rejects undeclared ones. Execution rejects any undeclared field again before preparation, including `async: false`, so a direct call that bypasses schema validation cannot reach `agent`, `task`, `tasks`, `chain`, `action`, `id`, `cwd`, `agentScope`, `async`, network, sandbox, reviewer, output, or credential inputs. The audit root is always the session's working directory, which must be the repository root. The same preparation, committed snapshot, route preflight, AgentFS launch, timeout ceiling, cancellation, session-shutdown drain, artifact collection, and completion evidence apply; `artifactRoot`, `nativePython`, and `nativeMaxTimeoutMs` options are honored and no other option grants anything. The tool has no custom renderer; Pi shows its name and the returned text.
+
+Registering or activating `swival-native-audit` authorizes nothing by itself. Provider access, installation guidance, specialist selection, and the decision to send a repository to a provider remain separate operator decisions, exactly as for `swival-subagent`.
+
+Keep two lifetimes distinct. A consumer may run the Pi session that holds this tool as a headless child Pi in the background, for example from a subagent framework; that outer run is asynchronous only from the consumer's point of view. The inner native audit stays synchronous: the tool call returns only after verified shutdown of the owned process group, and native `async`, `status`, `resume`, and `interrupt` remain unsupported. Closing the outer session triggers the same shutdown drain as any other native run.
+
 ## Layout
 
 ```text
@@ -223,7 +244,7 @@ pi-swival/
 ├── README.md
 ├── LICENSE
 ├── extensions/
-│   ├── index.ts                # swival-subagent tool implementation
+│   ├── index.ts                # swival-subagent tool; registerNativeAuditTool for swival-native-audit
 │   ├── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
 │   └── native-audit.ts         # CLI preparation, committed snapshot, native evidence
 ├── agents/                     # five bundled swival agents (auto-discovered)
@@ -248,7 +269,7 @@ The harness covers parsing, dispatch, report acceptance, traces, snapshots, arti
 npm test
 ```
 
-The offline harness uses Node 22.19+ or Node 24, selected Pi peers, uv, and installed Python 3.13. Setup installs the pinned YAML runtime dependency, links peers, and syncs the hash-locked Swival 1.0.46/LiteLLM 1.103.4 fixture into ignored `tests/.venv`. Run setup directly, outside npm's lifecycle. Tests and typechecking never install dependencies. The peer-loader, locks, and typecheck setup are shared test prerequisites; ordinary runtime maintenance changes are not included.
+The offline harness uses Node 22.19+ or Node 24, selected Pi peers, uv, and installed Python 3.13. Setup installs the pinned YAML runtime dependency, links peers, and syncs the hash-locked Swival 1.9.1/LiteLLM 1.106.5 fixture into ignored `tests/.venv`. Run setup directly, outside npm's lifecycle. Tests and typechecking never install dependencies. The peer-loader, locks, and typecheck setup are shared test prerequisites; ordinary runtime maintenance changes are not included.
 
 From the package root:
 

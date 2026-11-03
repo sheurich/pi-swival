@@ -94,6 +94,7 @@ class NativeEntryTests(unittest.TestCase):
             "--oneshot-commands", "--no-sandbox-auto-session", "--no-instructions",
             "--no-skills", "--no-metaskills", "--no-mcp", "--no-a2a", "--no-subagents",
             "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+            "--no-web-search", "--no-model-routing", "--no-decisions",
             *[item for key, value in self.routing.items() for item in
               ["--" + bridge.OVERRIDE_KEYS.get(key, key).replace("_", "-"), str(value)]],
             "--report", str(self.repo / "native-cli-report.json"), "--", command,
@@ -161,7 +162,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_released_tool_and_isolated_loop_denials(self):
         session = Session(base_dir=str(self.repo), files="some", commands="none",
-            network="provider-only",
+            network="provider-only", web_search=False,
             no_instructions=True, no_skills=True, memory=False, history=False,
                 subagents=False, lifecycle_enabled=False)
         with patch.object(agent, "resolve_provider", return_value=("gpt-offline", None, None,
@@ -175,6 +176,8 @@ class NativeEntryTests(unittest.TestCase):
             network_mode=None)
         self.assertEqual(isolated["files_mode"], "some")
         self.assertEqual(isolated["network_mode"], "provider-only")
+        self.assertIsNone(context.loop_kwargs["web_search_policy"])
+        self.assertIsNone(isolated["web_search_policy"])
         self.assertFalse(isolated["shell_allowed"])
         self.assertEqual(isolated["command_policy"].mode, "none")
         with patch.object(subprocess, "Popen",
@@ -182,10 +185,12 @@ class NativeEntryTests(unittest.TestCase):
             for name, args in [("run_command", {"command": ["id"]}), ("run_python",
                 {"code": "print(42)"}),
                                ("run_shell_command", {"command": "id"}), ("fetch_url",
-                                   {"url": "https://offline.invalid"})]:
-                result = tools.dispatch(name, args, str(self.repo), **{k: v for k,
-                    v in isolated.items() if k != "base_dir"})
-                self.assertTrue(result.startswith("error:"), name)
+                                   {"url": "https://offline.invalid"}), ("web_search",
+                                       {"query": "offline"})]:
+                for loop_kwargs in (context.loop_kwargs, isolated):
+                    result = tools.dispatch(name, args, str(self.repo), **{k: v for k,
+                        v in loop_kwargs.items() if k != "base_dir"})
+                    self.assertTrue(result.startswith("error:"), name)
 
     def test_chatgpt_not_found_never_replaces_model(self):
         self.assertGreater(len(set(agent._list_server_models("chatgpt", None, None))), 1)
@@ -223,7 +228,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_configured_defaults_and_specialist_precedence(self):
         self.write_config('provider="openrouter"\nmodel="example/default"\n'
-            'active_profile="ordinary"\nmax_context_tokens=128000\n'
+            'active_profile="ordinary"\nmax_context_tokens=128000\nweb_search=false\n'
             '[profiles.ordinary]\nprovider="chatgpt"\nmodel="chatgpt/gpt-active"\n'
             '[profiles.specialist]\nprovider="openrouter"\nmodel="example/specialist"\n'
             'reasoning_effort="high"\n')
@@ -294,6 +299,14 @@ class NativeEntryTests(unittest.TestCase):
             ('provider="openrouter"\nmodel="openrouter/auto"', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
             ('provider="openrouter"\nmodel="openrouter/openrouter/auto:floor"',
                 {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\nmodel_routing=true', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\nrouting_profiles=["test"]\n[profiles.test]\n' + chatgpt,
+                {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_model="typesafe/jev-latest"', {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_base_url="http://127.0.0.1:8000/v1"',
+                {}, "ROUTE_SELECTOR_UNSUPPORTED"),
+            (chatgpt + '\ndecision_api_key="synthetic-secret"',
+                {}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
             ('api_key="synthetic-secret"\n[profiles.test]\nprovider="openrouter"\nmodel="concrete"',
                 {"profile": "test"}, "CREDENTIAL_INTERFACE_UNSUPPORTED"),
             ('base_url="https://offline.invalid/v1"\n[profiles.test]\n' + chatgpt,
@@ -314,7 +327,8 @@ class NativeEntryTests(unittest.TestCase):
                 bridge.resolve_native_config(self.request())
 
     def test_nonpropagated_policy_fields_are_value_free(self):
-        for key, value in {"encrypt_secrets": "true", "llm_filter": '"synthetic-secret"',
+        for key, value in {"encrypt_secrets": "true", "web_search": "true",
+            "llm_filter": '"synthetic-secret"',
             "secret_shield": "true", "extra_body": '{ routing="synthetic-secret" }',
             "prompt_cache": "false", "sanitize_thinking": "true", "show_thinking": "true",
             "sandbox_strict_read": "true", "sandbox_session": '"synthetic-secret"',
@@ -560,7 +574,7 @@ class NativeEntryTests(unittest.TestCase):
             return httpx.Response(200, json=response)
         client = httpx.Client(transport=httpx.MockTransport(handler))
         self.addCleanup(client.close)
-        self.enterContext(patch.object(authenticator, "_get_httpx_client", return_value=client))
+        self.enterContext(patch.object(authenticator, "get_httpx_client", return_value=client))
         self.enterContext(patch.object(authenticator.time, "time", return_value=100))
         auth = authenticator.Authenticator()
         return auth, calls
@@ -593,7 +607,7 @@ class NativeEntryTests(unittest.TestCase):
         with self.assertRaises(authenticator.GetDeviceCodeError):
             auth.get_access_token()
         self.assertFalse(Path(auth.auth_file).exists())
-        with patch.object(authenticator, "_get_httpx_client", side_effect=KeyboardInterrupt):
+        with patch.object(authenticator, "get_httpx_client", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 auth.get_access_token()
 
@@ -899,6 +913,113 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_released_triage_promotion_preserves_full_deep_review(self):
         self.released_finding("# Synthetic source-only report\n", recovery="triage-promoted")
+
+    def test_anthropic_mythos_profile_admission_and_oauth_shim(self):
+        self.write_config(
+            'active_profile="vertex-gemini-flash"\nencrypt_secrets=false\n'
+            'web_search=false\n'
+            '[profiles.vertex-gemini-flash]\nprovider="geap"\nmodel="gemini-3.8-flash"\n'
+            'project="p"\nlocation="global"\n'
+            '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
+            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+            'reasoning_effort="high"\n'
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
+            route = bridge.resolve_native_config(
+                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+            )
+        self.assertEqual(route["provider"], "anthropic")
+        self.assertEqual(route["model"], "claude-mythos-5-1")
+        self.assertEqual(route["reasoningEffort"], "high")
+        self.assertEqual(route["options"]["max_context_tokens"], 1000000)
+
+        # Global encrypt_secrets=true remains rejected with POLICY_NOT_PROPAGATED unless encryptSecrets=False
+        self.write_config(
+            'encrypt_secrets=true\n'
+            '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
+            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+        )
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}), \
+             self.assertRaises(bridge.NativeAuditError) as raised:
+            bridge.resolve_native_config(
+                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+            )
+        self.assertEqual(raised.exception.reason, "POLICY_NOT_PROPAGATED")
+        self.assertEqual(raised.exception.field, "encrypt_secrets")
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
+            overridden = bridge.resolve_native_config(
+                {
+                    "source": str(self.repo),
+                    "routing": {"profile": "anthropic-claude-mythos", "encryptSecrets": False},
+                }
+            )
+        self.assertEqual(overridden["provider"], "anthropic")
+        self.assertIn("encryptSecrets", overridden["selection"]["explicitFields"])
+
+        shim_path = WORKTREE / "scripts" / "anthropic_oauth_shim" / "sitecustomize.py"
+        shim_spec = importlib.util.spec_from_file_location("anthropic_oauth_shim", shim_path)
+        shim_mod = importlib.util.module_from_spec(shim_spec)
+        captured = {}
+        def fake_completion(*args, **kwargs):
+            captured.update(kwargs)
+            return "ok"
+        with patch.object(litellm, "completion", side_effect=fake_completion):
+            shim_spec.loader.exec_module(shim_mod)
+            litellm.completion(
+                model="anthropic/claude-mythos-5-1",
+                api_key="sk-ant-oat01-synthetic",
+                messages=[{"role": "system", "content": "Audit instructions"}],
+                extra_headers={"User-Agent": "swival/1.9.1"},
+            )
+        self.assertEqual(captured["extra_headers"]["User-Agent"], "claude-cli/2.1.280")
+        self.assertEqual(captured["extra_headers"]["x-app"], "cli")
+        self.assertIn("claude-code-20250219", captured["extra_headers"]["anthropic-beta"])
+        self.assertIn("oauth-2025-04-20", captured["extra_headers"]["anthropic-beta"])
+        self.assertEqual(
+            captured["messages"][0]["content"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude.",
+        )
+        self.assertEqual(captured["messages"][0]["content"][1]["text"], "Audit instructions")
+
+        # Verify shim disables get_valid_models and Swival NotFound model replacement
+        self.assertEqual(
+            litellm.get_valid_models(
+                check_provider_endpoint=True,
+                custom_llm_provider="anthropic",
+                api_key="sk-ant-oat01-synthetic",
+            ),
+            [],
+        )
+        self.assertEqual(
+            agent._list_server_models("anthropic", None, "sk-ant-oat01-synthetic"),
+            [],
+        )
+        failure = litellm.NotFoundError(
+            "synthetic missing anthropic model",
+            llm_provider="anthropic",
+            model="claude-mythos-5-1",
+        )
+        with patch.object(litellm, "completion", side_effect=failure) as completion:
+            with self.assertRaises(agent.AgentError):
+                agent.call_llm(
+                    None,
+                    "claude-mythos-5-1",
+                    [{"role": "user", "content": "synthetic"}],
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    api_key="sk-ant-oat01-synthetic",
+                    provider="anthropic",
+                    max_retries=1,
+                )
+        self.assertEqual(
+            {call.kwargs["model"] for call in completion.call_args_list},
+            {"anthropic/claude-mythos-5-1"},
+        )
+        self.assertFalse(agent._MODEL_AUTOFIX)
 
 
 def zero_finding_reply(captured):

@@ -20,13 +20,16 @@ const NATIVE_FIELDS = new Set([
 	"audit", "async", "timeoutMs", "maxInlineBytes", "profileOverride", "modelOverride",
 	"providerOverride", "reasoningEffortOverride", "temperatureOverride",
 	"topPOverride", "seedOverride", "maxTurnsOverride", "maxOutputTokensOverride",
-	"providerTimeoutOverride",
+	"providerTimeoutOverride", "encryptSecretsOverride",
 ]);
 
 export function validateNativeAuditParams(params: Record<string, unknown>): NativeAuditOptions {
 	if (params.async === true) throw new Error("Native async is unsupported; native audits are synchronous.");
 	for (const key of Object.keys(params)) {
 		if (!NATIVE_FIELDS.has(key)) throw new Error(`Native audit cannot be combined with ${key}.`);
+	}
+	if (params.encryptSecretsOverride !== undefined && params.encryptSecretsOverride !== false) {
+		throw new Error("Native audit cannot be combined with encryptSecretsOverride unless false.");
 	}
 	const audit = params.audit;
 	if (!audit || typeof audit !== "object" || Array.isArray(audit)) throw new Error("Native audit requires an audit object.");
@@ -61,6 +64,7 @@ export function buildNativeAuditArgs(snapshot: string, route: Record<string, any
 		"--commands", "none", "--files", "some", "--oneshot-commands",
 		"--no-sandbox-auto-session", "--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp",
 		"--no-a2a", "--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+		"--no-web-search", "--no-model-routing", "--no-decisions",
 		"--provider", route.provider, "--model", route.model, "--report", path.join(snapshot, "native-cli-report.json")];
 	if (route.endpoint != null) args.push("--base-url", route.endpoint);
 	if (route.reasoningEffort != null) args.push("--reasoning-effort", route.reasoningEffort);
@@ -182,13 +186,54 @@ export async function prepareNativeAuthStore(input: NodeJS.ProcessEnv,
 	return { directory, filename };
 }
 
+/** Read Pi's stored Anthropic OAuth or API key from ~/.pi/agent/auth.json safely. */
+function readNativeAnthropicToken(homeDir: string): string | undefined {
+	if (typeof fsSync.constants.O_NOFOLLOW !== "number") return undefined;
+	const authPath = path.join(homeDir, ".pi", "agent", "auth.json");
+	let fd: number | undefined;
+	try {
+		fd = fsSync.openSync(authPath, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const stat = fsSync.fstatSync(fd);
+		if (!stat.isFile() || stat.nlink !== 1 || stat.size <= 0 || stat.size > 65536) return undefined;
+		if (typeof process.getuid === "function" && stat.uid !== process.getuid()) return undefined;
+		if ((stat.mode & 0o022) !== 0) return undefined;
+		const buf = Buffer.alloc(stat.size);
+		const bytesRead = fsSync.readSync(fd, buf, 0, stat.size, 0);
+		const parsed = JSON.parse(buf.toString("utf-8", 0, bytesRead)) as Record<string, unknown>;
+		const antEntry = parsed?.["anthropic"] as Record<string, unknown> | undefined;
+		if (!antEntry || typeof antEntry !== "object") return undefined;
+		if (antEntry.type === "oauth") {
+			const expires = antEntry.expires;
+			if (typeof expires === "number" && Number.isFinite(expires) && expires <= Date.now()) return undefined;
+			const access = typeof antEntry.access === "string" ? antEntry.access.trim() : "";
+			return access.startsWith("sk-ant-oat") ? access : undefined;
+		}
+		if (antEntry.type === undefined || antEntry.type === "api_key") {
+			const key = typeof antEntry.key === "string" ? antEntry.key.trim() : "";
+			return key ? key : undefined;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try { fsSync.closeSync(fd); } catch { /* ignore */ }
+		}
+	}
+}
+
 /** Forward only the selected upstream credential interface, never execution hooks. */
-export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, provider?: string): NodeJS.ProcessEnv {
+export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, provider?: string,
+	anthropicShimDir?: string): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {};
 	const credentials = provider === "chatgpt" ? ["CHATGPT_TOKEN_DIR", "CHATGPT_AUTH_FILE", "CHATGPT_API_KEY"] :
-		provider === "openrouter" ? ["OPENROUTER_API_KEY"] : [];
+		provider === "openrouter" ? ["OPENROUTER_API_KEY"] :
+		provider === "anthropic" ? ["ANTHROPIC_API_KEY"] : [];
 	for (const key of ["HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", ...credentials]) {
 		if (input[key] !== undefined) env[key] = input[key];
+	}
+	if (provider === "anthropic" && anthropicShimDir) {
+		env.PYTHONPATH = anthropicShimDir;
 	}
 	return { ...env, PATH: searchPath, LITELLM_MODE: "PRODUCTION", LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1",
 		NO_COLOR: "1", TERM: "dumb", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -201,8 +246,10 @@ export function nativePreflightEnvironment(input: NodeJS.ProcessEnv, searchPath:
 	for (const key of Object.keys(input)) {
 		if (["http_proxy", "https_proxy", "all_proxy"].includes(key.toLowerCase()) ||
 			["USE_LITELLM_PROXY", "SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD",
-				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
-				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE"].includes(key)) {
+				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+				"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
+				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
+				"ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"].includes(key)) {
 			env[key] = input[key] ? "present" : "";
 		}
 	}
@@ -228,14 +275,14 @@ const routeIdentifier = (value: unknown, limit = 160): value is string => typeof
 const routeOptions = new Set(["max_output_tokens", "max_turns", "provider_timeout", "retries",
 	"temperature", "top_p", "seed", "max_context_tokens"]);
 const explicitRouteFields = new Set(["profile", "provider", "model", "reasoningEffort",
-	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout"]);
+	"temperature", "topP", "seed", "maxOutputTokens", "maxTurns", "providerTimeout", "encryptSecrets"]);
 const routeFailure = () => new Error("Native audit configuration preflight failed: invalid or unsupported metadata. No native worker/provider was started.");
 
 export function parseNativeRoute(value: unknown): NativeRoute {
 	if (!isPlainRecord(value) || value.version !== 2 ||
 		!hasOnlyFields(value, new Set(["version", "runtime", "provider", "model", "endpoint", "profile",
 			"reasoningEffort", "options", "selection", "reportIdentity"])) ||
-		!isDeepStrictEqual(value.runtime, { swival: "1.0.46", litellm: "1.103.4" }) ||
+		!isDeepStrictEqual(value.runtime, { swival: "1.9.1", litellm: "1.106.5" }) ||
 		!routeIdentifier(value.provider, 40) || !routeIdentifier(value.model) ||
 		!(value.profile === null || routeIdentifier(value.profile, 80)) ||
 		!(value.reasoningEffort === null || ["none", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value.reasoningEffort)) ||
@@ -265,7 +312,7 @@ export function parseNativeRoute(value: unknown): NativeRoute {
 		if (!routeOptions.has(key) || !(option === null || typeof option === "number" && Number.isFinite(option) && Math.abs(option) <= Number.MAX_SAFE_INTEGER)) throw routeFailure();
 		options[key] = option;
 	}
-	return { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: value.provider,
+	return { version: 2, runtime: { swival: "1.9.1", litellm: "1.106.5" }, provider: value.provider,
 		model: value.model, endpoint: value.endpoint, profile: value.profile, reasoningEffort: value.reasoningEffort,
 		options, selection: { profileSource: selection.profileSource, explicitFields: [...selection.explicitFields] },
 		reportIdentity: { provider: value.reportIdentity.provider, model: value.reportIdentity.model } };
@@ -280,7 +327,7 @@ const preflightReasons: Record<string, string> = {
 	ROUTE_SELECTOR_UNSUPPORTED: "Automatic or multi-model selection is unsupported; select a concrete model.",
 	COMMAND_EXECUTION_REQUIRED: "Selected provider requires command execution, incompatible with commands-none.",
 	CONFIG_INVALID: "Native configuration is invalid or contains unknown requirements.",
-	RUNTIME_UNSUPPORTED: "Native runtime is unsupported; require Swival 1.0.46 and LiteLLM 1.103.4.",
+	RUNTIME_UNSUPPORTED: "Native runtime is unsupported; require Swival 1.9.1 and LiteLLM 1.106.5.",
 	TRANSPORT_REQUIREMENT_UNSUPPORTED: "Unsupported native transport proxy requirements.",
 	ENDPOINT_REQUIREMENT_UNSUPPORTED: "Selected or ambient endpoint requirements are unsupported; no fallback.",
 	PROJECT_ROUTING_UNSUPPORTED: "Project-supplied native routing is unsupported.",
@@ -288,7 +335,8 @@ const preflightReasons: Record<string, string> = {
 const policyFields = new Set(["encrypt_secrets", "secret_shield", "llm_filter", "extra_body", "user_agent", "prompt_cache",
 	"sanitize_thinking", "show_thinking", "sandbox_strict_read", "sandbox_session", "lifecycle_fail_closed",
 	"reasoning_effort_all_phases", "retries_all_phases", "retries", "network", "files", "sandbox", "max_context_tokens",
-	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity"]);
+	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity",
+	"web_search"]);
 
 export function parseNativePreflight(output: string, success: boolean): { route: NativeRoute; scope?: unknown } {
 	let value: unknown;
@@ -685,6 +733,16 @@ export async function prepareNativeAudit(
 	if (!Number.isInteger(timeoutMs) || (timeoutMs as number) < 1 || (timeoutMs as number) > maxTimeoutMs) {
 		throw new Error(`Native timeoutMs must be an integer from 1 to ${maxTimeoutMs}.`);
 	}
+	if (!input.ANTHROPIC_API_KEY) {
+		const authFilePath = path.join(input.HOME!, ".pi", "agent", "auth.json");
+		try {
+			await assertTrustedRuntimePath(authFilePath, protectedRoots);
+			const bridgedAnthropic = readNativeAnthropicToken(input.HOME!);
+			if (bridgedAnthropic) input.ANTHROPIC_API_KEY = bridgedAnthropic;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 	const preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	const routing: Record<string, unknown> = {};
 	for (const field of NATIVE_FIELDS) {
@@ -697,7 +755,13 @@ export async function prepareNativeAudit(
 	};
 	const { route } = await preflight();
 	checkCancelled();
-	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider);
+	let anthropicShimDir: string | undefined;
+	if (route.provider === "anthropic") {
+		anthropicShimDir = await canonicalRuntimePath(path.join(scriptRoot, "anthropic_oauth_shim"));
+		await assertTrustedRuntimePath(anthropicShimDir, protectedRoots);
+		await assertTrustedRuntimePath(path.join(anthropicShimDir, "sitecustomize.py"), protectedRoots);
+	}
+	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider, anthropicShimDir);
 	const authStore = route.provider === "chatgpt" ? await prepareNativeAuthStore(input, [...protectedRoots, runDir]) : undefined;
 	if (authStore) {
 		env.CHATGPT_TOKEN_DIR = authStore.directory;
@@ -772,7 +836,7 @@ export async function prepareNativeAudit(
 	const completion = new Promise<NativeTerminal>((resolve, reject) => { settle = resolve; fail = reject; });
 	const closed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
 	const consumeLine = (line: string, index: number) => {
-		// LiteLLM 1.103.4 prints this fixed header before its device-code challenge.
+		// LiteLLM 1.106.5 prints this fixed header before its device-code challenge.
 		if (line.trim() === "Sign in with ChatGPT using device code:") {
 			cancel("Native ChatGPT login is required. Authenticate with upstream Swival outside Pi, then rerun the audit.");
 		}
@@ -887,7 +951,7 @@ const pythonAsciiString = (value: string) => JSON.stringify(value).replace(/[\u0
 	(character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 const pythonStringList = (value: string[]) => `[${value.map(pythonAsciiString).join(", ")}]`;
 
-/** Match Swival 1.0.46 `_finding_key` for the released FindingRecord schema only. */
+/** Match Swival 1.9.1 `_finding_key` for the released FindingRecord schema only. */
 export function nativeFindingKey(value: unknown): string | undefined {
 	const finding = releasedFinding(value);
 	if (!finding) return undefined;

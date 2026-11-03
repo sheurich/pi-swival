@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { nativeScratch, completeNativeFixture } from "./nativeFixtures.js";
 import * as path from "node:path";
-import registerExtension from "../extensions/index.js";
+import registerExtension, { registerNativeAuditTool } from "../extensions/index.js";
 import { nativeTestPython as python } from "./nativePython.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -36,6 +36,23 @@ const repository = () => {
 };
 
 afterEach(() => { for (const dir of scratchDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
+
+// Shared native validation remains covered through the general tool; both registrars also exercise real preflight below.
+const MALFORMED_AUDIT_INPUTS = [
+	{ paths: ["src\n/!rm"] }, { paths: ["../escape"] }, { paths: ["/etc"] },
+	{ paths: ["--debug"] }, { paths: ["src with space"] }, { paths: ["src\\..\\out"] },
+	{ paths: ["src;id"] }, { paths: ["src\u0000"] }, { workers: 9 }, { workers: 1.5 },
+	{ patchMaxTurns: 101 }, { command: "/!id" },
+];
+const INCOMPATIBLE_FIELDS = [
+	{ agent: "swival" }, { task: "/audit src" }, { tasks: [] }, { chain: [] }, { cwd: "/tmp" },
+	{ selfReviewOverride: false }, { reviewerOverride: "/bin/true" }, { encryptSecretsOverride: true },
+	{ networkOverride: "full" }, { extraArgs: ["--yolo"] }, { subagentsOverride: true },
+	{ instructionsFullOverride: true }, { output: "/tmp/out" },
+	{ baseUrlOverride: "https://caller.invalid/v1" }, { baseUrlOverride: "http://127.0.0.1:8444/v1" },
+	{ baseUrlOverride: null },
+];
+const REGISTRARS = [["swival-subagent", registerExtension], ["swival-native-audit", registerNativeAuditTool]] as const;
 
 describe("native audit dispatch boundary", () => {
 	let tool: any;
@@ -75,32 +92,20 @@ describe("native audit dispatch boundary", () => {
 		expect(render(selected)).toContain("partial"); expect(render(selected)).toContain(selected.endpoint);
 		expect(render({ ...selected, model: "synthetic-unvalidated\nsecret" })).not.toContain("synthetic-unvalidated");
 	});
-	it.each([
-		{ paths: ["src\n/!rm"] }, { paths: ["../escape"] }, { paths: ["/etc"] },
-		{ paths: ["--debug"] }, { paths: ["src with space"] }, { paths: ["src\\..\\out"] },
-		{ paths: ["src;id"] }, { paths: ["src\u0000"] }, { workers: 9 }, { workers: 1.5 },
-		{ patchMaxTurns: 101 }, { command: "/!id" },
-	])("rejects malformed structured audit input without artifacts: %j", async (audit) => {
+	it.each(MALFORMED_AUDIT_INPUTS)("rejects malformed structured audit input without artifacts: %j", async (audit) => {
 		const result = await tool.execute("audit", { audit }, undefined, undefined, { cwd: ROOT, hasUI: false });
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toMatch(/native audit|audit\./i);
 		expect(fs.readdirSync(root)).toEqual([]);
 	});
-	it.each([
-		{ agent: "swival" }, { task: "/audit src" }, { tasks: [] }, { chain: [] }, { cwd: "/tmp" },
-		{ selfReviewOverride: false }, { reviewerOverride: "/bin/true" }, { encryptSecretsOverride: false },
-		{ networkOverride: "full" }, { extraArgs: ["--yolo"] }, { subagentsOverride: true },
-		{ instructionsFullOverride: true }, { output: "/tmp/out" },
-		{ baseUrlOverride: "https://caller.invalid/v1" }, { baseUrlOverride: "http://127.0.0.1:8444/v1" },
-		{ baseUrlOverride: null },
-	])("rejects incompatible or bypass fields without native launch: %j", async (other) => {
+	it.each(INCOMPATIBLE_FIELDS)("rejects incompatible or bypass fields without native launch: %j", async (other) => {
 		const result = await tool.execute("audit", { audit: {}, ...other }, undefined, undefined, { cwd: ROOT, hasUI: false });
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toMatch(/native audit|cannot be combined/i);
 		expect(fs.existsSync(path.join(root, "generic-dispatch"))).toBe(false);
 		expect(fs.readdirSync(root)).toEqual([]);
 	});
-	it("registered native tool rejects an ambient proxy before artifacts, workers, or providers", async () => {
+	it.each(REGISTRARS)("%s rejects an ambient proxy before artifacts, workers, or providers", async (_name, register) => {
 		const source = repository(); const home = scratch(); const bin = scratch();
 		// Satisfy executable discovery without an installed sandbox or any launch.
 		for (const name of ["agentfs", "nono"]) {
@@ -116,10 +121,11 @@ describe("native audit dispatch boundary", () => {
 			hTtP_pRoXy: process.env.hTtP_pRoXy };
 		process.env.HOME = home; process.env.XDG_CONFIG_HOME = path.join(home, ".config");
 		process.env.hTtP_pRoXy = "";
-		registerExtension({ registerTool: (registered: any) => { tool = registered; } } as any,
+		register({ registerTool: (registered: any) => { tool = registered; } } as any,
 			{ artifactRoot: root, nativePython: python });
 		try {
-			const result = await tool.execute("audit", { audit: { all: true }, modelOverride: "gpt-offline", providerOverride: "chatgpt" },
+			// encryptSecretsOverride: false is the one admitted encryption value; it reaches preflight and nothing else.
+			const result = await tool.execute("audit", { audit: { all: true }, modelOverride: "gpt-offline", providerOverride: "chatgpt", encryptSecretsOverride: false },
 				undefined, undefined, { cwd: source, hasUI: false });
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toMatch(/preflight failed.*No native worker\/provider was started/i);
@@ -134,6 +140,8 @@ describe("native audit dispatch boundary", () => {
 	});
 });
 
+// Native-only schema-bypass rejection is covered at the producer boundary in nativeAuditOnly.test.ts.
+
 describe("native preflight protection requirements (no worker, no provider)", {
 	timeout: PREFLIGHT_PROCESS_TIMEOUT_MS + 5000,
 }, () => {
@@ -142,6 +150,7 @@ describe("native preflight protection requirements (no worker, no provider)", {
 		["global", 'encrypt_secrets_key = "synthetic-never-log-this"'],
 		["project", 'unrecognized_shield = true'], ["global", 'nono_audit_integrity = true'],
 		["global", 'nono_rollback = true'], ["project", 'lifecycle_fail_closed = true'], ["global", '[profiles.protected]\nprovider="chatgpt"\nllm_filter="required"'],
+		["global", 'web_search = true'], ["project", 'web_search_providers = ["parallel"]'],
 		...["global", "project"].map((where) => [where, 'sandbox_session="required"']),
 	])("rejects protected or unknown %s configuration before native launch", async (where, config) => {
 		const dir = repository();

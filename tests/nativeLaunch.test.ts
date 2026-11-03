@@ -13,7 +13,8 @@ describe("native CLI launch contract", () => {
 			{ paths: ["src/*"], all: true, workers: 2, patchMaxTurns: 5 });
 		expect(args.slice(-2)).toEqual(["--", "/audit src/* --all --workers 2 --patch-max-turns 5"]);
 		for (const flag of ["--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp", "--no-a2a",
-			"--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory", "--oneshot-commands"]) {
+			"--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+			"--no-web-search", "--no-model-routing", "--no-decisions", "--oneshot-commands"]) {
 			expect(args).toContain(flag);
 		}
 		expect(args).toEqual(expect.arrayContaining(["--sandbox", "builtin", "--network", "provider-only", "--commands", "none", "--files", "some"]));
@@ -59,13 +60,13 @@ describe("native CLI launch contract", () => {
 			expect(() => parse(output, false)).toThrow(/preflight|configuration/i);
 			try { parse(output, false); } catch (error) { expect(String(error)).not.toContain("synthetic-secret"); }
 		}
-		const route = { version: 2, runtime: { swival: "1.0.46", litellm: "1.103.4" }, provider: "openrouter", model: "example/concrete",
+		const route = { version: 2, runtime: { swival: "1.9.1", litellm: "1.106.5" }, provider: "openrouter", model: "example/concrete",
 			endpoint: null, profile: null, reasoningEffort: null, options: {}, selection: { profileSource: null, explicitFields: [] },
 			reportIdentity: { provider: "openrouter", model: "example/concrete" } };
 		expect(parse(JSON.stringify(route), true).route).toEqual(route);
 		for (const mutation of [{ version: 1 }, { endpoint: "http://user:synthetic-secret@offline.invalid" },
 			{ provider: "synthetic\nsecret" }, { options: { api_key: "synthetic-secret" } },
-			{ runtime: { swival: "unproved", litellm: "1.103.4" } }, { selection: { profileSource: "explicit", explicitFields: [] } },
+			{ runtime: { swival: "unproved", litellm: "1.106.5" } }, { selection: { profileSource: "explicit", explicitFields: [] } },
 			{ reportIdentity: { provider: "openrouter", model: "replacement" } },
 			{ selection: { profileSource: null, explicitFields: ["baseUrl"] } }]) {
 			expect(() => parse(JSON.stringify({ ...route, ...mutation }), true)).toThrow(/preflight/i);
@@ -82,5 +83,9 @@ describe("native CLI launch contract", () => {
 		expect(env).toMatchObject({ HOME: "/synthetic/home", PATH: "/trusted/bin", CHATGPT_TOKEN_DIR: "/synthetic/auth",
 			LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" });
 		for (const name of ["NODE_OPTIONS", "PYTHONPATH", "AGENTFS", "NONO_ACTIVE", "SWIVAL_AGENTFS_ACTIVE", "UNRELATED_TOKEN"]) expect(env[name]).toBeUndefined();
+		const antEnv = environment({ HOME: "/synthetic/home", PATH: "/trusted/bin", ANTHROPIC_API_KEY: "sk-ant-oat01-synthetic",
+			PYTHONPATH: "/hostile" }, "/trusted/bin", "anthropic", "/trusted/shim");
+		expect(antEnv).toMatchObject({ HOME: "/synthetic/home", PATH: "/trusted/bin", ANTHROPIC_API_KEY: "sk-ant-oat01-synthetic",
+			PYTHONPATH: "/trusted/shim" });
 	});
 });

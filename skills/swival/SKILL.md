@@ -228,8 +228,8 @@ Do not specify `model`, `provider`, or `baseUrl` in agent definitions. Model rou
 Each agent's frontmatter is independent. There is no base agent, no `extends:` field, and no implicit inheritance from the bundled set. When you fork a bundled agent into `~/.pi/agent/swival-agents/` or `.pi/swival-agents/`, copy the entire frontmatter; flags you omit revert to the schema default, which is rarely what the bundled agent intended. The trap to watch for:
 
 - `requiresReviewer: true` on `test-runner` is what makes the test-as-contract gate enforceable. Drop it in a fork and the agent will report completion without running the test script.
-- The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
-- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
+- The nested-invocation hygiene flags (`noLifecycle`, `noMcp`, `noA2a`, `noWebSearch`, `noHistory`, `noContinue`, `noMemory`, `noSubagents`) default to `true` for every agent unless the frontmatter sets them to `false`. The dispatcher enforces `--no-subagents` by default to prevent unbounded subagent recursion. Do not rely on schema defaults, restate the flags you want.
+- Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true` and `noWebSearch: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
 - A project-scope agent that shadows a bundled or user-scope agent name cannot unset `requiresReviewer: true` inherited from the shadowed name — the dispatcher forces it back to `true` so a repo-controlled file cannot impersonate `test-runner` (or any other reviewer-gated name) to silently drop its test-as-contract gate.
 
 When overriding a bundled agent name from the user scope, diff your frontmatter against the bundled definition and ensure every semantically-load-bearing flag is preserved:
@@ -402,7 +402,7 @@ AgentFS fan-out on a shared directory requires `noSandboxAutoSession: true` on t
 
 ## Native source-only audit
 
-Use the explicit `audit` API from Pi's configured Git repository root. Read `auditing-with-swival` for scope, routing, and completion rules. It invokes the upstream AgentFS CLI on an independent committed snapshot. Required versions are Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, and AgentFS 0.6.4, with upstream's nono profile installed. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified.
+Use the explicit `audit` API from Pi's configured Git repository root. Read `auditing-with-swival` for scope, routing, and completion rules. It invokes the upstream AgentFS CLI on an independent committed snapshot. Required versions are Swival 1.9.1, LiteLLM 1.106.5, Python 3.13+, and AgentFS 0.6.4, with upstream's nono profile installed. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified.
 
 ```json
 {"audit":{"all":true}}
@@ -416,13 +416,13 @@ Consult installation guidance before execution. With no specialist selected, nat
 
 The name is illustrative, not bundled. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist. Do not infer specialization from vendor/model names or send source to probe access. Inherit effort unless an override is explicitly authorized.
 
-Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Swival 1.9.1 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
 Native support requires Swival-supported routes meeting the pinned policy contract. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint with its own key and context limit. Dynamic model-list adapters are refused because upstream can replace a model after NotFound. Other routes fail for concrete missing capabilities or credential authority, not unfamiliar vendors. Ordinary delegation retains its existing providers and behavior.
 
 For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. A device-login challenge cancels without returning its contents. AgentFS grants runtime access to a dedicated auth-store directory inside HOME, never through Swival `--add-dir` or model-tool roots. The adapter checks metadata, never auth-store contents. API-key/local routes receive no ChatGPT auth grant. Required encryption/filtering or unsupported policy fails closed; never disable controls or substitute a route.
 
-Native async is unsupported. Timeout, cancellation, and normal session shutdown stop the live owned process group. After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Retain crash resources and never signal recovered PIDs or resume native work from disk.
+Native async is unsupported. Timeout, cancellation, and normal session shutdown stop the live owned process group. After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Retain crash resources and never signal recovered PIDs or resume native work from disk. An explicitly configured wrapper can register the native-only `swival-native-audit` tool instead of `swival-subagent`; it accepts the same `audit` object and native fields only (`encryptSecretsOverride` only as `false`, with the same fail-closed encryption, filter, environment, and project-configuration guards) and rejects dispatch, control, `cwd`, and `async` inputs before preparation. When such a session is a headless child Pi run in the background by its consumer, the outer run is the asynchronous unit; the inner native audit stays a synchronous tool call. See `auditing-with-swival`.
 
 The source-only verifier cannot run project commands, builds, tests, Python, fetch tools, or PoCs. Upstream allows write-through access to the disposable snapshot. Bounded direct collection requires verified shutdown. The original source/Git remain protected; host-read confidentiality and provider-process egress confinement are not guaranteed. Patches are proposals for manual review.
 
@@ -489,7 +489,7 @@ uv tool upgrade swival
 
 Before spawning, the extension runs a fast, non-blocking version preflight:
 
-- Recommended: Swival 1.0.45 or later. Releases between 1.0.44 and 1.0.45 produce an advisory upgrade notice.
+- Recommended: Swival 1.9.1 or later. Releases between 1.0.44 and 1.9.1 produce an advisory upgrade notice.
 - Minimum compatible: Swival 1.0.44 (enforces report schema v1 and subagent recursion bounds). Earlier releases (< 1.0.44) or unverified versions are refused before spawning.
 - Results are cached in memory for 60 seconds to avoid per-task probe overhead.
 

@@ -1,6 +1,6 @@
 ---
 name: auditing-with-swival
-description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent.
+description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent or the native-only swival-native-audit tool.
 ---
 
 # Auditing with Swival
@@ -12,7 +12,7 @@ Use the structured `audit` API from Pi at the target Git repository root. The ad
 - Confirm scope and the operator's provider and data boundaries before sending source to a provider.
 - Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
 - With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
-- Require Swival 1.0.46, LiteLLM 1.103.4, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
+- Require Swival 1.9.1, LiteLLM 1.106.5, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Other versions fail closed. The real bootstrap/export gate passed on macOS; Linux remains unverified.
 - Configuration inspection does not prove account access. Do not send repository content to probe specialist access. There is no fallback to another model, provider, endpoint, account, profile, or sandbox.
 
 ## Dispatch
@@ -31,7 +31,7 @@ Select an existing operator-configured specialist profile when installation poli
 
 `security-specialist` is illustrative, not bundled or reserved. Explicit profile selection outranks `active_profile`. Authorized explicit field overrides outrank profile values. Do not add provider/model/effort overrides automatically; inherit selected settings. Reject conflicts with installation policy before execution. Ordinary inherited effort is best-effort; auxiliary phases can omit it.
 
-Swival 1.0.46 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Swival 1.9.1 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
 ## Route capabilities
 
@@ -54,6 +54,8 @@ For ChatGPT only, standard upstream ChatGPT authentication permits login, token 
 `paths` accepts at most 64 relative path/glob tokens without spaces, traversal, shell syntax, or host paths. Omit it for the auditable committed scope. `all` requires deep review of every selected file. `workers` is 1–8 pipeline workers, not autonomous subagents. `patchMaxTurns` is 1–100 turns per patch loop. The default timeout is 15 minutes; the default operator ceiling is 30 minutes.
 
 Native async is unsupported. Do not combine `audit` with `task`, `agent`, `cwd`, parallel/chain dispatch, output routing, reviewer settings, extra arguments, or permission overrides. Ordinary freeform delegation is separate and does not attest native completion. Do not use freeform slash-command tasks as a substitute.
+
+A session may expose `swival-native-audit` instead of `swival-subagent`. It takes the same `audit` object and the same native selection and bounding fields, nothing else; general dispatch, control, `cwd`, and `async` inputs are rejected before preparation. Its `encryptSecretsOverride` accepts only `false`, which admits a global `encrypt_secrets = true` configuration for the audit as `swival-subagent` already does; every other value is rejected, the inert run configuration never enables encryption, and project configuration, `SWIVAL_ENCRYPT_KEY`, filter, and proxy guards stay fail-closed. Scope, routing, boundary, lifetime, and completion rules below are identical. If that session is itself a headless child Pi run in the background by its consumer, only the outer run is asynchronous; the inner native audit remains a synchronous tool call that returns after verified shutdown. The tool's presence grants no audit authorization.
 
 ## Boundary
 

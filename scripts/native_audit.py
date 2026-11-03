@@ -36,29 +36,35 @@ class NativeAuditError(Exception):
         return result
 
 
-RUNTIME_VERSIONS = {"swival": "1.0.46", "litellm": "1.103.4"}
+RUNTIME_VERSIONS = {"swival": "1.9.1", "litellm": "1.106.5"}
 OVERRIDE_KEYS = {
     "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
     "topP": "top_p", "seed": "seed", "maxOutputTokens": "max_output_tokens",
     "maxTurns": "max_turns", "providerTimeout": "provider_timeout",
+    "encryptSecrets": "encrypt_secrets",
 }
 ROUTING_KEYS = {
-    *OVERRIDE_KEYS.values(), "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
+    *{v for v in OVERRIDE_KEYS.values() if v != "encrypt_secrets"},
+    "base_url", "api_key", "user_agent", "extra_body", "aws_profile",
     "project", "location", "max_context_tokens", "retries", "prompt_cache",
-    "sanitize_thinking", "show_thinking",
+    "sanitize_thinking", "show_thinking", "decision_model", "decision_base_url",
+    "decision_api_key", "model_routing", "routing_profiles",
 }
 OPTION_KEYS = ("max_output_tokens", "max_turns", "provider_timeout", "retries",
                "temperature", "top_p", "seed", "max_context_tokens")
 # Credential forwarding is an authority boundary, not a provider implementation.
-CREDENTIAL_ENV = {"openrouter": "OPENROUTER_API_KEY"}
+CREDENTIAL_ENV = {"openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 AMBIENT_ENDPOINTS = {"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE", "OPENAI_API_BASE",
-                     "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE"}
+                     "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
+                     "ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"}
 
 
 def _unpropagated_policy(key, value):
     if key.startswith("encrypt_secrets") and value is not False:
         return "encrypt_secrets"
+    if (key == "web_search" and value is not False) or (key == "web_search_providers" and value):
+        return "web_search"
     if key in {"llm_filter", "secret_shield", "extra_body", "user_agent"}:
         return key if value not in (None, False, "", {}) else None
     if (key == "prompt_cache" and value is False) or (key == "retries" and value != 5):
@@ -75,6 +81,10 @@ def _requirements(raw):
         field = _unpropagated_policy(key, value)
         if field:
             raise NativeAuditError("POLICY_NOT_PROPAGATED", field)
+        if key == "decision_api_key" and value is not None:
+            raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED", "api_key")
+        if key in {"model_routing", "routing_profiles", "decision_model", "decision_base_url"} and value:
+            raise NativeAuditError("ROUTE_SELECTOR_UNSUPPORTED")
         if (key in {"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain",
                     "nono_network_profile", "nono_credential", "nono_audit_integrity"}
                 and value) or (
@@ -84,7 +94,7 @@ def _requirements(raw):
             _requirements(value)
 
 
-def _scan_config(filename, *, project=False):
+def _scan_config(filename, *, project=False, allow_encrypt_secrets_override=False):
     """Bounded metadata/TOML scan before released loading; no auth-store reads."""
     from swival import config as config_module
     if not filename.exists():
@@ -96,7 +106,10 @@ def _scan_config(filename, *, project=False):
     except Exception as exc:
         raise NativeAuditError("CONFIG_INVALID") from exc
     # Upstream still validates every profile's schema; selected policy is checked later.
-    _requirements({key: value for key, value in raw.items() if key != "profiles"})
+    _requirements({key: value for key, value in raw.items()
+                   if key != "profiles" and not (
+                       not project and allow_encrypt_secrets_override
+                       and key == "encrypt_secrets" and value is True)})
     known = set(config_module.CONFIG_KEYS) | {
         "profiles", "active_profile", "audit", "mcp_servers", "a2a_servers", "serve_skills",
     }
@@ -139,6 +152,11 @@ def _parse_route(parser, values):
     argv = []
     for key, value in values.items():
         if value is not None:
+            if key == "encrypt_secrets":
+                if not isinstance(value, bool):
+                    raise NativeAuditError("CONFIG_INVALID")
+                argv.append("--encrypt-secrets" if value else "--no-encrypt-secrets")
+                continue
             if not isinstance(value, (str, int, float)) or isinstance(value, bool):
                 raise NativeAuditError("CONFIG_INVALID")
             argv.append("--" + key.replace("_", "-") + "=" + str(value))
@@ -167,7 +185,10 @@ def resolve_native_config(request):
         raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
     from swival import config as config_module
     from swival.agent import build_parser
-    raw = _scan_config(config_module.global_config_dir() / "config.toml")
+    raw = _scan_config(
+        config_module.global_config_dir() / "config.toml",
+        allow_encrypt_secrets_override=routing.get("encryptSecrets") is False,
+    )
     source = Path(request["source"]).resolve()
     _scan_config(source / "swival.toml", project=True)
     profile = routing.get("profile", raw.get("active_profile"))
@@ -201,7 +222,7 @@ def resolve_native_config(request):
 
 
 def _credential_capability(args):
-    if args.api_key is not None:
+    if args.api_key is not None or getattr(args, "decision_api_key", None) is not None:
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED", "api_key")
     if any(getattr(args, key, None) for key in ("aws_profile", "gcp_project", "location")):
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
@@ -226,6 +247,8 @@ def _admit_route(args, profile, routing):
         raise NativeAuditError("ROUTE_SELECTOR_UNSUPPORTED")
     if provider == "chatgpt" and endpoint not in (None, "https://chatgpt.com/backend-api/codex"):
         raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
+    if provider == "anthropic" and endpoint is not None:
+        raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
     if endpoint and urlsplit(endpoint).hostname in ("localhost", "127.0.0.1", "::1"):
         if args.max_context_tokens is None:
             raise NativeAuditError("POLICY_NOT_PROPAGATED", "max_context_tokens")
@@ -236,11 +259,15 @@ def _admit_route(args, profile, routing):
     import litellm
     from litellm.types.utils import LlmProviders
     from litellm.utils import ProviderConfigManager
-    # Pinned adapters without a dynamic models handler must keep a multi-model
+    # Pinned adapters without a dynamic models handler must not expose a singleton
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
+    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.106.5) return None
+    # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
+    # For anthropic, endpoint is None and the runtime shim disables get_models.
     adapter = LlmProviders(provider)
-    if (ProviderConfigManager.get_provider_model_info(None, adapter) is not None
-            or len(set(litellm.models_by_provider.get(provider, []))) < 2):
+    if ((provider != "anthropic"
+            and ProviderConfigManager.get_provider_model_info(None, adapter) is not None)
+            or len(set(litellm.models_by_provider.get(provider, []))) == 1):
         raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
     return {"version": 2, "runtime": RUNTIME_VERSIONS, "provider": provider, "model": model,
             "reasoningEffort": args.reasoning_effort, "options": options, "profile": profile,
