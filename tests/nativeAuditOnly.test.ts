@@ -36,6 +36,11 @@ const packageRoot = path.resolve(import.meta.dirname, "..");
 // The selected installed Pi package, as the smoke loader and lifecycle tests use it.
 const piPackage = process.env.PI_CODING_AGENT_PACKAGE
 	?? fs.realpathSync(path.join(packageRoot, "tests", "node_modules", "@earendil-works", "pi-coding-agent"));
+const { createJiti } = createRequire(path.join(piPackage, "package.json"))("jiti");
+function resolveHostDependency(host: string, specifier: string): string {
+	// Resolve from the selected host, not an assumed sibling or the test runner's peers.
+	return createJiti(path.join(host, "package.json"), { fsCache: false, moduleCache: false }).esmResolve(specifier);
+}
 
 const roots: string[] = [];
 afterEach(() => {
@@ -227,6 +232,20 @@ describe("registerNativeAuditTool", () => {
 });
 
 describe("registerNativeAuditTool through the installed Pi extension loader", () => {
+	it("resolves an import-only dependency nested under the selected host", () => {
+		const root = nativeScratch("native-only-nested-host-"); roots.push(root);
+		const host = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+		const dependency = path.join(host, "node_modules", "@earendil-works", "pi-ai");
+		fs.mkdirSync(path.join(dependency, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", type: "module" }));
+		fs.writeFileSync(path.join(dependency, "package.json"), JSON.stringify({
+			name: "@earendil-works/pi-ai", type: "module", exports: { ".": { import: "./dist/index.js" } },
+		}));
+		const entry = path.join(dependency, "dist", "index.js");
+		fs.writeFileSync(entry, "export const selectedHost = true;\n");
+		expect(resolveHostDependency(host, "@earendil-works/pi-ai")).toBe(pathToFileURL(entry).href);
+	});
+
 	it("loads the README wrapper offline, registers only swival-native-audit, and enforces the schema", async () => {
 		const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "swival-native-only-load-")));
 		const cwd = path.join(root, "project");
@@ -283,7 +302,7 @@ describe("registerNativeAuditTool through the installed Pi extension loader", ()
 			expect(Object.keys(definition.parameters.properties).sort()).toEqual([...NATIVE_SCHEMA_KEYS].sort());
 
 			// The host validator from the same installation: what a model call passes through before execute.
-			const ai = await import(pathToFileURL(path.join(piPackage, "..", "pi-ai", "dist", "index.js")).href) as
+			const ai = await import(resolveHostDependency(piPackage, "@earendil-works/pi-ai")) as
 				typeof import("@earendil-works/pi-ai");
 			const tool = { name: definition.name, description: definition.description, parameters: definition.parameters };
 			const validate = (args: Record<string, unknown>) => {
