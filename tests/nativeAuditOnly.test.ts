@@ -33,9 +33,12 @@ const NATIVE_SCHEMA_KEYS = [
 	"maxInlineBytes", "timeoutMs", "encryptSecretsOverride",
 ];
 const packageRoot = path.resolve(import.meta.dirname, "..");
+function resolveHostPackage(selection: string): string {
+	return fs.realpathSync(path.resolve(selection));
+}
 // The selected installed Pi package, as the smoke loader and lifecycle tests use it.
-const piPackage = process.env.PI_CODING_AGENT_PACKAGE
-	?? fs.realpathSync(path.join(packageRoot, "tests", "node_modules", "@earendil-works", "pi-coding-agent"));
+const piPackage = resolveHostPackage(process.env.PI_CODING_AGENT_PACKAGE
+	?? path.join(packageRoot, "tests", "node_modules", "@earendil-works", "pi-coding-agent"));
 const { createJiti } = createRequire(path.join(piPackage, "package.json"))("jiti");
 function resolveHostDependency(host: string, specifier: string): string {
 	// Resolve from the selected host, not an assumed sibling or the test runner's peers.
@@ -232,6 +235,26 @@ describe("registerNativeAuditTool", () => {
 });
 
 describe("registerNativeAuditTool through the installed Pi extension loader", () => {
+	it("canonicalizes a relative symlink selection before resolving a hoisted dependency", () => {
+		const root = nativeScratch("native-only-aliased-host-"); roots.push(root);
+		const host = path.join(root, "installation", "node_modules", "@earendil-works", "pi-coding-agent");
+		const dependency = path.join(root, "installation", "node_modules", "@earendil-works", "pi-ai");
+		fs.mkdirSync(host, { recursive: true });
+		fs.mkdirSync(path.join(dependency, "dist"), { recursive: true });
+		fs.writeFileSync(path.join(host, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", type: "module" }));
+		fs.writeFileSync(path.join(dependency, "package.json"), JSON.stringify({
+			name: "@earendil-works/pi-ai", type: "module", exports: { ".": { import: "./dist/index.js" } },
+		}));
+		const entry = path.join(dependency, "dist", "index.js");
+		fs.writeFileSync(entry, "export const selectedHost = true;\n");
+		const alias = path.join(root, "selected-host");
+		fs.symlinkSync(host, alias, "dir");
+		const selected = resolveHostPackage(path.relative(process.cwd(), alias));
+		expect(selected).toBe(fs.realpathSync(host));
+		expect(() => createRequire(path.join(selected, "package.json"))).not.toThrow();
+		expect(resolveHostDependency(selected, "@earendil-works/pi-ai")).toBe(pathToFileURL(entry).href);
+	});
+
 	it("resolves an import-only dependency nested under the selected host", () => {
 		const root = nativeScratch("native-only-nested-host-"); roots.push(root);
 		const host = path.join(root, "node_modules", "@earendil-works", "pi-coding-agent");
