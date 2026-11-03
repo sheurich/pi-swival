@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
-import registerExtension from "../extensions/index.js";
+import registerExtension, { registerNativeAuditTool } from "../extensions/index.js";
 import { inspectNativeAudit, prepareNativeAudit, type NativeAuditLaunch, type NativeTerminal } from "../extensions/native-audit.js";
 import { nativeScratch } from "./nativeFixtures.js";
 
@@ -28,11 +28,13 @@ afterEach(() => {
 	vi.resetAllMocks();
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
-function fixture() {
+// Both registrars own native runs through the same session drain.
+const registrars = [["swival-subagent", registerExtension], ["swival-native-audit", registerNativeAuditTool]] as const;
+function fixture(register: (typeof registrars)[number][1]) {
 	const root = nativeScratch("native-shutdown-"); roots.push(root);
 	let tool: any;
 	let shutdown!: () => Promise<void>;
-	registerExtension({ registerTool: (value: unknown) => { tool = value; },
+	register({ registerTool: (value: unknown) => { tool = value; },
 		on: (event: string, handler: () => Promise<void>) => { if (event === "session_shutdown") shutdown = handler; },
 	} as any, { artifactRoot: root });
 	return { shutdown, execute: () => tool.execute("shutdown-test", { audit: {} }, undefined, undefined, { cwd: root, hasUI: false }) as Promise<any> };
@@ -47,11 +49,11 @@ function liveRun() {
 }
 const completed = { exitCode: 0, shutdown: "verified", boundary: "agentfs-cli", exitedAt: new Date().toISOString() } as NativeTerminal;
 
-describe("native preparation session shutdown", () => {
+describe.each(registrars)("native preparation session shutdown via %s", (_name, register) => {
 	it("aborts and awaits deferred preparation rejection on repeated shutdown", async () => {
 		const preparation = deferred<NativeAuditLaunch>();
 		vi.mocked(prepareNativeAudit).mockReturnValue(preparation.promise);
-		const f = fixture(); const execution = f.execute();
+		const f = fixture(register); const execution = f.execute();
 		const signal = vi.mocked(prepareNativeAudit).mock.calls[0][7]!;
 		const first = f.shutdown(); const second = f.shutdown();
 		const firstState = observed(first); const secondState = observed(second);
@@ -73,7 +75,7 @@ describe("native preparation session shutdown", () => {
 		const inspection = deferred<Awaited<ReturnType<typeof inspectNativeAudit>>>();
 		vi.mocked(prepareNativeAudit).mockReturnValue(preparation.promise);
 		vi.mocked(inspectNativeAudit).mockReturnValue(inspection.promise);
-		const f = fixture(); const execution = f.execute();
+		const f = fixture(register); const execution = f.execute();
 		const shutdown = f.shutdown(); const state = observed(shutdown);
 		preparation.resolve(live.run); await turn();
 		const beforeCompletion = state.settled;
@@ -91,7 +93,7 @@ describe("native preparation session shutdown", () => {
 		const rejecting = deferred<NativeAuditLaunch>(); const preparing = deferred<NativeAuditLaunch>();
 		vi.mocked(prepareNativeAudit).mockResolvedValueOnce(active.run).mockReturnValueOnce(rejecting.promise).mockReturnValueOnce(preparing.promise);
 		vi.mocked(inspectNativeAudit).mockResolvedValue({ status: "failed", error: "cancelled" });
-		const f = fixture(); const executions = [f.execute(), f.execute(), f.execute()];
+		const f = fixture(register); const executions = [f.execute(), f.execute(), f.execute()];
 		await turn();
 		const shutdowns = [f.shutdown(), f.shutdown()]; const states = shutdowns.map(observed);
 		rejecting.reject(new Error("preparation failed")); active.terminal.reject(new Error("finalization failed"));
@@ -107,7 +109,7 @@ describe("native preparation session shutdown", () => {
 	it("cancels preparation admitted while shutdown is draining, but permits later session reuse", async () => {
 		const first = deferred<NativeAuditLaunch>(); const second = deferred<NativeAuditLaunch>();
 		vi.mocked(prepareNativeAudit).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-		const f = fixture(); const a = f.execute(); const shutdown = f.shutdown();
+		const f = fixture(register); const a = f.execute(); const shutdown = f.shutdown();
 		const b = f.execute();
 		const signal = vi.mocked(prepareNativeAudit).mock.calls[1][7]!;
 		const aborted = signal.aborted;

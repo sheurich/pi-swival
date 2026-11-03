@@ -232,6 +232,28 @@ describe("native audit documentation and migration", () => {
 	it("retires custom audit agents and contracts", () => {
 		for (const file of documentationFiles()) expect(read(file), file).not.toMatch(/audit-worker|security-recon|security-consolidator|recon-contract|consolidation-contract/);
 	});
+	it.each(["README.md", "skills/swival/SKILL.md", "skills/auditing-with-swival/SKILL.md"])(
+		"%s documents the native-only tool and keeps outer headless async distinct from the synchronous inner audit", (file) => {
+			const doc = read(join(PACKAGE_ROOT, file));
+			expect(doc).toContain("`swival-native-audit`");
+			expect(doc).toMatch(/headless child Pi[^\n]{0,120}background/i);
+			expect(doc).toMatch(/outer run[^\n]{0,80}asynchronous/i);
+			expect(doc).toMatch(/inner native audit[^\n]{0,60}synchronous/i);
+			expect(doc).toMatch(/reject[^\n]{0,120}before preparation/i);
+			expect(doc).toMatch(/`encryptSecretsOverride`[^\n]{0,40}only[^\n]{0,10}`false`/);
+			expect(doc).toMatch(/fail-closed/);
+		});
+	it("README documents registerNativeAuditTool as an explicit, non-default registrar without authorization claims", () => {
+		const doc = read(join(PACKAGE_ROOT, "README.md"));
+		expect(doc).toContain("registerNativeAuditTool(pi, options)");
+		expect(doc).toMatch(/manifest never loads it/);
+		expect(doc).toMatch(/default extension still registers only `swival-subagent`/);
+		expect(doc).toMatch(/authorizes nothing by itself/);
+		expect(doc).toMatch(/`async: false`/);
+		expect(doc).toMatch(/no file, auth, or process grant changes/);
+		expect(doc).toMatch(/`maxInlineBytes` defaults to 65536 characters/);
+		expect(doc).toMatch(/`timeoutMs` defaults to the smaller of 15 minutes and the native ceiling/);
+	});
 });
 
 describe("swival-worker-briefs points at the bundled self-review-worker", () => {

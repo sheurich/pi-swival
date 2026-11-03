@@ -3363,13 +3363,57 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
+const NativeAuditScope = Type.Object({
+	paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs, not commands." })),
+	all: Type.Optional(Type.Boolean({ description: "Deep-review every file in scope." })),
+	workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+	patchMaxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+}, { additionalProperties: false, description: "Synchronous, source-only native audit of repository-root cwd's committed tree. No async, task, agent, cwd or permission overrides." });
+
+// Native selection and bounding fields accepted by validateNativeAuditParams.
+// Both tool schemas reference these same objects, so the general tool's
+// declaration is unchanged and the native-only tool cannot drift from it.
+const NativeAuditFields = {
+	modelOverride: Type.Optional(
+		Type.String({
+			description:
+				"Override the exact model for this call. Prefer profileOverride; use this only when the user explicitly requests a one-off model.",
+		}),
+	),
+	profileOverride: Type.Optional(
+		Type.String({ description: "Override the agent's named Swival profile for this call, such as budget or frontier." }),
+	),
+	providerOverride: Type.Optional(Type.String({ description: "Override the agent's provider for this call." })),
+	maxTurnsOverride: Type.Optional(
+		Type.Number({
+			description:
+				"Override --max-turns for this call. Swival's default is 100 turns; lower this to bound runtime, raise for sweep-style refactors.",
+		}),
+	),
+	maxOutputTokensOverride: Type.Optional(
+		Type.Number({ description: "Override --max-output-tokens for this call." }),
+	),
+	temperatureOverride: Type.Optional(Type.Number({ description: "Override --temperature for this call." })),
+	topPOverride: Type.Optional(Type.Number({ description: "Override --top-p for this call." })),
+	seedOverride: Type.Optional(Type.Number({ description: "Override --seed for this call." })),
+	reasoningEffortOverride: Type.Optional(
+		Type.String({ description: "Override --reasoning-effort for this call." }),
+	),
+	providerTimeoutOverride: Type.Optional(
+		Type.Number({ description: "Override --provider-timeout (seconds) for this call. Swival's default is 900." }),
+	),
+	maxInlineBytes: Type.Optional(
+		Type.Number({
+			minimum: 1,
+			description:
+				"Cap (in characters) on a task's finalOutput inlined into the tool-response content. Applies to single, chain, and parallel modes. When output exceeds the cap, the response shows the first maxInlineBytes characters followed by a [truncated N chars; full output at <artifactDir>] marker. Omit (default) to inline the full output — silent truncation is never the default. To avoid token growth entirely, pass `output: \"...\"` paths instead.",
+		}),
+	),
+	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock budget in milliseconds for the swival process. On expiry: SIGTERM, then SIGKILL after 5 seconds. No default; only enforced when set." })),
+};
+
 const SwivalParams = Type.Object({
-	audit: Type.Optional(Type.Object({
-		paths: Type.Optional(Type.Array(Type.String(), { maxItems: 64, description: "Relative committed paths/globs, not commands." })),
-		all: Type.Optional(Type.Boolean({ description: "Deep-review every file in scope." })),
-		workers: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
-		patchMaxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-	}, { additionalProperties: false, description: "Synchronous, source-only native audit of repository-root cwd's committed tree. No async, task, agent, cwd or permission overrides." })),
+	audit: Type.Optional(NativeAuditScope),
 	agent: Type.Optional(Type.String({ description: "Swival agent name (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -3383,16 +3427,9 @@ const SwivalParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the swival process (single mode)" })),
 
 	// Dispatch-time overrides (outrank agent frontmatter).
-	modelOverride: Type.Optional(
-		Type.String({
-			description:
-				"Override the exact model for this call. Prefer profileOverride; use this only when the user explicitly requests a one-off model.",
-		}),
-	),
-	profileOverride: Type.Optional(
-		Type.String({ description: "Override the agent's named Swival profile for this call, such as budget or frontier." }),
-	),
-	providerOverride: Type.Optional(Type.String({ description: "Override the agent's provider for this call." })),
+	modelOverride: NativeAuditFields.modelOverride,
+	profileOverride: NativeAuditFields.profileOverride,
+	providerOverride: NativeAuditFields.providerOverride,
 	baseUrlOverride: Type.Optional(
 		Type.String({ description: "Override the agent's base URL for this call." }),
 	),
@@ -3414,21 +3451,12 @@ const SwivalParams = Type.Object({
 	maxReviewRoundsOverride: Type.Optional(
 		Type.Number({ description: "Override --max-review-rounds for this call." }),
 	),
-	maxTurnsOverride: Type.Optional(
-		Type.Number({
-			description:
-				"Override --max-turns for this call. Swival's default is 100 turns; lower this to bound runtime, raise for sweep-style refactors.",
-		}),
-	),
-	maxOutputTokensOverride: Type.Optional(
-		Type.Number({ description: "Override --max-output-tokens for this call." }),
-	),
-	temperatureOverride: Type.Optional(Type.Number({ description: "Override --temperature for this call." })),
-	topPOverride: Type.Optional(Type.Number({ description: "Override --top-p for this call." })),
-	seedOverride: Type.Optional(Type.Number({ description: "Override --seed for this call." })),
-	reasoningEffortOverride: Type.Optional(
-		Type.String({ description: "Override --reasoning-effort for this call." }),
-	),
+	maxTurnsOverride: NativeAuditFields.maxTurnsOverride,
+	maxOutputTokensOverride: NativeAuditFields.maxOutputTokensOverride,
+	temperatureOverride: NativeAuditFields.temperatureOverride,
+	topPOverride: NativeAuditFields.topPOverride,
+	seedOverride: NativeAuditFields.seedOverride,
+	reasoningEffortOverride: NativeAuditFields.reasoningEffortOverride,
 	instructionsFullOverride: Type.Optional(
 		Type.Boolean({
 			description:
@@ -3446,9 +3474,7 @@ const SwivalParams = Type.Object({
 				"Path to an A2A TOML config file with [a2a_servers.*] tables for this call. Relative paths resolve against cwd. Suppresses --no-a2a and requires networkOverride/network=full (or omitted, which defaults to full).",
 		}),
 	),
-	providerTimeoutOverride: Type.Optional(
-		Type.Number({ description: "Override --provider-timeout (seconds) for this call. Swival's default is 900." }),
-	),
+	providerTimeoutOverride: NativeAuditFields.providerTimeoutOverride,
 	initialToolChoiceOverride: Type.Optional(
 		StringEnum(["auto", "required"] as const, {
 			description: "Override --initial-tool-choice for this call. Swival's default is auto.",
@@ -3493,16 +3519,10 @@ const SwivalParams = Type.Object({
 			description: `Parallel-mode only: max concurrent tasks. Default 4, max ${MAX_CONCURRENCY}.`,
 		}),
 	),
-	maxInlineBytes: Type.Optional(
-		Type.Number({
-			minimum: 1,
-			description:
-				"Cap (in characters) on a task's finalOutput inlined into the tool-response content. Applies to single, chain, and parallel modes. When output exceeds the cap, the response shows the first maxInlineBytes characters followed by a [truncated N chars; full output at <artifactDir>] marker. Omit (default) to inline the full output — silent truncation is never the default. To avoid token growth entirely, pass `output: \"...\"` paths instead.",
-		}),
-	),
+	maxInlineBytes: NativeAuditFields.maxInlineBytes,
 	output: Type.Optional(Type.String({ description: "Single/chain mode: file path to write the run's finalOutput to. Relative paths resolve against cwd. When set, the tool-response content defaults to file-only metadata (path + size) instead of inlining the body — set outputMode=\"inline\" to also receive the body inline." })),
 	outputMode: Type.Optional(StringEnum(["inline", "file-only"] as const, { description: "Single/chain mode: how to surface output in the tool-response content. Default with output is file-only; inline returns the body even when also writing to a file." })),
-	timeoutMs: Type.Optional(Type.Number({ minimum: 1, description: "Wall-clock budget in milliseconds for the swival process. On expiry: SIGTERM, then SIGKILL after 5 seconds. No default; only enforced when set." })),
+	timeoutMs: NativeAuditFields.timeoutMs,
 
 	// ---- async / background execution ----
 
@@ -3803,6 +3823,143 @@ export interface SwivalExtensionOptions {
 	nativeMaxTimeoutMs?: number;
 }
 
+/** One registrar's native runs: preparation, live handles, and the shutdown drain. */
+interface NativeAuditSession {
+	/** Validate, prepare, and run one synchronous native audit from the session cwd. */
+	execute(input: Record<string, unknown>, cwd: string, signal: AbortSignal | undefined): Promise<AgentToolResult<SwivalDetails | undefined>>;
+	/** Idempotent session-shutdown drain; safe to call repeatedly and concurrently. */
+	shutdown(): Promise<void>;
+}
+
+function createNativeAuditSession(options: SwivalExtensionOptions, artifactRoot: string): NativeAuditSession {
+	const nativeRuntime = captureNativeRuntime(options.nativePython);
+	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
+	const nativeRuns = new Set<NativeAuditLaunch>();
+	// Track the whole operation, including preparation and post-run inspection.
+	// These promises only resolve, so rejected preparation/finalization cannot
+	// leave an unhandled rejection or prevent the shutdown drain.
+	const nativeOperations = new Map<AbortController, Promise<void>>();
+	const shutdownReason = "Native audit cancelled during session shutdown.";
+	let shutdowns = 0;
+	return {
+		async shutdown() {
+			shutdowns++;
+			try {
+				while (nativeOperations.size) {
+					for (const run of nativeRuns) run.cancel(shutdownReason);
+					for (const controller of nativeOperations.keys()) controller.abort();
+					await Promise.allSettled([...nativeOperations.values()]);
+				}
+			} finally {
+				shutdowns--;
+			}
+		},
+		async execute(input, cwd, signal) {
+			const controller = new AbortController();
+			const abort = () => controller.abort();
+			signal?.addEventListener("abort", abort, { once: true });
+			if (signal?.aborted) abort();
+			let finishOperation!: () => void;
+			nativeOperations.set(controller, new Promise<void>((resolve) => { finishOperation = resolve; }));
+			// A drain is temporary: do not change reuse after session_shutdown.
+			if (shutdowns) controller.abort();
+			let run: NativeAuditLaunch | undefined;
+			try {
+				const audit = validateNativeAuditParams(input);
+				if (!Number.isInteger(nativeMaxTimeoutMs) || nativeMaxTimeoutMs < 1 || nativeMaxTimeoutMs > 2_147_483_647) {
+					throw new Error("Invalid native timeout ceiling.");
+				}
+				const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
+				run = await prepareNativeAudit(cwd, input, audit, nativeRuntime,
+					artifactDir, runId, nativeMaxTimeoutMs, controller.signal);
+				nativeRuns.add(run);
+				// Defensively stop a live handle returned after cancellation, even
+				// if preparation did not observe its signal before returning.
+				if (controller.signal.aborted) run.cancel(shutdowns ? shutdownReason : undefined);
+				const routeText = `Resolved native route: ${run.route.provider}/${run.route.model}` +
+					(run.route.endpoint ? `; endpoint=${run.route.endpoint}` : "") +
+					(run.route.profile ? `; profile=${run.route.profile}` : "") +
+					(run.route.reasoningEffort ? `; effort=${run.route.reasoningEffort}` : "");
+				const terminal = await run.completion;
+				const nativeAudit = { ...await inspectNativeAudit(artifactDir, terminal.exitCode), route: run.route };
+				const maxInlineBytes = typeof input.maxInlineBytes === "number" ? input.maxInlineBytes : 64 * 1024;
+				const result: SwivalResult = { agent: "native-audit", agentSource: "bundled", task: run.meta.task,
+					exitCode: terminal.exitCode, nativeAudit, stderrTail: [], durationMs: Date.now() - run.meta.startedAt,
+					artifactDir, errorMessage: nativeAudit.error,
+					finalOutput: applyInlineCap(nativeAudit.answer ?? "", maxInlineBytes,
+						path.join(artifactDir, "evidence", "native-cli-report.json")) };
+				return { content: [{ type: "text", text: `Native audit status: ${nativeAudit.status}. ${routeText}\n${nativeAudit.error ?? result.finalOutput}\nSource-only verifier judgment; patches are proposals.\nArtifact dir: ${artifactDir}` }],
+					details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [result] }, isError: isRunFailure(result) };
+			} catch (error) {
+				return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
+			} finally {
+				signal?.removeEventListener("abort", abort);
+				if (run) nativeRuns.delete(run);
+				nativeOperations.delete(controller);
+				finishOperation();
+			}
+		},
+	};
+}
+
+// Native-only declaration. Shared fields keep their general types and bounds;
+// maxInlineBytes and timeoutMs carry the native semantics in their text, and
+// encryptSecretsOverride is declared false-only. validateNativeAuditParams and
+// prepareNativeAudit still reject every other value on direct calls.
+const NativeAuditToolParams = Type.Object({
+	audit: NativeAuditScope,
+	...NativeAuditFields,
+	maxInlineBytes: Type.Optional(Type.Number({
+		minimum: 1,
+		description: "Cap (in characters) on the native audit answer inlined into the tool-response content. Default 65536. A longer answer is cut after this many characters and followed by a [truncated N chars; full output at <artifact evidence path>] marker; the complete report stays in the artifact directory.",
+	})),
+	timeoutMs: Type.Optional(Type.Number({
+		minimum: 1,
+		description: "Wall-clock budget in milliseconds for the native audit. Default: the smaller of 15 minutes and the configured native ceiling (30 minutes unless the registering extension sets another). An explicit value must be an integer from 1 to that ceiling. On expiry the owned process group is stopped with bounded TERM then KILL escalation.",
+	})),
+	encryptSecretsOverride: Type.Optional(Type.Literal(false, {
+		description: "Only false is accepted; true is rejected. Admits a global encrypt_secrets=true Swival configuration for this audit. The run's inert configuration never enables encryption; project configuration, SWIVAL_ENCRYPT_KEY, filters, proxies, and every other preflight check stay fail-closed, and no file, auth, or process grant changes.",
+	})),
+}, { additionalProperties: false });
+
+/**
+ * Register only the synchronous native audit tool. Nothing loads this
+ * automatically: an explicitly configured consumer calls it instead of the
+ * default export when a session must not receive general Swival dispatch.
+ * The native path, repository-root policy, lifecycle, and shutdown drain are
+ * the ones the default `swival-subagent` tool uses for its `audit` input.
+ */
+export function registerNativeAuditTool(pi: ExtensionAPI, options: SwivalExtensionOptions = {}): void {
+	const artifactRoot = path.resolve(process.cwd(), options.artifactRoot ?? ARTIFACT_ROOT);
+	const nativeAudit = createNativeAuditSession(options, artifactRoot);
+	pi.on?.("session_shutdown", () => nativeAudit.shutdown());
+	pi.registerTool<typeof NativeAuditToolParams, SwivalDetails | undefined>({
+		name: "swival-native-audit",
+		label: "Swival native audit",
+		description: [
+			"Run one synchronous, source-only Swival native audit of the committed tree at the session's repository-root working directory.",
+			"Requires the audit object; accepts only native selection and bounding fields. encryptSecretsOverride accepts only false.",
+			"No agent, task, parallel, chain, control actions, cwd, async, network, sandbox, or credential inputs; patches are proposals and never applied.",
+		].join(" "),
+		promptSnippet: "Run one synchronous source-only Swival native audit of the committed repository tree",
+		promptGuidelines: [
+			"Use swival-native-audit only for an explicitly requested native audit of committed source; it cannot delegate tasks, run commands, or apply patches.",
+		],
+		parameters: NativeAuditToolParams,
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const input = params as unknown as Record<string, unknown>;
+			// The declared schema is also the execution boundary, so a direct call
+			// cannot reach fields the model never sees (including async: false).
+			const undeclared = Object.keys(input).filter((key) => !Object.hasOwn(NativeAuditToolParams.properties, key));
+			if (undeclared.length) {
+				return { content: [{ type: "text", text: `Native audit accepts only its declared fields; remove ${undeclared.join(", ")}.` }],
+					details: undefined, isError: true };
+			}
+			return nativeAudit.execute(input, ctx.cwd, signal);
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {}) {
 	const resolutionBase = process.cwd();
 	const artifactRoot = path.resolve(resolutionBase, options.artifactRoot ?? ARTIFACT_ROOT);
@@ -3842,15 +3999,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		observationGeneration++;
 		return startObservation(owner, true);
 	});
-	const nativeRuntime = captureNativeRuntime(options.nativePython);
-	const nativeMaxTimeoutMs = options.nativeMaxTimeoutMs ?? 30 * 60_000;
-	const nativeRuns = new Set<NativeAuditLaunch>();
-	// Track the whole operation, including preparation and post-run inspection.
-	// These promises only resolve, so rejected preparation/finalization cannot
-	// leave an unhandled rejection or prevent the shutdown drain.
-	const nativeOperations = new Map<AbortController, Promise<void>>();
-	const shutdownReason = "Native audit cancelled during session shutdown.";
-	let shutdowns = 0;
+	const nativeAudit = createNativeAuditSession(options, artifactRoot);
 	pi.on?.("session_shutdown", async (_event, ctx) => {
 		const owner = captureAsyncOwner(ctx?.sessionManager);
 		if (owner && observationOwnerSessionId === owner.ownerSessionId) {
@@ -3859,16 +4008,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			observation?.observer.dispose();
 			observation = undefined;
 		}
-		shutdowns++;
-		try {
-			while (nativeOperations.size) {
-				for (const run of nativeRuns) run.cancel(shutdownReason);
-				for (const controller of nativeOperations.keys()) controller.abort();
-				await Promise.allSettled([...nativeOperations.values()]);
-			}
-		} finally {
-			shutdowns--;
-		}
+		await nativeAudit.shutdown();
 	});
 	pi.registerTool<typeof SwivalParams, SwivalDetails | SwivalCatalogueDetails | undefined>({
 		name: "swival-subagent",
@@ -3917,49 +4057,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 			}
 
 			if ("audit" in params) {
-				const controller = new AbortController();
-				const abort = () => controller.abort();
-				signal?.addEventListener("abort", abort, { once: true });
-				if (signal?.aborted) abort();
-				let finishOperation!: () => void;
-				nativeOperations.set(controller, new Promise<void>((resolve) => { finishOperation = resolve; }));
-				// A drain is temporary: do not change reuse after session_shutdown.
-				if (shutdowns) controller.abort();
-				let run: NativeAuditLaunch | undefined;
-				try {
-					const input = params as unknown as Record<string, unknown>;
-					const audit = validateNativeAuditParams(input);
-					if (!Number.isInteger(nativeMaxTimeoutMs) || nativeMaxTimeoutMs < 1 || nativeMaxTimeoutMs > 2_147_483_647) {
-						throw new Error("Invalid native timeout ceiling.");
-					}
-					const { artifactDir, runId } = mintArtifactDir("native-audit", artifactRoot);
-					run = await prepareNativeAudit(ctx.cwd, input, audit, nativeRuntime,
-						artifactDir, runId, nativeMaxTimeoutMs, controller.signal);
-					nativeRuns.add(run);
-					// Defensively stop a live handle returned after cancellation, even
-					// if preparation did not observe its signal before returning.
-					if (controller.signal.aborted) run.cancel(shutdowns ? shutdownReason : undefined);
-					const routeText = `Resolved native route: ${run.route.provider}/${run.route.model}` +
-						(run.route.endpoint ? `; endpoint=${run.route.endpoint}` : "") +
-						(run.route.profile ? `; profile=${run.route.profile}` : "") +
-						(run.route.reasoningEffort ? `; effort=${run.route.reasoningEffort}` : "");
-					const terminal = await run.completion;
-					const nativeAudit = { ...await inspectNativeAudit(artifactDir, terminal.exitCode), route: run.route };
-					const result: SwivalResult = { agent: "native-audit", agentSource: "bundled", task: run.meta.task,
-						exitCode: terminal.exitCode, nativeAudit, stderrTail: [], durationMs: Date.now() - run.meta.startedAt,
-						artifactDir, errorMessage: nativeAudit.error,
-						finalOutput: applyInlineCap(nativeAudit.answer ?? "", params.maxInlineBytes ?? 64 * 1024,
-							path.join(artifactDir, "evidence", "native-cli-report.json")) };
-					return { content: [{ type: "text", text: `Native audit status: ${nativeAudit.status}. ${routeText}\n${nativeAudit.error ?? result.finalOutput}\nSource-only verifier judgment; patches are proposals.\nArtifact dir: ${artifactDir}` }],
-						details: { mode: "single", agentScope: "user", projectAgentsDir: null, results: [result] }, isError: isRunFailure(result) };
-				} catch (error) {
-					return { content: [{ type: "text", text: (error as Error).message }], details: undefined, isError: true };
-				} finally {
-					signal?.removeEventListener("abort", abort);
-					if (run) nativeRuns.delete(run);
-					nativeOperations.delete(controller);
-					finishOperation();
-				}
+				return nativeAudit.execute(params as unknown as Record<string, unknown>, ctx.cwd, signal);
 			}
 
 			// Prune artifact dirs older than 7 days — fire-and-forget, never blocks.
