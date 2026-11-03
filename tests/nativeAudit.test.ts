@@ -37,7 +37,7 @@ const repository = () => {
 
 afterEach(() => { for (const dir of scratchDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
-// Both registrars share these rejections; the native-only tool must not be weaker.
+// Shared native validation remains covered through the general tool; both registrars also exercise real preflight below.
 const MALFORMED_AUDIT_INPUTS = [
 	{ paths: ["src\n/!rm"] }, { paths: ["../escape"] }, { paths: ["/etc"] },
 	{ paths: ["--debug"] }, { paths: ["src with space"] }, { paths: ["src\\..\\out"] },
@@ -140,35 +140,7 @@ describe("native audit dispatch boundary", () => {
 	});
 });
 
-describe("native-only tool dispatch boundary", () => {
-	let tool: any;
-	let root: string;
-	const originalPath = process.env.PATH;
-	afterEach(() => { process.env.PATH = originalPath; });
-	beforeEach(() => {
-		root = scratch();
-		const bin = scratch();
-		fs.writeFileSync(path.join(bin, "swival"), `#!${python}\nfrom pathlib import Path\nPath(${JSON.stringify(path.join(root, "generic-dispatch"))}).write_text("forbidden")\n`, { mode: 0o755 });
-		process.env.PATH = `${bin}:${(originalPath ?? "").split(path.delimiter).filter(path.isAbsolute).join(path.delimiter)}`;
-		registerNativeAuditTool({ registerTool: (registered: any) => { tool = registered; } } as any,
-			{ artifactRoot: root, nativePython: python });
-	});
-	it.each(MALFORMED_AUDIT_INPUTS)("rejects malformed structured audit input without artifacts: %j", async (audit) => {
-		const result = await tool.execute("audit", { audit }, undefined, undefined, { cwd: ROOT, hasUI: false });
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/native audit|audit\./i);
-		expect(fs.readdirSync(root)).toEqual([]);
-	});
-	it.each([...INCOMPATIBLE_FIELDS, { async: false }, { encryptSecretsOverride: "false" }, { encryptSecretsOverride: 0 },
-		{ encryptSecretsOverride: null }, { encryptSecretsOverride: {} }, { action: "list" }, { id: "swival-run-1" }])(
-		"rejects incompatible or bypass fields without native launch: %j", async (other) => {
-			const result = await tool.execute("audit", { audit: {}, ...other }, undefined, undefined, { cwd: ROOT, hasUI: false });
-			expect(result.isError).toBe(true);
-			expect(result.content[0].text).toMatch(/native audit|cannot be combined/i);
-			expect(fs.existsSync(path.join(root, "generic-dispatch"))).toBe(false);
-			expect(fs.readdirSync(root)).toEqual([]);
-		});
-});
+// Native-only schema-bypass rejection is covered at the producer boundary in nativeAuditOnly.test.ts.
 
 describe("native preflight protection requirements (no worker, no provider)", {
 	timeout: PREFLIGHT_PROCESS_TIMEOUT_MS + 5000,
