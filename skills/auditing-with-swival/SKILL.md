@@ -1,6 +1,6 @@
 ---
 name: auditing-with-swival
-description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent.
+description: Run a source-only native Swival audit on committed repository content. Use for native audit coverage, findings, reports, and patch proposals through swival-subagent or the native-only swival-native-audit tool.
 ---
 
 # Auditing with Swival
@@ -54,6 +54,8 @@ For ChatGPT only, standard upstream ChatGPT authentication permits login, token 
 `paths` accepts at most 64 relative path/glob tokens without spaces, traversal, shell syntax, or host paths. Omit it for the auditable committed scope. `all` requires deep review of every selected file. `workers` is 1–8 pipeline workers, not autonomous subagents. `patchMaxTurns` is 1–100 turns per patch loop. The default timeout is 15 minutes; the default operator ceiling is 30 minutes.
 
 Native async is unsupported. Do not combine `audit` with `task`, `agent`, `cwd`, parallel/chain dispatch, output routing, reviewer settings, extra arguments, or permission overrides. Ordinary freeform delegation is separate and does not attest native completion. Do not use freeform slash-command tasks as a substitute.
+
+A session may expose `swival-native-audit` instead of `swival-subagent`. It takes the same `audit` object and the same native selection and bounding fields, nothing else; general dispatch, control, `cwd`, and `async` inputs are rejected before preparation. Its `encryptSecretsOverride` accepts only `false`, which admits a global `encrypt_secrets = true` configuration for the audit as `swival-subagent` already does; every other value is rejected, the inert run configuration never enables encryption, and project configuration, `SWIVAL_ENCRYPT_KEY`, filter, and proxy guards stay fail-closed. Scope, routing, boundary, lifetime, and completion rules below are identical. If that session is itself a headless child Pi run in the background by its consumer, only the outer run is asynchronous; the inner native audit remains a synchronous tool call that returns after verified shutdown. The tool's presence grants no audit authorization.
 
 ## Boundary
 
