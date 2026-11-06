@@ -1202,15 +1202,15 @@ jsonschema-specifications==2025.9.1 \
     --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe \
     --hash=sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d
     # via jsonschema
-litellm==1.106.5 \
-    --hash=sha256:25d71b305f7d0c67b990f21993f4aa9cd62c5a48ca0400b9b7aba6a355e2ad0b \
-    --hash=sha256:5c9f62dc04eb5a60a9f60a1faaa509a01432661b1638b1f34266197063b4d2d7 \
-    --hash=sha256:80f8b7cd0e5e66ab8011e1391eb2f9749524539ac66aa85dc93c68df038ef9eb \
-    --hash=sha256:9c8ebd30c4a5643207b8e9dade2680c540bbe17ca9543474d12147f6cd2f913f \
-    --hash=sha256:a4d2dedfe16a39659b9483afd3ce13c2170f73ab53ee60a1f9a6e5604a9e5f8f \
-    --hash=sha256:c1a3869f31da1d8349230a79d1f79c930cc1a4453ef1819cfc3235c80173c67e \
-    --hash=sha256:daf357933069999b3360b84982391cf72a62869bae2fddb644b4ee82a1324a0d \
-    --hash=sha256:dd15a08b86858b7f83b78685413f4cfb47c2713b4964b804a11208c937a98009
+litellm==1.106.6 \
+    --hash=sha256:42ce43ffb0161c9a844e8b0cd02a8796d0423b11d84fe304bff925378ca55085 \
+    --hash=sha256:8bf6d33b5ca32a5fc6858784b64c82e7f3bfab462d571d7d0def5596c3e1acc3 \
+    --hash=sha256:a2876545a652de5070fa5905849b479cee977680b0616b603a6ab21fd5599524 \
+    --hash=sha256:a51f2a7317ab9cb1ef01a93c619f3c7ff69fe1fe13a59b409d0130748b5d8af9 \
+    --hash=sha256:ac74f9ff9faae1a424dc7be873b80ccf1cea1681a9f4dac03bac068ae3a8d8b0 \
+    --hash=sha256:af0b6f4a3df53194b74188a972f103f41ee5ed86afeefc7d9a1ea40156cc0f2e \
+    --hash=sha256:ec3cae6c87971657c9ae905b6d23aef456e979c8848f22bbc5096a31e1a1da4d \
+    --hash=sha256:f3398d8c21ac9fe851f1788a2d811af7f369fb485d775a25a9b3f517b0b3e88b
     # via
     #   -r tests/requirements.in
     #   swival
@@ -2402,9 +2402,9 @@ starlette==1.10.0 \
     #   mcp
     #   sse-starlette
     #   swival
-swival==1.9.1 \
-    --hash=sha256:1b09a512c1af60038e45e7d5363994a6f6407370d4385079f2af7d3f6327d390 \
-    --hash=sha256:b0ffbfebaf40373f97fb74c92ac254c04a3fab934540823ae6d59fae1f317d84
+swival==1.9.3 \
+    --hash=sha256:36aaef061d70f574618b58516e6aa39410656b76028f0385b1bbc60f523f53b3 \
+    --hash=sha256:f0c32247e33ae8aea76d246772bea2da0ca0c51b890adbd0a580cb2d40e56354
     # via -r tests/requirements.in
 tenacity==9.1.4 \
     --hash=sha256:6095a360c919085f28c6527de529e76a06ad89b23659fa881ae0649b867a9d55 \

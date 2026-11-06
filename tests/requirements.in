@@ -1,3 +1,3 @@
 # Offline native entry-point tests use the released implementation, not a source fork.
-swival==1.9.1
-litellm==1.106.5
+swival==1.9.3
+litellm==1.106.6
