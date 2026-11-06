@@ -368,13 +368,16 @@ describe("independent committed snapshot", () => {
 		git(source, "add", "."); git(source, "commit", "-m", "unsupported fixture");
 		await expect(native!.createCommittedSnapshot(source, path.join(scratch(), "snapshot"))).rejects.toThrow(/unsupported|secret|credential/i);
 	});
-	it("accepts an in-repo relative directory symlink without materializing it in the snapshot", async () => {
+	it.each([
+		"../.agents/skills", "../.agents/skills/../skills", "./../.agents//skills/./",
+		"../src/../.agents/skills/",
+	])("accepts directory alias %s without materializing it in the snapshot", async (target) => {
 		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
 		const source = repository();
 		fs.mkdirSync(path.join(source, ".agents", "skills"), { recursive: true });
 		fs.mkdirSync(path.join(source, ".claude"));
 		fs.writeFileSync(path.join(source, ".agents", "skills", "SKILL.md"), "# skill\n");
-		fs.symlinkSync("../.agents/skills", path.join(source, ".claude", "skills"));
+		fs.symlinkSync(target, path.join(source, ".claude", "skills"));
 		git(source, "add", "."); git(source, "commit", "-m", "in-repo directory symlink fixture");
 		expect(git(source, "ls-tree", "HEAD", ".claude/").includes("120000")).toBe(true);
 		const dest = path.join(scratch(), "snapshot");
@@ -382,7 +385,9 @@ describe("independent committed snapshot", () => {
 		expect(manifest.files).toContain(".agents/skills/SKILL.md");
 		expect(manifest.files).not.toContain(".claude/skills");
 		expect(fs.readFileSync(path.join(dest, ".agents", "skills", "SKILL.md"), "utf8")).toBe("# skill\n");
-		expect(fs.existsSync(path.join(dest, ".claude", "skills"))).toBe(false);
+		expect(() => fs.lstatSync(path.join(dest, ".claude", "skills"))).toThrow(/ENOENT/);
+		expect(git(dest, "ls-tree", "HEAD", ".claude/")).toContain("120000");
+		expect(git(dest, "show", "HEAD:.claude/skills")).toBe(target);
 		expect(fs.lstatSync(path.join(dest, ".agents", "skills")).isSymbolicLink()).toBe(false);
 		expect(git(dest, "rev-parse", "HEAD^{tree}").trim()).toBe(git(source, "rev-parse", "HEAD^{tree}").trim());
 	});
@@ -393,11 +398,47 @@ describe("independent committed snapshot", () => {
 		["targets a regular file", "src/code.py", "link"],
 		["escapes through a nested dot-dot", "src/../../outside", "link"],
 		["targets .git metadata", ".git", "link"],
+		["traverses a missing directory before dot-dot", "missing/../src", "link"],
+		["traverses a regular file before dot-dot", "src/code.py/..", "link"],
+		["traverses .git before dot-dot", ".git/../src", "link"],
+		["traverses a secret directory before dot-dot", ".ssh/../src", "link"],
+		["traverses an env directory before dot-dot", ".env.local/../src", "link"],
+		["traverses a key-shaped directory before dot-dot", "private.key/../src", "link"],
+		["traverses reserved findings before dot-dot", "audit-findings/../src", "link"],
+		["traverses reserved audit state before dot-dot", ".swival/audit/../../src", "link"],
+		["traverses a reserved report before dot-dot", "NATIVE-CLI-REPORT.JSON/../src", "link"],
+		["escapes directly from the root", "../src", "link"],
+		["escapes from a nested location", "../../src", "src/link"],
+		["escapes and re-enters from the root", "../src/../src", "link"],
+		["escapes and re-enters from a nested location", "../../src/../src", "src/link"],
+		["ends at the root via dot", ".", "link"],
+		["ends at the root via dot-dot", "src/..", "link"],
+		["ends at the root from a nested location", ".././", "src/link"],
 	])("rejects a committed symlink that %s", async (_label, target, name) => {
 		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
 		const source = repository();
 		fs.symlinkSync(target, path.join(source, name));
 		git(source, "add", "."); git(source, "commit", "-m", "unsafe symlink fixture");
+		const destination = path.join(scratch(), "snapshot");
+		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
+		expect(fs.existsSync(destination)).toBe(false);
+	});
+	it("rejects a symlink intermediate even when dot-dot would remove it", async () => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const source = repository();
+		fs.symlinkSync("src", path.join(source, "alias"));
+		fs.symlinkSync("alias/../src", path.join(source, "link"));
+		git(source, "add", "."); git(source, "commit", "-m", "symlink intermediate fixture");
+		const destination = path.join(scratch(), "snapshot");
+		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
+		expect(fs.existsSync(destination)).toBe(false);
+	});
+	it("rejects an untracked directory intermediate that exists in the working copy", async () => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const source = repository();
+		fs.mkdirSync(path.join(source, "untracked"));
+		fs.symlinkSync("untracked/../src", path.join(source, "link"));
+		git(source, "add", "link"); git(source, "commit", "-m", "untracked intermediate fixture");
 		const destination = path.join(scratch(), "snapshot");
 		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
 		expect(fs.existsSync(destination)).toBe(false);

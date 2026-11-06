@@ -440,9 +440,20 @@ const unsafePath = (file: string) => {
 /** True when a committed symlink is a relative alias of an existing directory inside the same tree. */
 const inRepoDirectoryAlias = (file: string, linkTarget: string, treeDirectories: ReadonlySet<string>) => {
 	if (!linkTarget || /[\x00-\x1f\x7f\\]/.test(linkTarget) || linkTarget.startsWith("/") || linkTarget.includes("\ufffd")) return false;
-	const resolved = path.posix.normalize(path.posix.join(path.posix.dirname(file), linkTarget.replace(/\/+$/, "")));
-	return !resolved.startsWith("../") && resolved !== ".." && !path.posix.isAbsolute(resolved) &&
-		treeDirectories.has(resolved) && !unsafePath(resolved) && !secretPath(resolved);
+	const components = file.split("/").slice(0, -1);
+	for (const component of linkTarget.split("/")) {
+		if (!component || component === ".") continue;
+		if (component === "..") {
+			if (components.length === 0) return false;
+			components.pop();
+			continue;
+		}
+		components.push(component);
+		const directory = components.join("/");
+		// Validate before a later dot-dot can erase an invalid intermediate.
+		if (!treeDirectories.has(directory) || unsafePath(directory) || secretPath(directory)) return false;
+	}
+	return components.length > 0;
 };
 
 export async function createCommittedSnapshot(cwd: string, destination: string,
