@@ -36,7 +36,7 @@ class NativeAuditError(Exception):
         return result
 
 
-RUNTIME_VERSIONS = {"swival": "1.9.1", "litellm": "1.106.5"}
+RUNTIME_VERSIONS = {"swival": "1.9.3", "litellm": "1.106.6"}
 OVERRIDE_KEYS = {
     "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
@@ -261,7 +261,7 @@ def _admit_route(args, profile, routing):
     from litellm.utils import ProviderConfigManager
     # Pinned adapters without a dynamic models handler must not expose a singleton
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
-    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.106.5) return None
+    # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.106.6) return None
     # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
     # For anthropic, endpoint is None and the runtime shim disables get_models.
     adapter = LlmProviders(provider)

@@ -23,12 +23,18 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import warnings
 
 sys.dont_write_bytecode = True
 os.environ["LITELLM_MODE"] = "PRODUCTION"
 os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 os.environ["NONO_NO_UPDATE_CHECK"] = "1"
 FORBIDDEN = AssertionError("network/auth/inference forbidden")
+warnings.filterwarnings(
+    "ignore",
+    message=r"Item 'summary' on TypedDict class 'ChatCompletionReasoningItem' is using the `ReadOnly` qualifier",
+    category=UserWarning,
+)
 with patch.object(socket, "socket", side_effect=FORBIDDEN), \
      patch.object(socket, "create_connection", side_effect=FORBIDDEN), \
      patch.object(socket, "getaddrinfo", side_effect=FORBIDDEN):
@@ -52,6 +58,11 @@ class NativeEntryTests(unittest.TestCase):
     """Run released code without real sockets, auth, or provider calls."""
 
     def setUp(self):
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Item 'summary' on TypedDict class 'ChatCompletionReasoningItem' is using the `ReadOnly` qualifier",
+            category=UserWarning,
+        )
         temporary = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
             dir=TEMP, prefix="native-python-")
         self.root = Path(self.enterContext(temporary))
@@ -969,7 +980,7 @@ class NativeEntryTests(unittest.TestCase):
                 model="anthropic/claude-mythos-5-1",
                 api_key="sk-ant-oat01-synthetic",
                 messages=[{"role": "system", "content": "Audit instructions"}],
-                extra_headers={"User-Agent": "swival/1.9.1"},
+                extra_headers={"User-Agent": "swival/1.9.3"},
             )
         self.assertEqual(captured["extra_headers"]["User-Agent"], "claude-cli/2.1.280")
         self.assertEqual(captured["extra_headers"]["x-app"], "cli")
