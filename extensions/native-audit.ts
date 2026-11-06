@@ -437,6 +437,25 @@ const unsafePath = (file: string) => {
 			.some((reserved) => folded === reserved || folded.startsWith(reserved + "/"));
 };
 
+/** True when a committed symlink is a relative alias of an existing directory inside the same tree. */
+const inRepoDirectoryAlias = (file: string, linkTarget: string, treeDirectories: ReadonlySet<string>) => {
+	if (!linkTarget || /[\x00-\x1f\x7f\\]/.test(linkTarget) || linkTarget.startsWith("/") || linkTarget.includes("\ufffd")) return false;
+	const components = file.split("/").slice(0, -1);
+	for (const component of linkTarget.split("/")) {
+		if (!component || component === ".") continue;
+		if (component === "..") {
+			if (components.length === 0) return false;
+			components.pop();
+			continue;
+		}
+		components.push(component);
+		const directory = components.join("/");
+		// Validate before a later dot-dot can erase an invalid intermediate.
+		if (!treeDirectories.has(directory) || unsafePath(directory) || secretPath(directory)) return false;
+	}
+	return components.length > 0;
+};
+
 export async function createCommittedSnapshot(cwd: string, destination: string,
 	selectedGit?: TrustedGit): Promise<SnapshotManifest> {
 	const trusted = selectedGit ?? await resolveTrustedGit(cwd, captureNativeRuntime());
@@ -456,11 +475,12 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 		const match = /^(\d+) (blob|tree|commit) ([a-f0-9]+)\t([\s\S]+)$/.exec(line);
 		if (!match) throw new Error("Unsupported Git tree entry.");
 		const [, mode, type, oid, file] = match;
-		if (unsafePath(file) || file.includes("\ufffd") || !["040000", "100644", "100755"].includes(mode)) throw new Error("Unsupported native audit path or file mode.");
+		if (unsafePath(file) || file.includes("\ufffd") || !["040000", "100644", "100755", "120000"].includes(mode)) throw new Error("Unsupported native audit path or file mode.");
 		if (secretPath(file)) throw new Error("Native audit refuses secret-shaped tracked paths.");
 		return { mode, type, oid, file };
 	});
 	if (entries.length > 4096) throw new Error("Native audit snapshot exceeds the 4096-entry limit.");
+	const treeDirectories = new Set(entries.filter((e) => e.mode === "040000").map((e) => e.file));
 	const objects = new Map<string, { type: string; bytes: Buffer }>();
 	objects.set(sourceTree, { type: "tree", bytes: Buffer.alloc(0) });
 	for (const entry of entries) objects.set(entry.oid, { type: entry.type, bytes: Buffer.alloc(0) });
@@ -476,6 +496,14 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 			throw new Error("Native audit refuses recognized credential content; protected routes are unsupported.");
 		}
 	}
+	// Only benign in-repo directory aliases are accepted; they stay in the committed
+	// tree as evidence but are never written into the snapshot working copy.
+	for (const entry of entries.filter((e) => e.mode === "120000")) {
+		if (!inRepoDirectoryAlias(entry.file, objects.get(entry.oid)!.bytes.toString("utf8"), treeDirectories)) {
+			throw new Error("Unsupported native audit path or file mode.");
+		}
+	}
+	const regularFiles = entries.filter((e) => e.type === "blob" && e.mode !== "120000");
 	await fs.mkdir(dest, { mode: 0o700 });
 	await git(dest, ["init", "--template=", `--object-format=${sourceTree.length === 64 ? "sha256" : "sha1"}`]);
 	for (const [oid, object] of objects) {
@@ -490,7 +518,7 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 		"Independent committed audit snapshot\n", env)).toString().trim();
 	await git(dest, ["update-ref", "HEAD", snapshotCommit]);
 	await git(dest, ["read-tree", snapshotCommit]);
-	for (const entry of entries.filter((e) => e.type === "blob")) {
+	for (const entry of regularFiles) {
 		const target = path.join(dest, entry.file);
 		await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
 		await fs.writeFile(target, objects.get(entry.oid)!.bytes, { mode: entry.mode === "100755" ? 0o700 : 0o600, flag: "wx" });
@@ -499,7 +527,7 @@ export async function createCommittedSnapshot(cwd: string, destination: string,
 	// tree as evidence, but do not activate repository-supplied runtime settings.
 	await fs.writeFile(path.join(dest, "swival.toml"), "# Native audit runtime configuration is inert.\n", { mode: 0o600 });
 	return { ...identity, sourceCommit, sourceTree, snapshotCommit,
-		files: entries.filter((e) => e.type === "blob").map((e) => e.file),
+		files: regularFiles.map((e) => e.file),
 		excluded: "All staged, unstaged, and untracked content is excluded; only the committed tree is imported." };
 }
 
