@@ -439,6 +439,25 @@ export function enforceNonoBootstrap(
 	};
 }
 
+function allCliOptionValues(args: readonly string[], option: string): string[] {
+	const values: string[] = [];
+	const equalsPrefix = `${option}=`;
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--") break;
+		if (arg.startsWith(equalsPrefix)) {
+			values.push(arg.slice(equalsPrefix.length));
+			continue;
+		}
+		if (arg !== option) continue;
+		const next = args[i + 1];
+		if (next === undefined || next === "--" || next.startsWith("-")) continue;
+		values.push(next);
+		i++;
+	}
+	return values;
+}
+
 function lastCliOptionValue(args: readonly string[], option: string): string | undefined {
 	let value: string | undefined;
 	const equalsPrefix = `${option}=`;
@@ -638,13 +657,132 @@ export function readAnthropicAuthToken(homeDir: string): string | undefined {
 	}
 }
 
-function canonicalPathOrResolved(targetPath: string, baseDir?: string): string {
-	const resolved = baseDir ? path.resolve(baseDir, targetPath) : path.resolve(targetPath);
+function expandTildePath(targetPath: string, homeDir: string = os.homedir()): string {
+	if (targetPath === "~") return homeDir;
+	if (targetPath.startsWith("~/") || targetPath.startsWith(`~${path.sep}`)) {
+		return path.join(homeDir, targetPath.slice(2));
+	}
+	return targetPath;
+}
+
+function canonicalPathOrResolved(
+	targetPath: string,
+	baseDir?: string,
+	homeDir: string = os.homedir(),
+): string {
+	const expanded = expandTildePath(targetPath, homeDir);
+	const resolved = path.isAbsolute(expanded)
+		? path.resolve(expanded)
+		: baseDir
+			? path.resolve(baseDir, expanded)
+			: path.resolve(expanded);
 	try {
 		return fs.realpathSync.native(resolved);
 	} catch {
 		return resolved;
 	}
+}
+
+function parseTomlRootStringArray(raw: string, key: string): string[] | undefined {
+	const firstTable = /(?:^|\n)\s*\[/.exec(raw);
+	const rootSection = firstTable ? raw.slice(0, firstTable.index) : raw;
+	if (/^\s*["']/m.test(rootSection)) return undefined;
+	const keyRe = new RegExp(`^\\s*${key}\\s*=\\s*\\[([\\s\\S]*?)\\]\\s*(?:#.*)?$`, "m");
+	const match = keyRe.exec(rootSection);
+	if (!match) return undefined;
+	const body = match[1];
+	const items: string[] = [];
+	let i = 0;
+	while (i < body.length) {
+		const ch = body[i];
+		if (/\s|,/.test(ch)) {
+			i++;
+			continue;
+		}
+		if (ch === "#") {
+			const nl = body.indexOf("\n", i);
+			if (nl === -1) break;
+			i = nl + 1;
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			const quote = ch;
+			i++;
+			let val = "";
+			let closed = false;
+			while (i < body.length) {
+				const c = body[i];
+				if (quote === '"' && c === "\\") {
+					i++;
+					if (i >= body.length) return undefined;
+					const esc = body[i];
+					if (esc === '"' || esc === "\\") val += esc;
+					else if (esc === "n") val += "\n";
+					else if (esc === "t") val += "\t";
+					else if (esc === "r") val += "\r";
+					else return undefined;
+					i++;
+					continue;
+				}
+				if (c === quote) {
+					closed = true;
+					i++;
+					break;
+				}
+				if (c === "\n" || c === "\r" || c === "\0") return undefined;
+				val += c;
+				i++;
+			}
+			if (!closed) return undefined;
+			items.push(val);
+			continue;
+		}
+		return undefined;
+	}
+	return items;
+}
+
+/**
+ * Read effective root-level `allowed_dirs_ro` from `<baseDir>/swival.toml` or
+ * `$XDG_CONFIG_HOME/swival/config.toml` (`~/.config/swival/config.toml`) using
+ * Swival's precedence and path-resolution rules (`_resolve_paths`), so adding
+ * `--add-dir-ro <commonGitDir>` on the CLI does not discard configured
+ * read-only directories.
+ */
+export function readConfiguredAllowedDirsRo(
+	baseDir: string | undefined,
+	homeDir: string = os.homedir(),
+	env: NodeJS.ProcessEnv = process.env,
+): string[] {
+	const resolveEntries = (entries: string[], configDir: string): string[] =>
+		entries.map((entry) => {
+			const expanded = expandTildePath(entry, homeDir);
+			return path.isAbsolute(expanded) ? expanded : path.join(configDir, expanded);
+		});
+	if (baseDir && path.isAbsolute(baseDir)) {
+		try {
+			const realBaseDir = fs.realpathSync.native(baseDir);
+			const projRaw = readSafeRegularText(path.join(realBaseDir, "swival.toml"), 65536, false);
+			if (projRaw !== undefined) {
+				const projEntries = parseTomlRootStringArray(projRaw, "allowed_dirs_ro");
+				if (projEntries !== undefined) {
+					return resolveEntries(projEntries, realBaseDir);
+				}
+			}
+		} catch { /* ignore */ }
+	}
+	try {
+		const xdg = env.XDG_CONFIG_HOME?.trim();
+		const globalDir = xdg ? path.join(xdg, "swival") : path.join(homeDir, ".config", "swival");
+		const globalRaw = readSafeRegularText(path.join(globalDir, "config.toml"), 65536, false);
+		if (globalRaw !== undefined) {
+			const globalEntries = parseTomlRootStringArray(globalRaw, "allowed_dirs_ro");
+			if (globalEntries !== undefined) {
+				return resolveEntries(globalEntries, globalDir);
+			}
+		}
+	} catch { /* ignore */ }
+	return [];
 }
 
 /**
@@ -1223,13 +1361,26 @@ export function buildSwivalArgs(
 			: undefined;
 		const linkedCommonGitDir = resolveLinkedWorktreeCommonGitDir(baseDirCandidate);
 		if (linkedCommonGitDir) {
-			const existingCanonical = [...(agent.addDir ?? []), ...(agent.addDirRo ?? [])].map((d) =>
-				canonicalPathOrResolved(d, baseDirCandidate),
-			);
+			const extraAddDirs = allCliOptionValues(agent.extraArgs ?? [], "--add-dir");
+			const extraAddDirsRo = allCliOptionValues(agent.extraArgs ?? [], "--add-dir-ro");
+			const hasCliAddDirRo = (agent.addDirRo?.length ?? 0) > 0 || extraAddDirsRo.length > 0;
+			const inheritedConfigRo = hasCliAddDirRo
+				? []
+				: readConfiguredAllowedDirsRo(baseDirCandidate);
+			const existingCanonical = [
+				...(agent.addDir ?? []),
+				...extraAddDirs,
+				...(agent.addDirRo ?? []),
+				...extraAddDirsRo,
+				...inheritedConfigRo,
+			].map((d) => canonicalPathOrResolved(d, cwd));
 			const alreadyCovered = existingCanonical.some(
 				(d) => d === linkedCommonGitDir || linkedCommonGitDir.startsWith(d + path.sep),
 			);
 			if (!alreadyCovered) {
+				for (const d of inheritedConfigRo) {
+					args.push("--add-dir-ro", d);
+				}
 				args.push("--add-dir-ro", linkedCommonGitDir);
 			}
 		}

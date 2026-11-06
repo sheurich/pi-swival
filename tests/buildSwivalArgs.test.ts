@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, readConfiguredAllowedDirsRo, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -232,6 +232,8 @@ describe("buildSwivalArgs", () => {
 
 	it("auto-adds --add-dir-ro for a validated linked Git worktree and rejects forged .git pointers", () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wt-"));
+		const prevXdg = process.env.XDG_CONFIG_HOME;
+		process.env.XDG_CONFIG_HOME = path.join(tmpRoot, "xdg");
 		try {
 			const mainGit = path.join(tmpRoot, "repo", ".git");
 			const wtAdmin = path.join(mainGit, "worktrees", "lane-a");
@@ -254,13 +256,44 @@ describe("buildSwivalArgs", () => {
 			expect(roIdx).toBeGreaterThan(-1);
 			expect(userArgs[roIdx + 1]).toBe(realMainGit);
 
-			// Honours --base-dir in extraArgs and deduplicates existing addDir / addDirRo
+			// Honours --base-dir in extraArgs and deduplicates existing addDir / addDirRo (resolved against cwd)
 			const extraBdArgs = buildSwivalArgs(makeAgent({ extraArgs: ["--base-dir", wtDir] }), "/tmp/r.json", "/cwd");
 			expect(extraBdArgs).toContain(realMainGit);
 			const dedupArgs = buildSwivalArgs(makeAgent({ addDirRo: [mainGit] }), "/tmp/r.json", wtDir);
 			expect(dedupArgs.filter((a) => a === "--add-dir-ro").length).toBe(1);
 			const parentRwArgs = buildSwivalArgs(makeAgent({ addDir: [path.dirname(mainGit)] }), "/tmp/r.json", wtDir);
 			expect(parentRwArgs).not.toContain("--add-dir-ro");
+			// Relative addDirRo resolves against cwd, not baseDir: when baseDir != cwd, a relative path matching baseDir does not suppress the grant
+			const unrelatedCwd = path.join(tmpRoot, "unrelated-cwd");
+			fs.mkdirSync(unrelatedCwd, { recursive: true });
+			const relMismatchArgs = buildSwivalArgs(
+				makeAgent({ baseDir: wtDir, addDirRo: ["../../repo/.git"] }),
+				"/tmp/r.json",
+				unrelatedCwd,
+			);
+			expect(relMismatchArgs).toContain(realMainGit);
+			// Preserves allowed_dirs_ro from project swival.toml / global config.toml when CLI --add-dir-ro is unset
+			const refDir = path.join(tmpRoot, "ref-docs");
+			fs.mkdirSync(refDir, { recursive: true });
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), `allowed_dirs_ro = ["${refDir}", "rel-ro"]\n`);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "rel-ro")]);
+			const preservedArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
+			expect(preservedArgs).toContain(refDir);
+			expect(preservedArgs).toContain(path.join(realWtDir, "rel-ro"));
+			expect(preservedArgs).toContain(realMainGit);
+			fs.unlinkSync(path.join(wtDir, "swival.toml"));
+			// Global XDG config.toml allowed_dirs_ro is preserved when CLI --add-dir-ro is unset, and skipped when CLI --add-dir-ro is set
+			const xdgSwival = path.join(tmpRoot, "xdg", "swival");
+			fs.mkdirSync(xdgSwival, { recursive: true });
+			fs.writeFileSync(path.join(xdgSwival, "config.toml"), `allowed_dirs_ro = ["${refDir}"]\n`);
+			const globalPreservedArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
+			expect(globalPreservedArgs).toContain(refDir);
+			expect(globalPreservedArgs).toContain(realMainGit);
+			const cliExplicitRoArgs = buildSwivalArgs(makeAgent({ addDirRo: ["/custom-ro"] }), "/tmp/r.json", wtDir);
+			expect(cliExplicitRoArgs).not.toContain(refDir);
+			expect(cliExplicitRoArgs).toContain("/custom-ro");
+			expect(cliExplicitRoArgs).toContain(realMainGit);
+			fs.unlinkSync(path.join(xdgSwival, "config.toml"));
 
 			// Project-scope agents and files=none (frontmatter or extraArgs) never receive auto --add-dir-ro
 			const projArgs = buildSwivalArgs(makeAgent({ source: "project" }), "/tmp/r.json", wtDir);
@@ -301,6 +334,8 @@ describe("buildSwivalArgs", () => {
 			expect(resolveLinkedWorktreeCommonGitDir(sshWtDir, fakeHome)).toBeUndefined();
 			expect(resolveLinkedWorktreeCommonGitDir(wtDir, path.join(realMainGit, "nested-home"))).toBeUndefined();
 		} finally {
+			if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+			else process.env.XDG_CONFIG_HOME = prevXdg;
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
 		}
 	});
