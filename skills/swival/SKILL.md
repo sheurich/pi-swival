@@ -91,7 +91,7 @@ swival-subagent with tasks: [
 ]
 ```
 
-Fresh worktrees track committed files only. Untracked dependencies (`node_modules`, `.venv`, `.env`) must be installed or linked before running builds or tests. Worktrees isolate concurrent writes against race conditions, but share `.git` configuration and hooks with the host repository.
+Fresh worktrees track committed files only. Untracked dependencies (`node_modules`, `.venv`, `.env`) must be installed or linked before running builds or tests. Worktrees isolate concurrent writes against race conditions, but share `.git` configuration and hooks with the host repository. For bundled and user-scope agents, `pi-swival` validates linked worktrees and passes `--add-dir-ro <common-git-dir>` so read-only Git commands (`status`, `rev-parse`, `diff`) work under `network: provider-only` (making shared `.git` metadata/config readable while keeping `.git` state write-protected).
 
 After tasks finish, commit any uncommitted changes in each worktree, merge the branches, and remove the worktrees:
 
