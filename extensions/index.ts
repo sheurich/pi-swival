@@ -638,6 +638,94 @@ export function readAnthropicAuthToken(homeDir: string): string | undefined {
 	}
 }
 
+function canonicalPathOrResolved(targetPath: string, baseDir?: string): string {
+	const resolved = baseDir ? path.resolve(baseDir, targetPath) : path.resolve(targetPath);
+	try {
+		return fs.realpathSync.native(resolved);
+	} catch {
+		return resolved;
+	}
+}
+
+/**
+ * Resolve the shared Git directory (`commondir`) for a linked Git worktree so
+ * read-only Git inspection (`git status`, `git rev-parse`, `git diff`) works
+ * under `--network provider-only` (`nono --read`).
+ *
+ * Enforces bidirectional Git worktree invariants before returning a path:
+ * 1. `<baseDir>/.git` is a regular file (`<= 4096` bytes, no symlink) with
+ *    `gitdir: <worktreeGitDir>`.
+ * 2. `<worktreeGitDir>` is a real directory containing regular files `HEAD`,
+ *    `commondir`, and `gitdir`, where `gitdir` resolves back to `<baseDir>/.git`.
+ * 3. `<commonGitDir>` is the parent of `<worktreeGitDir>`'s `worktrees/` dir,
+ *    contains regular file `HEAD` and real directories `objects/` and `refs/`,
+ *    lies outside `<baseDir>`, and does not overlap protected home directories.
+ */
+export function resolveLinkedWorktreeCommonGitDir(
+	baseDir: string | undefined,
+	homeDir: string = os.homedir(),
+): string | undefined {
+	if (!baseDir || !path.isAbsolute(baseDir)) return undefined;
+	try {
+		const realBaseDir = fs.realpathSync.native(baseDir);
+		if (!fs.lstatSync(realBaseDir).isDirectory()) return undefined;
+		const dotGitPath = path.join(realBaseDir, ".git");
+		const dotGitStat = fs.lstatSync(dotGitPath);
+		if (dotGitStat.isSymbolicLink() || !dotGitStat.isFile() || dotGitStat.size <= 0 || dotGitStat.size > 4096) {
+			return undefined;
+		}
+		const dotGitMatch = /^gitdir:\s*([^\r\n\0]+)\r?\n?$/.exec(fs.readFileSync(dotGitPath, "utf-8"));
+		if (!dotGitMatch) return undefined;
+		const rawWorktreeGitDir = path.resolve(realBaseDir, dotGitMatch[1].trim());
+		const rawWtStat = fs.lstatSync(rawWorktreeGitDir);
+		if (rawWtStat.isSymbolicLink() || !rawWtStat.isDirectory()) return undefined;
+		const worktreeGitDir = fs.realpathSync.native(rawWorktreeGitDir);
+		for (const reqFile of ["HEAD", "commondir", "gitdir"] as const) {
+			const st = fs.lstatSync(path.join(worktreeGitDir, reqFile));
+			if (st.isSymbolicLink() || !st.isFile() || st.size <= 0 || st.size > 4096) return undefined;
+		}
+		const backGitdirRaw = fs.readFileSync(path.join(worktreeGitDir, "gitdir"), "utf-8").trim();
+		if (!backGitdirRaw || /[\r\n\0]/.test(backGitdirRaw)) return undefined;
+		const backGitdirResolved = path.resolve(worktreeGitDir, backGitdirRaw);
+		const backGitdirDir = fs.realpathSync.native(path.dirname(backGitdirResolved));
+		if (backGitdirDir !== realBaseDir || path.basename(backGitdirResolved) !== ".git") {
+			return undefined;
+		}
+		const commondirRaw = fs.readFileSync(path.join(worktreeGitDir, "commondir"), "utf-8").trim();
+		if (!commondirRaw || /[\r\n\0]/.test(commondirRaw)) return undefined;
+		const rawCommonGitDir = path.resolve(worktreeGitDir, commondirRaw);
+		const rawCommonStat = fs.lstatSync(rawCommonGitDir);
+		if (rawCommonStat.isSymbolicLink() || !rawCommonStat.isDirectory()) return undefined;
+		const commonGitDir = fs.realpathSync.native(rawCommonGitDir);
+		if (path.dirname(worktreeGitDir) !== path.join(commonGitDir, "worktrees")) return undefined;
+		if (commonGitDir === path.parse(commonGitDir).root) return undefined;
+		if (commonGitDir === realBaseDir || commonGitDir.startsWith(realBaseDir + path.sep)) return undefined;
+		const headStat = fs.lstatSync(path.join(commonGitDir, "HEAD"));
+		if (headStat.isSymbolicLink() || !headStat.isFile() || headStat.size <= 0 || headStat.size > 4096) {
+			return undefined;
+		}
+		for (const reqDir of ["objects", "refs"] as const) {
+			const st = fs.lstatSync(path.join(commonGitDir, reqDir));
+			if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
+		}
+		const realHome = fs.existsSync(homeDir) ? fs.realpathSync.native(homeDir) : path.resolve(homeDir);
+		if (commonGitDir === realHome) return undefined;
+		for (const sub of [".ssh", ".gnupg", ".aws", ".config", ".pi", ".agentfs"]) {
+			const protectedRoot = canonicalPathOrResolved(path.join(realHome, sub));
+			if (
+				commonGitDir === protectedRoot ||
+				commonGitDir.startsWith(protectedRoot + path.sep) ||
+				protectedRoot.startsWith(commonGitDir + path.sep)
+			) {
+				return undefined;
+			}
+		}
+		return commonGitDir;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * Resolve optional child-process environment overrides for a Swival launch.
  * - Bridges Pi's `fastly-arc` API key from `~/.pi/agent/auth.json` into
@@ -1127,6 +1215,25 @@ export function buildSwivalArgs(
 	else if (cwd) args.push("--base-dir", cwd);
 	for (const d of agent.addDir ?? []) args.push("--add-dir", d);
 	for (const d of agent.addDirRo ?? []) args.push("--add-dir-ro", d);
+	const effectiveFilesMode = lastCliOptionValue(agent.extraArgs ?? [], "--files") ?? agent.files;
+	if (agent.source !== "project" && effectiveFilesMode !== "none") {
+		const configuredBaseDir = lastCliOptionValue(agent.extraArgs ?? [], "--base-dir") ?? agent.baseDir ?? cwd;
+		const baseDirCandidate = configuredBaseDir
+			? (cwd ? path.resolve(cwd, configuredBaseDir) : configuredBaseDir)
+			: undefined;
+		const linkedCommonGitDir = resolveLinkedWorktreeCommonGitDir(baseDirCandidate);
+		if (linkedCommonGitDir) {
+			const existingCanonical = [...(agent.addDir ?? []), ...(agent.addDirRo ?? [])].map((d) =>
+				canonicalPathOrResolved(d, baseDirCandidate),
+			);
+			const alreadyCovered = existingCanonical.some(
+				(d) => d === linkedCommonGitDir || linkedCommonGitDir.startsWith(d + path.sep),
+			);
+			if (!alreadyCovered) {
+				args.push("--add-dir-ro", linkedCommonGitDir);
+			}
+		}
+	}
 	const encryptSecrets = overrides.encryptSecrets ?? agent.encryptSecrets;
 	if (encryptSecrets) args.push("--encrypt-secrets");
 	if (agent.noReadGuard) args.push("--no-read-guard");

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
+import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
@@ -228,6 +228,81 @@ describe("buildSwivalArgs", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd-fallback");
 		const bd = args.indexOf("--base-dir");
 		expect(args[bd + 1]).toBe("/cwd-fallback");
+	});
+
+	it("auto-adds --add-dir-ro for a validated linked Git worktree and rejects forged .git pointers", () => {
+		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wt-"));
+		try {
+			const mainGit = path.join(tmpRoot, "repo", ".git");
+			const wtAdmin = path.join(mainGit, "worktrees", "lane-a");
+			const wtDir = path.join(tmpRoot, "worktrees", "lane-a");
+			fs.mkdirSync(path.join(mainGit, "objects"), { recursive: true });
+			fs.mkdirSync(path.join(mainGit, "refs"), { recursive: true });
+			fs.mkdirSync(wtAdmin, { recursive: true });
+			fs.mkdirSync(wtDir, { recursive: true });
+			fs.writeFileSync(path.join(mainGit, "HEAD"), "ref: refs/heads/main\n");
+			fs.writeFileSync(path.join(wtAdmin, "HEAD"), "ref: refs/heads/lane-a\n");
+			fs.writeFileSync(path.join(wtAdmin, "commondir"), "../..\n");
+			const realWtDir = fs.realpathSync.native(wtDir);
+			const realMainGit = fs.realpathSync.native(mainGit);
+			fs.writeFileSync(path.join(wtAdmin, "gitdir"), `${path.join(realWtDir, ".git")}\n`);
+			fs.writeFileSync(path.join(wtDir, ".git"), `gitdir: ${path.join(realMainGit, "worktrees", "lane-a")}\n`);
+
+			expect(resolveLinkedWorktreeCommonGitDir(wtDir)).toBe(realMainGit);
+			const userArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
+			const roIdx = userArgs.indexOf("--add-dir-ro");
+			expect(roIdx).toBeGreaterThan(-1);
+			expect(userArgs[roIdx + 1]).toBe(realMainGit);
+
+			// Honours --base-dir in extraArgs and deduplicates existing addDir / addDirRo
+			const extraBdArgs = buildSwivalArgs(makeAgent({ extraArgs: ["--base-dir", wtDir] }), "/tmp/r.json", "/cwd");
+			expect(extraBdArgs).toContain(realMainGit);
+			const dedupArgs = buildSwivalArgs(makeAgent({ addDirRo: [mainGit] }), "/tmp/r.json", wtDir);
+			expect(dedupArgs.filter((a) => a === "--add-dir-ro").length).toBe(1);
+			const parentRwArgs = buildSwivalArgs(makeAgent({ addDir: [path.dirname(mainGit)] }), "/tmp/r.json", wtDir);
+			expect(parentRwArgs).not.toContain("--add-dir-ro");
+
+			// Project-scope agents and files=none (frontmatter or extraArgs) never receive auto --add-dir-ro
+			const projArgs = buildSwivalArgs(makeAgent({ source: "project" }), "/tmp/r.json", wtDir);
+			expect(projArgs).not.toContain("--add-dir-ro");
+			const noneArgs = buildSwivalArgs(makeAgent({ files: "none" }), "/tmp/r.json", wtDir);
+			expect(noneArgs).not.toContain("--add-dir-ro");
+			const extraNoneArgs = buildSwivalArgs(makeAgent({ extraArgs: ["--files=none"] }), "/tmp/r.json", wtDir);
+			expect(extraNoneArgs).not.toContain("--add-dir-ro");
+
+			// Forged .git pointing to a directory whose gitdir does not point back fails closed
+			const otherWt = path.join(tmpRoot, "worktrees", "forged");
+			fs.mkdirSync(otherWt, { recursive: true });
+			fs.writeFileSync(path.join(otherWt, ".git"), `gitdir: ${path.join(realMainGit, "worktrees", "lane-a")}\n`);
+			expect(resolveLinkedWorktreeCommonGitDir(otherWt)).toBeUndefined();
+
+			// Symlinked .git file fails closed
+			const symWt = path.join(tmpRoot, "worktrees", "symlinked");
+			fs.mkdirSync(symWt, { recursive: true });
+			fs.symlinkSync(path.join(wtDir, ".git"), path.join(symWt, ".git"));
+			expect(resolveLinkedWorktreeCommonGitDir(symWt)).toBeUndefined();
+
+			// Protected home directory (or ancestor of ~/.ssh) fails closed even if shaped like a Git worktree
+			const fakeHome = path.join(tmpRoot, "home");
+			const dotSshGit = path.join(fakeHome, ".ssh", "repo.git");
+			const sshWtAdmin = path.join(dotSshGit, "worktrees", "lane-b");
+			const sshWtDir = path.join(tmpRoot, "worktrees", "lane-b");
+			fs.mkdirSync(path.join(dotSshGit, "objects"), { recursive: true });
+			fs.mkdirSync(path.join(dotSshGit, "refs"), { recursive: true });
+			fs.mkdirSync(sshWtAdmin, { recursive: true });
+			fs.mkdirSync(sshWtDir, { recursive: true });
+			const realSshWtDir = fs.realpathSync.native(sshWtDir);
+			const realDotSshGit = fs.realpathSync.native(dotSshGit);
+			fs.writeFileSync(path.join(dotSshGit, "HEAD"), "ref: refs/heads/main\n");
+			fs.writeFileSync(path.join(sshWtAdmin, "HEAD"), "ref: refs/heads/lane-b\n");
+			fs.writeFileSync(path.join(sshWtAdmin, "commondir"), "../..\n");
+			fs.writeFileSync(path.join(sshWtAdmin, "gitdir"), `${path.join(realSshWtDir, ".git")}\n`);
+			fs.writeFileSync(path.join(sshWtDir, ".git"), `gitdir: ${path.join(realDotSshGit, "worktrees", "lane-b")}\n`);
+			expect(resolveLinkedWorktreeCommonGitDir(sshWtDir, fakeHome)).toBeUndefined();
+			expect(resolveLinkedWorktreeCommonGitDir(wtDir, path.join(realMainGit, "nested-home"))).toBeUndefined();
+		} finally {
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("includes --report, --no-color, and the system prompt body", () => {
