@@ -275,7 +275,10 @@ describe("buildSwivalArgs", () => {
 			// Preserves allowed_dirs_ro from project swival.toml / global config.toml when CLI --add-dir-ro is unset
 			const refDir = path.join(tmpRoot, "ref-docs");
 			fs.mkdirSync(refDir, { recursive: true });
-			fs.writeFileSync(path.join(wtDir, "swival.toml"), `allowed_dirs_ro = ["${refDir}", "rel-ro"]\n`);
+			fs.writeFileSync(
+				path.join(wtDir, "swival.toml"),
+				[`allowed_dirs_ro = [`, `  "${refDir}",`, `  "rel-ro",`, `]`, `[profiles.example]`, `provider = "bedrock"`].join("\n") + "\n",
+			);
 			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "rel-ro")]);
 			const preservedArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
 			expect(preservedArgs).toContain(refDir);

@@ -683,13 +683,17 @@ function canonicalPathOrResolved(
 	}
 }
 
-function parseTomlRootStringArray(raw: string, key: string): string[] | undefined {
-	const firstTable = /(?:^|\n)\s*\[/.exec(raw);
+function parseTomlRootStringArray(raw: string, key: string): string[] | null | undefined {
+	const firstTable = /(?:^|\n)\s*\[[A-Za-z0-9_."'-]+\]/.exec(raw);
 	const rootSection = firstTable ? raw.slice(0, firstTable.index) : raw;
-	if (/^\s*["']/m.test(rootSection)) return undefined;
+	if (/^\s*["'][^"'\r\n]*["']\s*=/m.test(rootSection)) return null;
+	const anyKeyRe = new RegExp(`^\\s*${key}\\s*=`, "gm");
+	const keyMatches = rootSection.match(anyKeyRe);
+	if (!keyMatches || keyMatches.length === 0) return undefined;
+	if (keyMatches.length > 1) return null;
 	const keyRe = new RegExp(`^\\s*${key}\\s*=\\s*\\[([\\s\\S]*?)\\]\\s*(?:#.*)?$`, "m");
 	const match = keyRe.exec(rootSection);
-	if (!match) return undefined;
+	if (!match) return null;
 	const body = match[1];
 	const items: string[] = [];
 	let i = 0;
@@ -714,13 +718,13 @@ function parseTomlRootStringArray(raw: string, key: string): string[] | undefine
 				const c = body[i];
 				if (quote === '"' && c === "\\") {
 					i++;
-					if (i >= body.length) return undefined;
+					if (i >= body.length) return null;
 					const esc = body[i];
 					if (esc === '"' || esc === "\\") val += esc;
 					else if (esc === "n") val += "\n";
 					else if (esc === "t") val += "\t";
 					else if (esc === "r") val += "\r";
-					else return undefined;
+					else return null;
 					i++;
 					continue;
 				}
@@ -729,15 +733,15 @@ function parseTomlRootStringArray(raw: string, key: string): string[] | undefine
 					i++;
 					break;
 				}
-				if (c === "\n" || c === "\r" || c === "\0") return undefined;
+				if (c === "\n" || c === "\r" || c === "\0") return null;
 				val += c;
 				i++;
 			}
-			if (!closed) return undefined;
+			if (!closed) return null;
 			items.push(val);
 			continue;
 		}
-		return undefined;
+		return null;
 	}
 	return items;
 }
@@ -765,6 +769,7 @@ export function readConfiguredAllowedDirsRo(
 			const projRaw = readSafeRegularText(path.join(realBaseDir, "swival.toml"), 65536, false);
 			if (projRaw !== undefined) {
 				const projEntries = parseTomlRootStringArray(projRaw, "allowed_dirs_ro");
+				if (projEntries === null) return [];
 				if (projEntries !== undefined) {
 					return resolveEntries(projEntries, realBaseDir);
 				}
@@ -777,6 +782,7 @@ export function readConfiguredAllowedDirsRo(
 		const globalRaw = readSafeRegularText(path.join(globalDir, "config.toml"), 65536, false);
 		if (globalRaw !== undefined) {
 			const globalEntries = parseTomlRootStringArray(globalRaw, "allowed_dirs_ro");
+			if (globalEntries === null) return [];
 			if (globalEntries !== undefined) {
 				return resolveEntries(globalEntries, globalDir);
 			}
