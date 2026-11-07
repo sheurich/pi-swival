@@ -1573,6 +1573,8 @@ export interface TraceToolCall {
 	type: "toolCall";
 	name: string;
 	args: Record<string, unknown>;
+	sessionId?: string;
+	toolUseId?: string;
 	ok?: boolean; // set when a matching tool_result arrives
 }
 export interface TraceText {
@@ -2313,11 +2315,14 @@ export function startTraceTail(
 	let buffer = "";
 	const toolUseNames = new Map<string, string>();
 
-	let consuming = false;
+	let consuming: Promise<void> | null = null;
 	let shouldRerun = false;
-	const consume = async () => {
-		if (consuming) { shouldRerun = true; return; }
-		consuming = true;
+	let stopped = false;
+	const consume = (): Promise<void> => {
+		shouldRerun = true;
+		if (consuming) return consuming;
+		// Defer the body so even an empty read shares the tracked promise.
+		consuming = Promise.resolve().then(async () => {
 		try {
 			do {
 				shouldRerun = false;
@@ -2328,7 +2333,7 @@ export function startTraceTail(
 				} catch {
 					return;
 				}
-				if (stat.size <= position) return;
+				if (stat.size <= position) continue;
 				let handle: fs.promises.FileHandle | undefined;
 				try {
 					handle = await fs.promises.open(traceFile, "r");
@@ -2362,6 +2367,10 @@ export function startTraceTail(
 							continue;
 						}
 						const t = obj.type;
+						// Older/synthetic traces omit sessionId; the selected filename
+						// is a stable session identity for those records.
+						const sessionId = typeof obj.sessionId === "string" ? obj.sessionId : path.basename(traceFile, ".jsonl");
+						const toolKey = (id: string) => JSON.stringify([sessionId, id]);
 						if (t === "assistant" && obj.message) {
 							const msg = obj.message as Record<string, unknown>;
 							const content = msg.content;
@@ -2370,9 +2379,10 @@ export function startTraceTail(
 									if (!part || typeof part !== "object") continue;
 									const p = part as Record<string, unknown>;
 									if (p.type === "tool_use" && typeof p.name === "string") {
-										if (typeof p.id === "string") toolUseNames.set(p.id, p.name);
+										const toolUseId = typeof p.id === "string" ? p.id : undefined;
+										if (toolUseId !== undefined) toolUseNames.set(toolKey(toolUseId), p.name);
 										const args = (p.input as Record<string, unknown>) ?? {};
-										onEvent({ type: "toolCall", name: p.name, args });
+										onEvent({ type: "toolCall", name: p.name, args, sessionId, toolUseId });
 									} else if (p.type === "text" && typeof p.text === "string" && p.text.trim()) {
 										onEvent({ type: "text", text: p.text });
 									}
@@ -2388,9 +2398,10 @@ export function startTraceTail(
 									if (!part || typeof part !== "object") continue;
 									const p = part as Record<string, unknown>;
 									if (p.type === "tool_result" && typeof p.tool_use_id === "string") {
-										const name = toolUseNames.get(p.tool_use_id) ?? "tool";
+										const toolUseId = p.tool_use_id;
+										const name = toolUseNames.get(toolKey(toolUseId)) ?? "tool";
 										const ok = p.is_error !== true;
-										onEvent({ type: "toolCall", name, args: {}, ok });
+										onEvent({ type: "toolCall", name, args: {}, sessionId, toolUseId, ok });
 									}
 								}
 							}
@@ -2401,12 +2412,14 @@ export function startTraceTail(
 				}
 			} while (shouldRerun);
 		} finally {
-			consuming = false;
+			consuming = null;
 		}
+		});
+		return consuming;
 	};
 
 	const attachFileWatcher = () => {
-		if (!traceFile || fileWatcher) return;
+		if (stopped || !traceFile || fileWatcher) return;
 		try {
 			fileWatcher = fs.watch(traceFile, { persistent: false }, () => {
 				void consume();
@@ -2416,18 +2429,25 @@ export function startTraceTail(
 		}
 	};
 
-	const pickTraceFile = async () => {
-		try {
-			const entries = await fs.promises.readdir(traceDir);
-			const jsonl = entries.find((e) => e.endsWith(".jsonl"));
-			if (jsonl) {
-				traceFile = path.join(traceDir, jsonl);
+	let picking: Promise<void> | null = null;
+	const pickTraceFile = (): Promise<void> => {
+		if (picking) return picking;
+		picking = Promise.resolve().then(async () => {
+			try {
+				if (!traceFile) {
+					const entries = await fs.promises.readdir(traceDir);
+					const jsonl = entries.find((e) => e.endsWith(".jsonl"));
+					if (jsonl) traceFile = path.join(traceDir, jsonl);
+				}
 				attachFileWatcher();
 				await consume();
+			} catch {
+				/* trace dir not created yet */
+			} finally {
+				picking = null;
 			}
-		} catch {
-			/* trace dir not created yet */
-		}
+		});
+		return picking;
 	};
 
 	try {
@@ -2445,9 +2465,16 @@ export function startTraceTail(
 	void pickTraceFile();
 
 	return async () => {
+		stopped = true;
 		clearInterval(pollInterval);
 		watcher?.close();
 		fileWatcher?.close();
+		// Discovery may still be queued when the process exits immediately
+		// after writing its trace. Join it before asking for the final read.
+		await pickTraceFile();
+		// An earlier readdir may have snapshotted an empty directory before
+		// the child's final write. Retry discovery once after joining it.
+		if (!traceFile) await pickTraceFile();
 		await consume();
 	};
 }
@@ -3336,14 +3363,13 @@ async function runSingleSwival(
 
 	const stopTrace = startTraceTail(traceDir, (event) => {
 		if (!current.traceEvents) current.traceEvents = [];
-		// Merge tool_result results into the matching toolCall to avoid
-		// doubling events; we only track the most recent pending call for a
-		// name because the trace does not carry unique ids we can cheaply key
-		// on from this side.
-		if (event.type === "toolCall" && event.ok !== undefined) {
+		// A name is not an identity: same-name calls can overlap, and tool
+		// IDs can be reused in another session. Never guess for orphan results.
+		if (event.type === "toolCall" && event.ok !== undefined && event.toolUseId !== undefined) {
 			for (let i = current.traceEvents.length - 1; i >= 0; i--) {
 				const prev = current.traceEvents[i];
-				if (prev.type === "toolCall" && prev.name === event.name && prev.ok === undefined) {
+				if (prev.type === "toolCall" && prev.sessionId === event.sessionId &&
+					prev.toolUseId === event.toolUseId && prev.ok === undefined) {
 					prev.ok = event.ok;
 					scheduleEmit();
 					return;
@@ -3491,6 +3517,11 @@ async function runSingleSwival(
 			}
 		});
 
+		// The child has closed: drain trace discovery and all outstanding reads
+		// before the canonical update or artifact persistence observes the run.
+		await stopTrace().catch(() => undefined);
+		if (emitTimer) { clearTimeout(emitTimer); emitTimer = undefined; }
+		emitPending = false;
 		current.exitCode = exitCode;
 		current.durationMs = Date.now() - started;
 		current.report = await readReport(reportPath);
