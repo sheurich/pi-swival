@@ -49,7 +49,8 @@ describe("test peer bootstrap", () => {
 		expect(root.scripts.typecheck).not.toMatch(/install|npx/);
 		expect(root.scripts.test).not.toMatch(/install|npx/);
 		const setup = readFileSync(new URL("./setup.sh", import.meta.url), "utf8");
-		expect(setup).toContain("node_modules/typescript/package.json");
+		expect(setup.match(/^\s*npm ci\b/gm)).toHaveLength(2);
+		expect(setup).not.toMatch(/pinned_types_present|npm install|--package-lock=false/);
 		expect(setup).toContain("--ignore-scripts");
 		expect(setup).not.toMatch(/--allow-scripts|--unsafe-perm/);
 	});
