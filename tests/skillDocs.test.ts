@@ -239,11 +239,23 @@ describe("swival-worker-briefs points at the bundled self-review-worker", () => 
 
 	it("uses the bundled relative source path", () => {
 		expect(skill()).toContain("../../agents/self-review-worker.md");
+		expect(skill()).toContain("../../agents/test-runner.md");
 	});
 
 	it("requires distinct cwd for parallel dispatch", () => {
 		const matches = [...skill().matchAll(/cwd:\s*"([^"]+)"/g)].map((m) => m[1]);
 		expect(new Set(matches).size).toBeGreaterThanOrEqual(2);
+	});
+
+	it.each([
+		["read-only SelfReviewer mechanics", /READ_ONLY_AGENT_TOOLS/],
+		["outer-success on maxReviewRounds or reviewer error", /accepting answer as-is/],
+		["worktree pre-flight and hygiene", /Pre-flight & Hygiene/],
+		["dispatch overrides", /reviewPromptOverride/],
+		["provider-only network override", /networkOverride:\s*"provider-only"/],
+		["context-budget output controls", /outputMode:\s*"file-only"/],
+	])("documents %s", (_label, pattern) => {
+		expect(skill()).toMatch(pattern);
 	});
 });
 
