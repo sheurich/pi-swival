@@ -23,13 +23,13 @@ Understanding Swival's `SelfReviewer` mechanics is essential when writing briefs
 1. **Read-only file inspection only — no commands or tests:** `SelfReviewer` runs a read-only agent loop (`READ_ONLY_AGENT_TOOLS`, `files="some"`, `network="provider-only"`) using the same model/provider as the worker. It can read, list, grep, and outline files inside `cwd`, **but it cannot execute shell commands, builds, or tests**.
 2. **No visibility into the worker's tool-call transcript:** `SelfReviewer` receives only `<task>`, optional `<verification>` (`verifyOverride`), the worker's final `<answer>` text, and optional custom rubric instructions (`reviewPromptOverride`). It never sees intermediate tool calls or command outputs unless the worker quotes them in `<answer>`.
 3. **Scoped strictly to `cwd`:** `SelfReviewer` inspects only `cwd` (`base_dir`) with `extra_write_roots=[]`. Files outside `cwd` (including paths granted to the worker via `addDir` or `addDirRo`) are invisible to `SelfReviewer`. Keep all files that require review inside `cwd`.
-4. **When to use `test-runner` instead:** If completion depends on an executable test, linter, or build script provably exiting `0`, dispatch `test-runner` (`../../agents/test-runner.md`) with `reviewerOverride: "<script>"` (test-as-contract), or pair `self-review-worker` with `reviewPromptOverride` / `verifyOverride` and run the test command independently in the parent session after the worker finishes.
+4. **When to use `test-runner` instead:** If you want an executable test, linter, or build script to run inside the retry loop after each turn, dispatch `test-runner` (`../../agents/test-runner.md`) with `reviewerOverride: "<script>"` (test-as-contract), or pair `self-review-worker` with `reviewPromptOverride` / `verifyOverride`. Because Swival's review loop applies the same outer-success fallback to both `--self-review` and external `--reviewer` scripts (see below), always verify `report.json` and run the test command in the parent session before accepting either agent's output.
 
 ## Reviewer outcome semantics and parent verification
 
-In Swival 1.9.3, when `SelfReviewer` encounters a reviewer error (`verdict.status == "error"`) or reaches `maxReviewRounds` (default `5`), Swival logs a warning (`accepting answer as-is` or `Max review rounds (<N>) reached, accepting answer`) and still exits `0` with `result.outcome = "success"`.
+In Swival 1.9.3, when either `SelfReviewer` (`--self-review`) or `ExternalReviewer` (`--reviewer`, used by `test-runner`) encounters a reviewer error (`verdict.status == "error"` / exit code `>= 2`) or reaches `maxReviewRounds` (default `5` on `self-review-worker`, `10` on `test-runner`), Swival logs a warning (`accepting answer as-is` or `Max review rounds (<N>) reached, accepting answer`) and still exits `0` with `result.outcome = "success"`.
 
-After every `self-review-worker` run, the caller must:
+After every `self-review-worker` (or `test-runner`) run, the caller must:
 
 - Inspect `report.json` (confirm the final `type: "review"` entry in `timeline` has `exit_code: 0` rather than `1` or `2`).
 - Run `git status --short`, `git diff`, and the validation command independently in the parent session before staging or committing.
@@ -70,7 +70,7 @@ Pair a well-structured brief with dispatch overrides that match the task's risk 
 | `reviewPromptOverride` | Supply a focused checklist for `SelfReviewer` to verify in the edited files (e.g. `"Read the modified files and verify error paths, types, and quoted test output."` ). |
 | `verifyOverride` | Point `SelfReviewer` at an acceptance-criteria file path (resolved relative to `cwd`). |
 | `instructionsFullOverride: true` | Load complete repository `AGENTS.md`/`CLAUDE.md` files without the instruction-budget cap (`<= 8,192` tokens; suppresses `--no-instructions`). |
-| `output` / `outputMode` / `maxInlineBytes` | Pass `output: "<artifact-path>"` (defaults to `outputMode: "file-only"`) or `maxInlineBytes` so `SelfReviewer` inspects the full verbose `<answer>` in-process while the parent session receives a compact file reference instead of bloating context. |
+| `output` / `outputMode` / `maxInlineBytes` | Pass `output: "<artifact-path>"` (resolved relative to the task's `cwd`; defaults to `outputMode: "file-only"`) to return only path + size metadata to the parent while `SelfReviewer` still inspects the full `<answer>` in-process, or pass `maxInlineBytes` to keep short answers inline and truncate longer ones with a pointer to the artifact directory. |
 
 ## Brief template
 
@@ -137,7 +137,7 @@ swival-subagent with
     {
       agent: "self-review-worker",
       cwd: ".worktrees/worker-a",
-      output: ".worktrees/worker-a/.swival-summary.md",
+      output: ".swival-summary.md",
       task: [
         "Goal: Refactor auth token parsing.",
         "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status; stop on unexpected dirt. Do not commit or weaken tests.",
@@ -151,7 +151,7 @@ swival-subagent with
     {
       agent: "self-review-worker",
       cwd: ".worktrees/worker-b",
-      output: ".worktrees/worker-b/.swival-summary.md",
+      output: ".swival-summary.md",
       task: [
         "Goal: Add parser error regression tests.",
         "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status; stop on unexpected dirt. Do not commit or edit production code.",
@@ -167,7 +167,7 @@ swival-subagent with
 
 ## Common pitfalls
 
-- **Assuming `--self-review` runs your test suite:** `SelfReviewer` is read-only and cannot run commands. If the worker does not quote command exit codes and output in `<answer>`, `SelfReviewer` has no way to see whether tests ran. Use `test-runner` with `reviewerOverride` when an executable script must gate completion.
+- **Assuming `--self-review` runs your test suite:** `SelfReviewer` is read-only and cannot run commands. If the worker does not quote command exit codes and output in `<answer>`, `SelfReviewer` has no way to see whether tests ran. Use `test-runner` with `reviewerOverride` when an executable script should drive retry feedback, and still verify `report.json` (`exit_code: 0` on the final `type: "review"` timeline entry) plus parent-session validation before accepting.
 - **Editing or referencing files outside `cwd`:** `SelfReviewer` cannot read paths outside `cwd` (even with `addDir` / `addDirRo`). Always set `cwd` to a root that encloses every file under review.
 - **Trusting exit code `0` without checking `report.json` and `git diff`:** Swival 1.9.3 exits `0` with `outcome = "success"` even when `maxReviewRounds` is exhausted or the reviewer errors. Check `timeline` review events in `report.json` and run validation in the parent session.
 - **Requesting review-only output from `self-review-worker`:** Use a read-only reviewer agent instead.
