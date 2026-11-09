@@ -51,6 +51,22 @@ describe("CI hardening", () => {
 		expect(step.run.indexOf("sha256sum -c -")).toBeLessThan(step.run.indexOf("tar -xJf"));
 	});
 
+	it("installs digest-pinned nono before the native gate requires provider-only isolation", () => {
+		const steps = jobs.agentfs.steps;
+		const install = steps.findIndex((step: any) => step.name === "Install pinned nono");
+		const native = steps.findIndex((step: any) => step.run === "npm run native-agentfs-integration");
+		expect(install).toBeGreaterThanOrEqual(0);
+		expect(install).toBeLessThan(native);
+		const run = steps[install].run;
+		expect(run).toContain("nono-v0.80.0-x86_64-unknown-linux-gnu.tar.gz");
+		expect(run).toContain("6da665b61999570c10dffc7da78828fe1fb7f3cac53319e505cebecaef17037f");
+		expect(run.match(/\bcurl\b/g)).toHaveLength(1);
+		expect(run.indexOf("sha256sum -c -")).toBeGreaterThan(0);
+		expect(run.indexOf("sha256sum -c -")).toBeLessThan(run.indexOf("tar -xzf"));
+		expect(run).toContain('"$HOME/.local/bin/nono"');
+		expect(run).toContain('"$GITHUB_PATH"');
+	});
+
 	it("bootstraps both test jobs with the selected Pi host, pinned Node/uv, and Python 3.13", () => {
 		for (const name of ["test", "agentfs"]) {
 			const steps = jobs[name].steps;
