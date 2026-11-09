@@ -448,6 +448,33 @@ describe("isRunFailure", () => {
 });
 
 describe("terminalFailureReason and renderStatus", () => {
+	it.each([0, 2])("retains exhausted reports with %i review rounds and classifies the turn limit", (reviewRounds) => {
+		const raw = loadFixture("report-exhausted.json");
+		const report = summarizeReport({ ...raw, stats: { ...(raw.stats as object), review_rounds: reviewRounds } });
+		expect(report.outcome).toBe("exhausted");
+		expect(report.accepted).toBe(false);
+		expect(report.reviewRounds).toBe(reviewRounds);
+		expect(report.answer).toBe("Synthetic partial work; not a completed answer.");
+		for (const exitCode of [0, 2]) {
+			expect(isRunFailure({ exitCode, report })).toBe(true);
+			expect(terminalFailureReason(exitCode, report, ["401 Unauthorized"])).toEqual({
+				code: "max_turns",
+				text: "Swival reached its turn limit before completion.",
+			});
+		}
+	});
+
+	it.each([0, 2])("fails closed without inferring exhaustion from exit %i", (exitCode) => {
+		for (const report of [undefined, summarizeReport({}), summarizeReport({ result: "malformed" }), summarizeReport({ result: { outcome: "future-outcome" } })]) {
+			expect(isRunFailure({ exitCode, report })).toBe(true);
+			expect(terminalFailureReason(exitCode, report, [])).toEqual({
+				code: "config_error",
+				text: "Swival did not produce a valid terminal report.",
+			});
+		}
+		expect(terminalFailureReason(2, summarizeReport({ result: { outcome: "success" } }), [])?.code).toBe("non_zero_exit");
+	});
+
 	it("maps exit status 130 directly to non_zero_exit reason", () => {
 		const res = terminalFailureReason(130, undefined, ["process killed"]);
 		expect(res?.code).toBe("non_zero_exit");
