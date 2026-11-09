@@ -75,6 +75,8 @@ describe("status and resume consumption", () => {
 		options: {
 			sandbox?: Record<string, unknown>;
 			outcome?: "success" | "failed" | "error";
+			report?: Record<string, unknown>;
+			malformedReport?: boolean;
 			exitCode?: number;
 			includeReport?: boolean;
 			agentFsRequested?: boolean;
@@ -94,7 +96,7 @@ describe("status and resume consumption", () => {
 			}));
 		}
 		if (options.includeReport !== false) {
-			fs.writeFileSync(path.join(artifactDir, "report.json"), JSON.stringify({
+			fs.writeFileSync(path.join(artifactDir, "report.json"), options.malformedReport ? "{invalid json" : JSON.stringify(options.report ?? {
 				result: {
 					outcome: options.outcome ?? "success",
 					answer: "must not be presented as success",
@@ -132,6 +134,31 @@ describe("status and resume consumption", () => {
 		});
 		expect(result.isError).not.toBe(true);
 		if (action === "resume") expect(result.content[0].text).toContain("must not be presented as success");
+	});
+
+	it.each(["status", "resume"] as const)("%s classifies persisted exhausted results without losing artifacts", async (action) => {
+		const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/report-exhausted.json", import.meta.url), "utf-8"));
+		for (const reviewRounds of [0, 2]) {
+			const report = { ...fixture, stats: { ...fixture.stats, review_rounds: reviewRounds } };
+			const { artifactDir, result } = await executeAction(action, { agentFsRequested: false, exitCode: 2, report });
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toContain("failed (max_turns): Swival reached its turn limit before completion.");
+			expect(result.content[0].text).toContain(`Artifact dir: ${artifactDir}`);
+			expect(result.content[0].text).not.toMatch(/review_rejected|Synthetic partial work|stdout answer/);
+			expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "report.json"), "utf-8"))).toEqual(report);
+			expect(fs.readFileSync(path.join(artifactDir, "stdout.txt"), "utf-8")).toBe("stdout answer");
+		}
+	});
+
+	it.each(["status", "resume"] as const)("%s fails closed for malformed/unknown reports at exit zero or two", async (action) => {
+		for (const exitCode of [0, 2]) {
+			for (const reportOptions of [{ malformedReport: true }, { report: { result: { outcome: "future-outcome" } } }, { includeReport: false }]) {
+				const { result } = await executeAction(action, { agentFsRequested: false, exitCode, ...reportOptions });
+				expect(result.isError).toBe(true);
+				expect(result.content[0].text).toContain("valid terminal report");
+				expect(result.content[0].text).not.toMatch(/max_turns|stdout answer/);
+			}
+		}
 	});
 
 	it.each(["status", "resume"] as const)("%s rejects failed outcomes and hides partial output", async (action) => {

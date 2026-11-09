@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildParallelSummary, type SwivalResult } from "../extensions/index.js";
+import { buildParallelSummary, summarizeReport, terminalFailureReason, type SwivalResult } from "../extensions/index.js";
 
 function makeResult(overrides: Partial<SwivalResult> = {}): SwivalResult {
 	return {
@@ -16,6 +16,19 @@ function makeResult(overrides: Partial<SwivalResult> = {}): SwivalResult {
 }
 
 describe("buildParallelSummary", () => {
+	it.each([0, 2])("summarizes exhaustion with %i review rounds as failed/max_turns, not rejection", (reviewRounds) => {
+		const report = summarizeReport({ result: { outcome: "exhausted", answer: "partial work" }, stats: { review_rounds: reviewRounds, turns: 100 } });
+		const reason = terminalFailureReason(2, report, []);
+		const exhausted = makeResult({ exitCode: 2, report, reason, errorMessage: reason?.text, finalOutput: report.answer!, artifactDir: "/artifacts/exhausted" });
+		const summary = buildParallelSummary([makeResult(), exhausted]);
+		expect(summary).toContain("swival parallel: 1/2 ok");
+		expect(summary).toContain("worker (failed/max_turns, 100 turns)");
+		expect(summary).toContain("error: Swival reached its turn limit before completion.");
+		expect(summary).toContain("artifacts: /artifacts/exhausted");
+		expect(summary).not.toMatch(/rejected|partial work/);
+		expect(exhausted.finalOutput).toBe("partial work");
+	});
+
 	it("uses 'ok' vocabulary in the aggregate header (not 'succeeded')", () => {
 		const summary = buildParallelSummary([makeResult()]);
 		expect(summary).toMatch(/^swival parallel: 1\/1 ok/);
