@@ -1491,8 +1491,9 @@ interface ReportSummary {
 	// Derived from result.outcome. "success" means reviewer accepted (or
 	// review was disabled and swival returned a terminal answer). "failed"
 	// is a reviewer rejection. "error" is an internal AgentError (see
-	// errorMessage for the specific cause).
-	outcome?: "success" | "failed" | "error" | "interrupted" | "unknown";
+	// errorMessage for the specific cause). "exhausted" means the turn limit
+	// was reached before completion, not reviewer rejection.
+	outcome?: "success" | "failed" | "error" | "interrupted" | "exhausted" | "unknown";
 	accepted?: boolean;
 	// From result.error_message — populated when swival raised an AgentError
 	// subclass (ConfigError, ContextOverflowError, ToolsNotSupportedError,
@@ -1685,6 +1686,7 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 	else if (outcomeVal === "failed") outcome = "failed";
 	else if (outcomeVal === "error") outcome = "error";
 	else if (outcomeVal === "interrupted") outcome = "interrupted";
+	else if (outcomeVal === "exhausted") outcome = "exhausted";
 
 	// Last reviewer feedback: the most recent timeline entry of type "review".
 	// We include its feedback even on accepted runs (for visibility), but
@@ -1726,7 +1728,7 @@ export function summarizeReport(raw: Record<string, unknown>): ReportSummary {
 		accepted:
 			outcome === "success"
 				? true
-				: outcome === "failed" || outcome === "error" || outcome === "interrupted"
+				: outcome === "failed" || outcome === "error" || outcome === "interrupted" || outcome === "exhausted"
 					? false
 					: undefined,
 		errorMessage: toStr(result.error_message),
@@ -1895,6 +1897,13 @@ export function classifyFailure(
 	stderrLines: readonly string[],
 	report?: ReportSummary,
 ): FailureReason | undefined {
+	if (report?.outcome === "exhausted") {
+		return {
+			code: "max_turns",
+			text: "Swival reached its turn limit before completion.",
+		};
+	}
+
 	// Review budget exhausted is usually success-from-swival-cli's POV (exit 0)
 	// but outcome=failed in the report. We surface it specifically so the
 	// caller knows *why* the run is marked failed rather than showing stderr.

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "result": {
+    "outcome": "exhausted",
+    "exit_code": 2,
+    "answer": "Synthetic partial work; not a completed answer."
+  },
+  "settings": {
+    "max_turns": 100
+  },
+  "stats": {
+    "turns": 100,
+    "review_rounds": 0
+  }
+}

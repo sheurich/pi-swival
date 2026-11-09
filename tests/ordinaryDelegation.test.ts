@@ -204,6 +204,31 @@ process.exit(0);
 		expect(parsed.trackedFiles.some((f: string) => f.includes("name.txt"))).toBe(true);
 	});
 
+	it.each([0, 2])("returns exhausted sync output with %i review rounds without retrying", async (reviewRounds) => {
+		const fixture = JSON.parse(fs.readFileSync(new URL("./fixtures/report-exhausted.json", import.meta.url), "utf-8"));
+		const report = { ...fixture, stats: { ...fixture.stats, review_rounds: reviewRounds }, sandbox: { mode: "agentfs", agentfs_version: "0.6.4" } };
+		const calls = path.join(binDir, "calls.txt");
+		fs.writeFileSync(path.join(binDir, "swival"), `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+if (args.includes('--version')) { console.log('1.9.3'); process.exit(0); }
+fs.appendFileSync(${JSON.stringify(calls)}, 'run\\n');
+fs.writeFileSync(args[args.indexOf('--report') + 1], ${JSON.stringify(JSON.stringify(report))});
+console.log('streamed partial work');
+process.exit(2);
+`, { mode: 0o755 });
+		const result = await tool.execute("exhausted-sync", { agent: "swival", task: "Return partial work", cwd: repoDir }, undefined, undefined, { cwd: repoDir, hasUI: false });
+		const run = result.details.results[0];
+		expect(fs.readFileSync(calls, "utf-8")).toBe("run\n");
+		expect(result.isError).toBe(true);
+		expect(run.reason).toEqual({ code: "max_turns", text: "Swival reached its turn limit before completion." });
+		expect(run.report.outcome).toBe("exhausted");
+		expect(run.report.accepted).toBe(false);
+		expect(run.finalOutput).toBe(fixture.result.answer);
+		expect(result.content[0].text).toContain("Swival reached its turn limit before completion.");
+		expect(JSON.parse(fs.readFileSync(path.join(run.artifactDir, "report.json"), "utf-8"))).toEqual(report);
+	});
+
 	it("surfaces instruction-file-too-large as config_error rather than opaque failure", async () => {
 		const fakeSwival = path.join(binDir, "swival");
 		fs.writeFileSync(
