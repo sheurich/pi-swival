@@ -932,7 +932,7 @@ class NativeEntryTests(unittest.TestCase):
             '[profiles.vertex-gemini-flash]\nprovider="geap"\nmodel="gemini-3.8-flash"\n'
             'project="p"\nlocation="global"\n'
             '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
-            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+            'model="claude-mythos-5-2"\nmax_context_tokens=1000000\n'
             'reasoning_effort="high"\n'
         )
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
@@ -940,7 +940,7 @@ class NativeEntryTests(unittest.TestCase):
                 {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
             )
         self.assertEqual(route["provider"], "anthropic")
-        self.assertEqual(route["model"], "claude-mythos-5-1")
+        self.assertEqual(route["model"], "claude-mythos-5-2")
         self.assertEqual(route["reasoningEffort"], "high")
         self.assertEqual(route["options"]["max_context_tokens"], 1000000)
 
@@ -948,7 +948,7 @@ class NativeEntryTests(unittest.TestCase):
         self.write_config(
             'encrypt_secrets=true\n'
             '[profiles.anthropic-claude-mythos]\nprovider="anthropic"\n'
-            'model="claude-mythos-5-1"\nmax_context_tokens=1000000\n'
+            'model="claude-mythos-5-2"\nmax_context_tokens=1000000\n'
         )
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}), \
              self.assertRaises(bridge.NativeAuditError) as raised:
@@ -974,15 +974,19 @@ class NativeEntryTests(unittest.TestCase):
         def fake_completion(*args, **kwargs):
             captured.update(kwargs)
             return "ok"
+        from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+        litellm.model_cost.pop("claude-mythos-5-2", None)
+        self.addCleanup(litellm.model_cost.pop, "claude-mythos-5-2", None)
+        self.assertFalse(AnthropicConfig.model_supports_effort_param("claude-mythos-5-2", "anthropic"))
         with patch.object(litellm, "completion", side_effect=fake_completion):
             shim_spec.loader.exec_module(shim_mod)
             litellm.completion(
-                model="anthropic/claude-mythos-5-1",
+                model="anthropic/claude-mythos-5-2",
                 api_key="sk-ant-oat01-synthetic",
                 messages=[{"role": "system", "content": "Audit instructions"}],
                 extra_headers={"User-Agent": "swival/1.9.3"},
             )
-        self.assertEqual(captured["extra_headers"]["User-Agent"], "claude-cli/2.1.280")
+        self.assertEqual(captured["extra_headers"]["User-Agent"], "claude-cli/2.1.290")
         self.assertEqual(captured["extra_headers"]["x-app"], "cli")
         self.assertIn("claude-code-20250219", captured["extra_headers"]["anthropic-beta"])
         self.assertIn("oauth-2025-04-20", captured["extra_headers"]["anthropic-beta"])
@@ -991,6 +995,14 @@ class NativeEntryTests(unittest.TestCase):
             "You are Claude Code, Anthropic's official CLI for Claude.",
         )
         self.assertEqual(captured["messages"][0]["content"][1]["text"], "Audit instructions")
+
+        # The shim backfills the model map so reasoning effort is not dropped
+        self.assertTrue(AnthropicConfig.model_supports_effort_param("claude-mythos-5-2", "anthropic"))
+        backfilled = litellm.model_cost["claude-mythos-5-2"]
+        self.assertEqual(backfilled["litellm_provider"], "anthropic")
+        self.assertEqual(backfilled["max_input_tokens"], 1000000)
+        self.assertEqual(backfilled["input_cost_per_token"], 8e-06)
+        self.assertNotIn("input_cost_per_token_batches", backfilled)
 
         # Verify shim disables get_valid_models and Swival NotFound model replacement
         self.assertEqual(
@@ -1008,13 +1020,13 @@ class NativeEntryTests(unittest.TestCase):
         failure = litellm.NotFoundError(
             "synthetic missing anthropic model",
             llm_provider="anthropic",
-            model="claude-mythos-5-1",
+            model="claude-mythos-5-2",
         )
         with patch.object(litellm, "completion", side_effect=failure) as completion:
             with self.assertRaises(agent.AgentError):
                 agent.call_llm(
                     None,
-                    "claude-mythos-5-1",
+                    "claude-mythos-5-2",
                     [{"role": "user", "content": "synthetic"}],
                     100,
                     None,
@@ -1028,7 +1040,7 @@ class NativeEntryTests(unittest.TestCase):
                 )
         self.assertEqual(
             {call.kwargs["model"] for call in completion.call_args_list},
-            {"anthropic/claude-mythos-5-1"},
+            {"anthropic/claude-mythos-5-2"},
         )
         self.assertFalse(agent._MODEL_AUTOFIX)
 
