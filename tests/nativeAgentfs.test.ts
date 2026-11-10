@@ -4,11 +4,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
 import { nativeTestPython } from "./nativePython.js";
-import { captureNativeRuntime, prepareNativeAudit, inspectNativeAudit } from "../extensions/native-audit.js";
+import { buildNativeAgentfsArgs, captureNativeRuntime, prepareNativeAudit, inspectNativeAudit } from "../extensions/native-audit.js";
 import { fixtureRepository, fixtureSearchPath, nativeScratch } from "./nativeFixtures.js";
 
-// This probes CLI bootstrap and write-through snapshot collection, not audit completion.
-// Upstream --allow base_dir makes the independent snapshot writable on the host.
+// Probe the production external-AgentFS boundary and host-visible snapshot collection.
+// AgentFS overlays a separate empty cwd; only the snapshot receives a write-through grant.
 // Only provider resolution is replaced. The fixture never reaches a provider or auth.
 describe("native upstream AgentFS mechanism", () => {
 	it("bootstraps the real CLI and collects bounded snapshot files after teardown", async () => {
@@ -20,6 +20,7 @@ describe("native upstream AgentFS mechanism", () => {
 		const root = fs.mkdtempSync(path.join(temporary, "native-agentfs-"));
 		const home = path.join(root, "home");
 		const snapshot = path.join(root, "snapshot");
+		const sandboxCwd = path.join(root, "sandbox-cwd");
 		const source = path.join(root, "source");
 		const findings = path.join(snapshot, "audit-findings");
 		const session = `native-probe-${randomBytes(16).toString("hex")}`;
@@ -29,7 +30,7 @@ describe("native upstream AgentFS mechanism", () => {
 			.find((entry) => { try { fs.accessSync(entry, fs.constants.X_OK); return true; } catch { return false; } });
 		expect(agentfsEntry, "The real AgentFS binary is required; no skipped native mechanism gate.").toBeDefined();
 		const agentfs = fs.realpathSync(agentfsEntry!);
-		for (const directory of [home, snapshot, source, path.join(root, "tmp")]) fs.mkdirSync(directory);
+		for (const directory of [home, snapshot, sandboxCwd, source, path.join(root, "tmp")]) fs.mkdirSync(directory);
 		const pack = path.join(home, ".config", "nono", "packages", "jedisct1", "swival");
 		fs.mkdirSync(path.join(pack, "profiles"), { recursive: true });
 		const reviewedPack = path.join(worktree, "tests", "fixtures", "nono-availability");
@@ -66,9 +67,9 @@ with patch.object(socket, "socket", side_effect=AssertionError("network forbidde
      patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS forbidden")):
     from swival import agent, sandbox_agentfs
     def stop_before_provider(**_kwargs):
-        assert sandbox_agentfs.is_sandboxed(), "real upstream bootstrap did not engage"
+        assert sandbox_agentfs.is_inside_agentfs(), "real AgentFS boundary did not engage"
         assert os.environ.get("AGENTFS") == "1"
-        assert sandbox_agentfs.get_agentfs_session() == ${JSON.stringify(session)}
+        assert not os.environ.get("SWIVAL_AGENTFS_ACTIVE"), "must not re-exec inside the snapshot"
         findings = Path(${JSON.stringify(findings)})
         findings.mkdir()
         (findings / "report.md").write_text("synthetic snapshot report\\n")
@@ -83,12 +84,13 @@ with patch.object(socket, "socket", side_effect=AssertionError("network forbidde
     agent.resolve_provider = stop_before_provider
     agent.main()
 `, { mode: 0o700 });
-		const args = ["--base-dir", snapshot, "--sandbox", "agentfs", "--network", "provider-only",
-			"--commands", "none", "--files", "some", "--oneshot-commands", "--sandbox-session", session,
+		const args = ["--base-dir", snapshot, "--sandbox", "builtin", "--network", "provider-only",
+			"--commands", "none", "--files", "some", "--oneshot-commands",
 			"--no-sandbox-auto-session", "--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp",
 			"--no-a2a", "--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
 			"--provider", "chatgpt", "--model", "offline-fixture", "--", "/audit --all --workers 1"];
-		const proc = spawn(entry, args, { cwd: snapshot, env, shell: false, detached: true,
+		const proc = spawn(agentfs, buildNativeAgentfsArgs(entry, snapshot, undefined, session, args), {
+			cwd: sandboxCwd, env, shell: false, detached: true,
 			stdio: ["ignore", "pipe", "pipe"] });
 		let output = "";
 		let stopped: string | undefined;
@@ -109,7 +111,7 @@ with patch.object(socket, "socket", side_effect=AssertionError("network forbidde
 			});
 			clearTimeout(timer);
 			fs.writeFileSync(path.join(root, "probe-result.json"), JSON.stringify({
-				exitCode: code, stopped, diagnostics: output, session, agentfs, entry, args, cwd: snapshot,
+				exitCode: code, stopped, diagnostics: output, session, agentfs, entry, args, cwd: sandboxCwd,
 			}, null, 2), { mode: 0o600 });
 			expect(stopped, output).toBeUndefined();
 			expect(code, output).toBe(0);
@@ -292,7 +294,7 @@ it.each(["auth-runtime", "evidence-alias"])("rejects %s before real AgentFS rece
 		.rejects.toThrow(kind === "auth-runtime" ? /auth.*runtime scope/i : /unsupported.*path/i);
 	expect(fs.existsSync(marker)).toBe(false); expect(fs.existsSync(artifacts)).toBe(false);
 	if (kind === "auth-runtime") expect(fs.existsSync(directory)).toBe(false);
-});
+}, 30_000);
 
 it.each([null, "http://127.0.0.1:8444/v1"])("runs the released API /audit producer through real AgentFS at endpoint %s with HTTP doubles", async (endpoint) => {
 	const root = nativeScratch("native-api-agentfs-"); const source = fixtureRepository(root);

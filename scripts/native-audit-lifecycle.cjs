@@ -252,11 +252,11 @@ async function finalizeNativeAudit(options, outcome) {
 	const snapshot = path.join(runDir, "snapshot");
 	if (record.shutdown === "unverified") {
 		record.shutdownFailure = "Native CLI/process/AgentFS shutdown could not be verified.";
-		for (const name of ["snapshot", "runtime-bin", "config"]) retained.push(path.join(runDir, name));
+		for (const name of ["snapshot", "runtime-bin", "config", "sandbox-cwd"]) retained.push(path.join(runDir, name));
 	} else {
 		try { preserveEvidence(runDir); }
 		catch { record.preservationFailure = "Native evidence preservation failed or exceeded resource limits."; }
-		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "config")];
+		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "config"), path.join(runDir, "sandbox-cwd")];
 		if (record.preservationFailure) retained.push(snapshot);
 		else removable.unshift(snapshot);
 		for (const target of removable) {
