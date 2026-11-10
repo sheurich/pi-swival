@@ -33,35 +33,35 @@ describe("isMutatingCwdAgent", () => {
 		expect(isMutatingCwdAgent(makeAgent({ files: "none" }))).toBe(true);
 	});
 
-	it("returns false only when file writes and mutating commands are both disabled", () => {
+	it("returns false only when file writes and commands are both disabled", () => {
 		expect(isMutatingCwdAgent(makeAgent({ files: "none", commands: "none" }))).toBe(false);
 		expect(
 			isMutatingCwdAgent(makeAgent({ files: "none", commands: READ_ONLY_AUDIT_COMMANDS })),
-		).toBe(false);
+		).toBe(true);
 	});
 
-	it("treats a read-only command allowlist with file writes enabled as mutating", () => {
+	it("treats a command-name allowlist with file writes enabled as mutating", () => {
 		expect(
 			isMutatingCwdAgent(makeAgent({ files: "some", commands: READ_ONLY_AUDIT_COMMANDS })),
 		).toBe(true);
 	});
 
-	it("returns true for a partial commands allowlist that is not the canonical read-only set", () => {
+	it("returns true for a partial command-name allowlist", () => {
 		expect(isMutatingCwdAgent(makeAgent({ commands: "ls,rg" }))).toBe(true);
 	});
 
-	it("returns false when sandbox=agentfs AND noSandboxAutoSession is set", () => {
+	it("does not exempt fresh AgentFS sessions", () => {
 		expect(
 			isMutatingCwdAgent(makeAgent({ sandbox: "agentfs", noSandboxAutoSession: true })),
-		).toBe(false);
+		).toBe(true);
 	});
 
-	it("exempts bundled sandboxed-explorer from isMutatingCwdAgent", () => {
+	it("treats bundled sandboxed-explorer as write-capable", () => {
 		const discovery = discoverSwivalAgents(process.cwd(), "user");
 		const explorer = discovery.agents.find((a) => a.name === "sandboxed-explorer");
 		expect(explorer).toBeDefined();
 		expect(explorer?.noSandboxAutoSession).toBe(true);
-		expect(isMutatingCwdAgent(explorer!)).toBe(false);
+		expect(isMutatingCwdAgent(explorer!)).toBe(true);
 	});
 
 	it("returns true when sandbox=agentfs WITHOUT noSandboxAutoSession (shared overlay)", () => {
@@ -102,7 +102,7 @@ describe("isMutatingCwdAgent", () => {
 				noSandboxAutoSession: true,
 				extraArgs: ["--sandbox=agentfs"],
 			})),
-		).toBe(false);
+		).toBe(true);
 	});
 
 	it("uses extraArgs overrides when classifying file and command write surfaces", () => {

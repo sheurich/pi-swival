@@ -7,7 +7,7 @@ Audit the configured repository with these requested relative scopes: $ARGUMENTS
 
 Read the `auditing-with-swival` skill. Confirm scope and the operator's provider and data boundaries. Start Pi from the intended Git root; do not clone another repository or pass a caller-supplied host path.
 
-Require Swival 1.9.3, LiteLLM 1.106.6, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified. Support means a Swival-supported route satisfying native policies on this runtime. Dynamic model-list routes fail when upstream cannot prevent model replacement. Never broaden permissions.
+Require Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified. Support means a Swival-supported route satisfying native policies on this runtime. Dynamic model-list routes fail when upstream cannot prevent model replacement. Never broaden permissions.
 
 Consult installation guidance before execution. With no specialist selected, use configured Swival defaults, including its active profile:
 
@@ -27,7 +27,7 @@ Swival 1.9.3 can retry the same request on the same provider, model, and endpoin
 
 For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Do not inspect or export auth-store contents. API-key/local routes receive no ChatGPT store or grant. Stop on required encryption, filtering, strict-read isolation, proxies, unknown policy, or incompatible routing.
 
-Translate confirmed relative path/glob tokens into `audit.paths` on the selected call. `all` requires deep review throughout the selected committed scope. `workers` is 1–8; `patchMaxTurns` is 1–100. Use one structured call.
+Translate confirmed relative path/glob tokens into `audit.paths` on the selected call. `all` requires deep review throughout the selected committed scope. `workers` is 1 to 8; `patchMaxTurns` is 1 to 100. Use one structured call.
 
 Native async is unsupported. Omit `paths` for the auditable committed scope. Do not add `task`, `agent`, `cwd`, output routing, reviewer options, permission overrides, or arbitrary arguments. Requested effort is not guaranteed for every auxiliary phase.
 

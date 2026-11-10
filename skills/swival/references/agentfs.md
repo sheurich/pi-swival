@@ -6,6 +6,12 @@ For native audit, the adapter launches upstream AgentFS directly with `--no-defa
 
 AgentFS does not establish host-read confidentiality or provider-process egress confinement. `network=provider-only` is Swival's tool policy. The installed runtime remains trusted.
 
+## Ordinary delegation
+
+Use a disposable cwd for write exploration. A fresh AgentFS session does not remove Swival's host-base write-through grant. `noSandboxAutoSession: true` separates session state only.
+
+Parallel writable tasks need distinct disposable directories or worktrees. The same-cwd guard treats fresh AgentFS sessions and command-name allowlists as write-capable. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption. Ordinary cwd and output paths are caller-selected, not restricted to approved roots. Pi writes requested output outside the child sandbox; no confidentiality guarantee applies.
+
 ## Native source locations
 
 The [AgentFS 0.6.4 Darwin policy](https://github.com/tursodatabase/agentfs/blob/3a5ed2b88e5d5a5f9b2c7fe02d012b50fd19e3c0/cli/src/sandbox/darwin.rs#L98-L157) also permits `/private/tmp`, `/tmp`, `/var/tmp`, `/private/var/folders`, `/dev`, `/private/var/db/mds`, HOME's `Library`, `/Library/Preferences`, `/Library/Keychains`, and the active AgentFS session directory. The banner omits several of these exceptions.

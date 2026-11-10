@@ -31,6 +31,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { canonicalFuturePath } from "./paths.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum as PiStringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -1050,9 +1051,8 @@ export function enforceCompletedAsyncNono(
 }
 
 /**
- * The exact `commands` allowlist that marks shell execution as read-only.
- * Drift-sensitive: if the bundled audit-worker's allowlist changes, update
- * this constant in lockstep.
+ * Historical audit command-name list. Executable names do not restrict their
+ * arguments or guarantee read-only behavior (for example, git can write).
  */
 export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
 
@@ -1061,25 +1061,18 @@ export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
  * based on the final emitted arguments because extraArgs can override typed
  * frontmatter fields.
  *
- * A shared cwd is safe only when each run has a separate AgentFS overlay, or
- * when both file writes and mutating shell commands are disabled. Anything
- * else is treated as write-capable.
+ * A shared cwd is safe only when both file writes and commands are disabled.
+ * AgentFS sessions do not remove write-through access to the allowed base.
  */
 export function isMutatingCwdAgent(
 	agent: SwivalAgentConfig,
 	overrides: SwivalOverrides = {},
 ): boolean {
 	const args = buildSwivalArgs(agent, "", undefined, overrides);
-	const hasFreshAgentFsOverlay =
-		isAgentFsRequested(args) &&
-		hasCliFlag(args, "--no-sandbox-auto-session") &&
-		lastCliOptionValue(args, "--sandbox-session") === undefined;
-	if (hasFreshAgentFsOverlay) return false;
-
 	const files = lastCliOptionValue(args, "--files");
 	const commands = lastCliOptionValue(args, "--commands");
 	const fileWritesDisabled = files === "none";
-	const mutatingCommandsDisabled = commands === "none" || commands === READ_ONLY_AUDIT_COMMANDS;
+	const mutatingCommandsDisabled = commands === "none";
 	return !(fileWritesDisabled && mutatingCommandsDisabled);
 }
 
@@ -2632,7 +2625,9 @@ export async function pruneOldArtifacts(
 			const stat = await fs.promises.stat(fullPath);
 			if (!stat.isDirectory() || stat.mtimeMs >= cutoff) continue;
 			// Retention is deliberately more conservative than control classification.
-			if (name.startsWith("native-audit-") || await isNativeArtifact(fullPath)) continue;
+			if (name.startsWith("native-audit-")) continue;
+			const meta = await readObservationJson(path.join(fullPath, "run-meta.json"), 65536);
+			if (!meta || await isNativeArtifact(fullPath, meta.value)) continue;
 			// Fix 4: never prune a directory belonging to an in-flight run.
 			if (activeArtifactDirs.has(fullPath)) continue;
 			// Fix 4: require completed.json — a missing marker means the run is
@@ -2668,12 +2663,9 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 	for (const name of entries) {
 		const metaPath = path.join(artifactRoot, name, "run-meta.json");
 		try {
-			try {
-				const metaStat = await fs.promises.stat(metaPath);
-				if (metaStat.size > 65536) continue; // 64 KB cap — legitimate meta files are < 1 KB
-			} catch { continue; }
-			const text = await fs.promises.readFile(metaPath, "utf-8");
-			const parsed = JSON.parse(text) as Record<string, unknown>;
+			const metadata = await readObservationJson(metaPath, 65536);
+			if (!metadata) continue;
+			const parsed = metadata.value;
 			// Fix 10: validate expected fields before trusting the object.
 			if (
 				typeof parsed.runId !== "string" ||
@@ -2684,18 +2676,19 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				!validPersistedAsyncOwner(parsed)
 			) continue;
 
-			// Path containment: artifactDir must be under artifactRoot
-			const resolvedArtifact = path.resolve(parsed.artifactDir as string);
-			const resolvedRoot = path.resolve(artifactRoot);
+			// Canonicalize existing ancestors too: missing leaves can sit below an
+			// escaping symlink, while the configured root may have a valid alias.
+			const resolvedRoot = await canonicalFuturePath(artifactRoot);
+			const resolvedArtifact = await canonicalFuturePath(parsed.artifactDir as string);
 			if (!resolvedArtifact.startsWith(resolvedRoot + path.sep)) continue;
-
-			// stdoutFile and stderrFile must be under artifactDir
-			if (typeof (parsed as any).stdoutFile === "string") {
-				if (!path.resolve((parsed as any).stdoutFile).startsWith(resolvedArtifact + path.sep)) continue;
+			for (const key of ["stdoutFile", "stderrFile"] as const) {
+				if (typeof parsed[key] === "string") {
+					parsed[key] = await canonicalFuturePath(parsed[key] as string);
+				}
 			}
-			if (typeof (parsed as any).stderrFile === "string") {
-				if (!path.resolve((parsed as any).stderrFile).startsWith(resolvedArtifact + path.sep)) continue;
-			}
+			if (typeof parsed.stdoutFile !== "string" || !parsed.stdoutFile.startsWith(resolvedArtifact + path.sep)) continue;
+			if (typeof parsed.stderrFile !== "string" || !parsed.stderrFile.startsWith(resolvedArtifact + path.sep)) continue;
+			parsed.artifactDir = resolvedArtifact;
 
 			// PID range: reject 0, 1, negative, and non-integer values
 			if (typeof (parsed as any).pid === "number") {
@@ -3067,6 +3060,16 @@ export async function readAsyncRunObservations(
 
 // ------------------------------------------------ async (background) --
 
+function asyncOptionError(options: { timeoutMs?: unknown; output?: unknown; outputMode?: unknown }): string | undefined {
+	const unsupported = (["timeoutMs", "output", "outputMode"] as const).filter((key) => options[key] !== undefined);
+	return unsupported.length ? `async: true does not support ${unsupported.join(", ")}. Omit these options or use synchronous execution.` : undefined;
+}
+
+function plainTextTask(task: string): string {
+	// `--` stops argparse option parsing, but Swival still dispatches / and !.
+	return `Delegated task (plain text):\n\n${task}`;
+}
+
 /**
  * Spawn Swival through a detached durable wrapper. The wrapper writes the
  * completion marker itself, so status survives a Pi restart. Stdout and stderr
@@ -3088,6 +3091,8 @@ export async function runSingleSwivalAsync(
 	artifactRoot: string = ARTIFACT_ROOT,
 	owner?: AsyncOwner,
 ): Promise<{ runId: string; artifactDir: string }> {
+	const optionError = asyncOptionError(overrides);
+	if (optionError) throw new SwivalArgumentError(optionError);
 	artifactRoot = path.resolve(artifactRoot);
 	const runOwner = captureAsyncOwner({
 		getSessionId: () => owner?.ownerSessionId,
@@ -3129,10 +3134,10 @@ export async function runSingleSwivalAsync(
 	const nonoRequested = isNonoRequested(args);
 	const isReexec = isReexecSandboxRequested(args);
 	if (isReexec) {
-		args.push("--", task);
+		args.push("--", plainTextTask(task));
 	} else {
 		const taskFile = path.join(artifactDir, "task.txt");
-		await fs.promises.writeFile(taskFile, task, { encoding: "utf-8", mode: 0o600 });
+		await fs.promises.writeFile(taskFile, plainTextTask(task), { encoding: "utf-8", mode: 0o600 });
 		args.push("--");
 	}
 
@@ -3412,7 +3417,7 @@ async function runSingleSwival(
 	// because ambient configuration may enable a re-executing sandbox.
 	const isReexec = isReexecSandboxRequested(args);
 	if (isReexec) {
-		args.push("--", task);
+		args.push("--", plainTextTask(task));
 	} else {
 		args.push("--");
 	}
@@ -3428,7 +3433,7 @@ async function runSingleSwival(
 			});
 			if (!isReexec) {
 				proc.stdin?.on("error", () => { /* child exited before reading prompt */ });
-				proc.stdin?.end(task, "utf-8");
+				proc.stdin?.end(plainTextTask(task), "utf-8");
 			}
 
 			const stdoutDecoder = new TextDecoder("utf-8");
@@ -3836,7 +3841,7 @@ const SwivalParams = Type.Object({
 	async: Type.Optional(
 		Type.Boolean({
 			description:
-				"Single mode only: spawn swival in the background and return immediately with a runId (e.g. swival-run-<timestamp>). Stdout/stderr are piped to files in the artifact dir so output is preserved. Use action:status/resume/interrupt with the returned runId to manage the run.",
+				"Single mode only: spawn swival in the background and return immediately with a runId (e.g. swival-run-<timestamp>). Stdout/stderr are piped to files in the artifact dir so output is preserved. Use action:status/resume/interrupt with the returned runId to manage the run. Cannot combine async: true with timeoutMs, output, or outputMode.",
 		}),
 	),
 
@@ -4339,6 +4344,14 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 		parameters: SwivalParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const optionError = params.async && !("audit" in params) ? asyncOptionError(params) : undefined;
+			if (optionError) {
+				return {
+					content: [{ type: "text", text: optionError }],
+					details: { mode: "single", agentScope: params.agentScope ?? "user", projectAgentsDir: null, results: [] },
+					isError: true,
+				};
+			}
 			const launchOwner = params.async ? captureAsyncOwner(ctx.sessionManager) : undefined;
 			// Shutdown must retire pending approval even before an observer exists.
 			if (launchOwner && observationOwnerSessionId !== launchOwner.ownerSessionId) {
@@ -4751,9 +4764,8 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				// Reject parallel dispatches where two write-capable tasks resolve to
 				// the same cwd. The motivating bug: parallel `self-review-worker` fan-out
 				// on a shared worktree silently lost the second worker's edits because
-				// they raced on the same filesystem. Read-only audit-style agents and
-				// AgentFS sessions with their own overlay (noSandboxAutoSession=true)
-				// are exempted by isMutatingCwdAgent.
+				// they raced on the same filesystem. Only agents with both files and
+				// commands disabled are exempted by isMutatingCwdAgent.
 				const cwdGroups = new Map<string, number[]>();
 				for (let i = 0; i < params.tasks.length; i++) {
 					const t = params.tasks[i];
@@ -4790,8 +4802,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 									`(${resolvedCwd}): ${preview}. Parallel filesystem writes on a shared cwd race ` +
 									`and silently lose edits. Remedies: (a) dispatch them serially, (b) give each task ` +
 									`its own cwd (per-task cwd field, e.g. distinct git worktrees), or (c) use an agent ` +
-									`with sandbox: agentfs and noSandboxAutoSession: true so each invocation gets its ` +
-									`own overlay.`,
+									`with files: none and commands: none.`,
 							},
 						],
 						details: makeDetails("parallel")([]),

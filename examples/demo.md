@@ -1,11 +1,8 @@
 # Demo: pi-swival end to end
 
-A short walkthrough that exercises every piece pi-swival contributes to Pi:
-the `swival-subagent` tool, the bundled agents, the `swival` skill, and the
-`/swival-audit` prompt template.
+This walkthrough covers `swival-subagent`, reviewer loops, AgentFS session inspection, and the `/swival-audit` prompt template.
 
-Run the steps in order. Each step prints a marker so you can verify Pi
-loaded the package correctly.
+Run the steps in order using disposable files. Expected results depend on your configured runtime and provider.
 
 ## Prerequisites
 
@@ -22,7 +19,7 @@ pi --version
 swival --version
 ```
 
-You also need an LLM provider configured for swival. If you already use swival from the terminal, the existing config works. Otherwise, see `skills/swival/references/setup.md` for native and local provider setup.
+Use Swival 1.9.3, LiteLLM 1.106.6, and Python >=3.13,<3.15; operational tests use Python 3.13. The installation commands above are unpinned. You also need an LLM provider configured for Swival. If you already use swival from the terminal, the existing config works. Otherwise, see `skills/swival/references/setup.md` for native and local provider setup.
 
 ## Install the package
 
@@ -44,9 +41,9 @@ pi list | grep pi-swival
 
 All five bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`) are auto-discovered from the package's `agents/` directory.
 
-## Demo 1 — generic delegation
+## Demo 1: generic delegation
 
-Open Pi in any directory and ask it to delegate a trivial task:
+Open Pi in a disposable directory and confirm that `/tmp/swival-demo.txt` can be overwritten. Ordinary paths are caller-selected, not restricted to approved roots. Delegation does not promise confidentiality. If file policy excludes `/tmp`, use a disposable file within the selected cwd instead:
 
 ```text
 Use swival-subagent with task: "Print 'hello from swival' to a file
@@ -63,12 +60,11 @@ This exercises:
 
 - The `swival-subagent` tool registration (extension load).
 - The default `swival` agent (selected when no `agent` is named).
-- Swival's normal answer + report flow (no review, no sandbox).
+- Swival's normal answer and report flow without agent-requested review or sandbox settings; ambient Swival configuration still applies.
 
-## Demo 2 — reviewer loop
+## Demo 2: reviewer loop
 
-Ask for a change that benefits from a second pass. The
-`self-review-worker` agent has `selfReview: true` and a 5-round budget.
+Confirm that `/tmp/fizzbuzz.py` and `/tmp/test_fizzbuzz.py` are disposable. The `self-review-worker` agent has `selfReview: true` and a five-round retry budget.
 
 ```text
 Use swival-subagent with agent: "self-review-worker"
@@ -79,18 +75,16 @@ least four pytest cases covering 3, 5, 15, and a non-multiple."
 
 Expected behaviour:
 
-1. Pi reports `✓ self-review-worker  <model> · N rounds · M tool calls · ...`
-   where N is at least 1 (the reviewer ran).
+1. Pi reports `✓ self-review-worker  <model> · N rounds · M tool calls · ...`. The round count records retries, not whether review occurred.
 2. Both files exist and are correct.
 
-If swival rejects the first answer, the header shows `1 rounds` or more.
-If the reviewer is satisfied immediately, it shows `0 rounds`.
+If swival rejects the first answer, the header shows `1 rounds` or more. If the reviewer is satisfied immediately, it shows `0 rounds`.
 
-## Demo 3 — sandboxed exploration (AgentFS)
+## Demo 3: sandboxed exploration (AgentFS)
 
-Run a destructive-looking task without touching the real filesystem.
+Use a disposable cwd and disposable target files. Swival 1.9.3 grants AgentFS host-base write-through access through `--allow <base-dir>`. Fresh sessions do not prevent those writes. Use the explorer only with disposable files; its session does not isolate host-base writes.
 
-Prerequisite: `agentfs` installed (see `skills/swival/references/agentfs.md`).
+Prerequisite: `agentfs` installed (see `skills/swival/references/agentfs.md`). Set `cwd` to your disposable directory on the following call. Keep a separate copy if you want to compare the original file.
 
 ```text
 Use swival-subagent with agent: "sandboxed-explorer"
@@ -100,16 +94,15 @@ with sys.stdout.write."
 
 Expected behaviour:
 
-1. Pi reports the header with the sandbox session id.
-2. `cat /tmp/fizzbuzz.py` shows the original file unchanged.
-3. `agentfs diff <session-id>` shows the would-be refactor.
+1. Inspect the result's sandbox report for the session identifier or diff hint.
+2. Inspect `/tmp/fizzbuzz.py` directly; host write-through can change it.
+3. `agentfs diff <session-id>` shows overlay changes only, so it cannot prove that host files stayed unchanged.
 
-This is the key value of `sandboxed-explorer`: you see what swival would
-do, then decide whether to apply it.
+Review direct file changes alongside any overlay diff. Native audit uses a separate committed snapshot; ordinary explorer sessions do not provide that source boundary.
 
-## Demo 4 — native audit prompt template
+## Demo 4: native audit prompt template
 
-Use a disposable synthetic Git repository and start Pi from its root. Require Swival 1.9.3, LiteLLM 1.106.6, Python 3.13+, AgentFS 0.6.4, upstream's nono profile, and separate approval for any live provider/auth calls. The real bootstrap/export gate passed on macOS; Linux remains unverified. Consult installation policy before execution. With no specialist selected, use configured Swival defaults. Pass a required configured specialist through `profileOverride`; a terminal selected-route failure stops without fallback. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint. Dynamic model-list adapters are refused because upstream can replace the selected model. For ChatGPT only, standard upstream authentication can log in, refresh tokens, and write auth state. API-key/local routes receive no ChatGPT store grant. Native async is unsupported.
+Use a disposable synthetic Git repository and start Pi from its root. Require Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, upstream's nono profile, and separate approval for any live provider/auth calls. The real bootstrap/export gate passed on macOS; Linux remains unverified. Consult installation policy before execution. With no specialist selected, use configured Swival defaults. Pass a required configured specialist through `profileOverride`; a terminal selected-route failure stops without fallback. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint. Dynamic model-list adapters are refused because upstream can replace the selected model. For ChatGPT only, standard upstream authentication can log in, refresh tokens, and write auth state. API-key/local routes receive no ChatGPT store grant. Native async is unsupported.
 
 Swival 1.9.3 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
@@ -128,9 +121,9 @@ Expected behaviour:
 
 Inspect native coverage and artifact pairs before treating the pipeline as complete. Native verifier judgment is not independently executed exploit reproduction. This demo does not prove uniform per-phase effort, and no patch applies automatically.
 
-## Demo 5 — parallel dispatch
+## Demo 5: parallel dispatch
 
-Confirm the `tasks[]` mode works:
+Prepare two distinct disposable directories first. Add a different per-task `cwd` to each item below and use targets within those directories. The abbreviated example omits those required paths; do not dispatch it unchanged. The same-cwd guard rejects these ordinary writable tasks. It also rejects fresh AgentFS sessions sharing a writable cwd because they still permit host-base writes.
 
 ```text
 Use swival-subagent with tasks: [
@@ -148,12 +141,12 @@ rm -f /tmp/swival-demo.txt /tmp/fizzbuzz.py /tmp/test_fizzbuzz.py
 pi remove pi-swival
 ```
 
-## What this demo proves
+## What to check
 
 | Demo | Validates |
 |------|-----------|
 | 1 | Extension loads, `swival-subagent` tool dispatches, default agent works |
 | 2 | Reviewer loop runs, structured report parsed |
-| 3 | AgentFS sandbox isolates writes |
+| 3 | AgentFS session inspection and direct host-file checks, without a COW-isolation claim |
 | 4 | Prompt registration and native committed-snapshot execution, when all prerequisites are met |
 | 5 | Parallel task dispatch and per-task result blocks |

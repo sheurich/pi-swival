@@ -2,7 +2,7 @@
 
 Install Swival, point it at a provider, and verify connectivity.
 
-Tracked against Swival 1.9.3.
+Tracked against Swival 1.9.3 and LiteLLM 1.106.6. Swival requires Python >=3.13,<3.15; operational tests use Python 3.13. The install and upgrade commands below are unpinned; verify versions before a native audit.
 
 Bedrock and Vertex are reached through Swival's native `bedrock` and `vertexai` providers. No proxy process or second routing configuration is required.
 
@@ -47,9 +47,9 @@ model = "global.anthropic.claude-sonnet-5"
 # aws_profile = "prod"    # optional; overrides AWS_PROFILE
 ```
 
-Three things to get right:
+Bedrock configuration constraints:
 
-- Do not set `api_key`. Bedrock rejects it outright, auth comes from the AWS credential chain, and a global `api_key` still applies when a profile selects bedrock — so one stray global key breaks every Bedrock profile.
+- Do not set `api_key`. Bedrock uses the AWS credential chain and rejects `api_key`. Global keys still apply when a profile selects Bedrock, so they break Bedrock profiles.
 - `base_url` means the AWS region for this provider. Leave it unset to take the region from `~/.aws/config`. A global value also leaks into `vertexai` profiles, which do not accept it.
 - An inference profile that reports `ACTIVE` is not necessarily invocable. The caller's IAM role may still get `AccessDenied`. Test by invoking.
 
@@ -62,7 +62,7 @@ project = "my-gcp-project"     # key is "project", not "gcp_project"
 location = "global"
 ```
 
-Needs application default credentials (`gcloud auth application-default login`). `project` and `location` are both required; Vertex rejects `api_key`. Pass the bare model name — Swival adds the `vertex_ai/` prefix itself. Gemini's graded reasoning effort tops out at `high`; Swival's enum also accepts `xhigh`, but Vertex does not honor it.
+Needs application default credentials (`gcloud auth application-default login`). `project` and `location` are both required; Vertex rejects `api_key`. Pass the bare model name: Swival adds the `vertex_ai/` prefix itself. Gemini's graded reasoning effort tops out at `high`; Swival's enum also accepts `xhigh`, but Vertex does not honor it.
 
 ### ChatGPT subscription
 
@@ -91,11 +91,13 @@ A per-profile `api_key` is fine here because the profile also sets `provider = "
 
 ### File-access defaults
 
-By default, Swival restricts file access to the base directory (auto-detected project root, or the current directory). Command execution defaults to unrestricted (`--commands all`). Add `yolo = true` only if you also want to lift the file-access restriction; otherwise leave it out and scope access with `--add-dir` / `--add-dir-ro`.
+Swival's builtin file tools default to the base directory, usually the detected project root or current directory. Command execution defaults to unrestricted (`--commands all`); file-tool checks do not confine unrestricted commands. Add `yolo = true` only if you also want to lift the file-access restriction; otherwise leave it out and scope access with `--add-dir` / `--add-dir-ro`.
+
+Ordinary delegation accepts caller-selected cwd and output paths without approved-root confinement. Swival 1.9.3 grants AgentFS host-base write-through access, even with a fresh session. Use disposable directories for write exploration and distinct writable directories for parallel tasks. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption; fresh AgentFS sessions remain write-capable. No host-read confidentiality guarantee applies.
 
 ## Native audit prerequisites
 
-The Pi adapter requires Swival 1.9.3, LiteLLM 1.106.6, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux remains unverified. Native mode uses configured Swival provider/model defaults or an existing `profileOverride` selected by installation policy. No specialist selected permits defaults. Missing or invalid selected specialists stop before launch; terminal selected-route failures stop without fallback. Names do not identify specialists or prove access. The ordinary provider examples above do not imply native adapter support. Offline native representatives cover ChatGPT, API-key OpenRouter, and an explicit OpenRouter-compatible loopback endpoint with a dedicated endpoint key and `max_context_tokens`. Generic/LMStudio/llama.cpp and equivalent dynamic-list routes are refused because upstream can replace the model after NotFound. Never convert a rejected route automatically. Other routes require compatible credential authority, source-only execution and policy propagation. No every-provider/version promise applies.
+The Pi adapter requires Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux remains unverified. Native mode uses configured Swival provider/model defaults or an existing `profileOverride` selected by installation policy. No specialist selected permits defaults. Missing or invalid selected specialists stop before launch; terminal selected-route failures stop without fallback. Names do not identify specialists or prove access. The ordinary provider examples above do not imply native adapter support. Offline native representatives cover ChatGPT, API-key OpenRouter, and an explicit OpenRouter-compatible loopback endpoint with a dedicated endpoint key and `max_context_tokens`. Generic/LMStudio/llama.cpp and equivalent dynamic-list routes are refused because upstream can replace the model after NotFound. Never convert a rejected route automatically. Other routes require compatible credential authority, source-only execution and policy propagation. No every-provider/version promise applies.
 
 For ChatGPT only, use standard upstream ChatGPT authentication, including login, token refresh, and auth-state writes. API-key/local routes receive no ChatGPT directory grant. Configure their selected key at execution time; never send a remote key to a local endpoint. The adapter does not inspect or export auth stores, change account access, or substitute another route. Native async is unsupported. A Pi crash or SIGKILL can leave Swival running without artifact export or claimed completion. Normal timeout, cancellation, and session shutdown stop the live owned process group.
 
@@ -164,5 +166,5 @@ The hook does not cover delegated runs. `swival-subagent` passes `--no-lifecycle
 | `--gcp-project or GOOGLE_CLOUD_PROJECT is required` | Vertex profile missing `project` | Add `project`; the key is not `gcp_project` |
 | `--api-key is not supported for geap` | `api_key` set globally or on a `vertexai` profile | Remove it; use application default credentials |
 | Vertex 404 "model not found" | Wrong project, or API not enabled | Check `project` and enable the Vertex AI API |
-| Expired AWS SSO mid-run | SSO session shorter than the run | Add the lifecycle hook above |
+| Expired AWS SSO mid-run | SSO session shorter than the run | Refresh before dispatch; the startup hook does not renew credentials during execution |
 | `uv: command not found` | uv not installed | See https://docs.astral.sh/uv/ or use `pipx` |

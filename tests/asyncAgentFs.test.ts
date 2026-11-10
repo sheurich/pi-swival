@@ -124,7 +124,7 @@ describe("status and resume consumption", () => {
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toMatch(/failed AgentFS bootstrap validation/);
 		expect(result.content[0].text).toMatch(/agentfs_version/);
-		expect(result.content[0].text).toContain(`Artifact dir: ${artifactDir}`);
+		expect(result.content[0].text).toContain(`Artifact dir: ${fs.realpathSync(artifactDir)}`);
 		if (action === "resume") expect(result.content[0].text).not.toContain("must not be presented as success");
 	});
 
@@ -143,7 +143,7 @@ describe("status and resume consumption", () => {
 			const { artifactDir, result } = await executeAction(action, { agentFsRequested: false, exitCode: 2, report });
 			expect(result.isError).toBe(true);
 			expect(result.content[0].text).toContain("failed (max_turns): Swival reached its turn limit before completion.");
-			expect(result.content[0].text).toContain(`Artifact dir: ${artifactDir}`);
+			expect(result.content[0].text).toContain(`Artifact dir: ${fs.realpathSync(artifactDir)}`);
 			expect(result.content[0].text).not.toMatch(/review_rejected|Synthetic partial work|stdout answer/);
 			expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "report.json"), "utf-8"))).toEqual(report);
 			expect(fs.readFileSync(path.join(artifactDir, "stdout.txt"), "utf-8")).toBe("stdout answer");

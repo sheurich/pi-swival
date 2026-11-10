@@ -1161,7 +1161,7 @@ describe("async launch observation", () => {
 		const agent: any = { name: "test", source: "user", description: "test", systemPrompt: "", filePath: "/test.md" };
 		const launched = await extension.runSingleSwivalAsync(root, [agent], "test", "task", undefined, {}, root,
 			{ ownerSessionId: OWNER });
-		expect((execution.spawn.mock.calls as any)[0][1].slice(-2)).toEqual(["--", "task"]);
+		expect((execution.spawn.mock.calls as any)[0][1].slice(-2)).toEqual(["--", "Delegated task (plain text):\n\ntask"]);
 		expect(await extension.readAsyncRunObservations(OWNER, root)).toMatchObject([{ state: "running" }]);
 		const meta = JSON.parse(fs.readFileSync(path.join(launched.artifactDir, "run-meta.json"), "utf8"));
 		complete(meta); proc.emit("close", 0);

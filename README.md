@@ -1,17 +1,17 @@
 # pi-swival
 
-A Pi package that integrates [Swival](https://github.com/Swival/swival) — a coding agent with a built-in reviewer loop, OS-enforced sandboxing, format-preserving secret encryption, and outbound request filtering — into Pi as a delegation target.
+Delegate tasks from Pi to [Swival](https://github.com/Swival/swival), with reviewer loops, configurable sandboxes, secret encryption, and request filtering.
 
 ![pi-swival demo](demo/demo-quick.gif)
 
 The package bundles:
 
-- `swival-subagent` extension — dispatches tasks to a swival subprocess with reviewer loops, sandboxes, and structured reporting. Mirrors the shape of pi's example subagent extension but swaps the spawn target to swival.
-- `swival` skill — drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and native provider setup.
-- `auditing-with-swival` skill — one native audit on an isolated committed snapshot, with preserved state, reports, and patch proposals.
-- `swival-worker-briefs` skill — task brief structure and evidence standards for `self-review-worker` dispatches.
-- `swival-audit` prompt template — slash-command-style invocation that walks an interactive operator through the audit pipeline.
-- Five swival agents — `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`.
+- `swival-subagent` extension: dispatches tasks to a swival subprocess with reviewer loops, sandboxes, and structured reporting. Mirrors the shape of pi's example subagent extension but swaps the spawn target to swival.
+- `swival` skill: drives swival from any Pi agent via the extension, with reference material on AgentFS sandboxing and native provider setup.
+- `auditing-with-swival` skill: one native audit on an isolated committed snapshot, with preserved state, reports, and patch proposals.
+- `swival-worker-briefs` skill: task brief structure and evidence standards for `self-review-worker` dispatches.
+- `swival-audit` prompt template: slash-command-style invocation that walks an interactive operator through the audit pipeline.
+- Five swival agents: `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`.
 
 ## Install
 
@@ -33,7 +33,7 @@ pi install /path/to/pi-swival
 
 Pi installs runtime dependencies for managed git/npm packages. For a local checkout, install the pinned runtime dependency, `yaml` 2.9.0, from the checkout root with `npm install --ignore-scripts --legacy-peer-deps`.
 
-The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The five bundled swival agents under `agents/` are discovered automatically by the extension at runtime — no symlinks or manual copies needed.
+The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The five bundled swival agents under `agents/` are discovered automatically by the extension at runtime: no symlinks or manual copies needed.
 
 To override a bundled agent or add your own, place `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` in a project root (project scope). Discovery priority: project > user > bundled.
 
@@ -46,6 +46,8 @@ uv tool install swival
 # or: pipx install swival
 ```
 
+The tested runtime is Swival 1.9.3 with LiteLLM 1.106.6 and Python >=3.13,<3.15. Operational tests use Python 3.13. Unpinned installation commands can select another release; native audits require the tested versions.
+
 Swival routes models through `~/.config/swival/config.toml`. Its `bedrock` and `vertexai` providers reach AWS and Google Cloud natively, with no extra process to run. See `skills/swival/references/setup.md` for the full setup walkthrough.
 
 ## What's bundled
@@ -57,7 +59,7 @@ A Pi tool that dispatches single, parallel, or chained tasks, or one structured 
 Key features beyond pi's example subagent extension:
 
 - Reviewer loop (`selfReview` or test-as-contract `reviewer`) that retries until the reviewer accepts.
-- Kernel & overlay sandboxing (`sandbox: agentfs` SQLite overlay; `sandbox: nono` Landlock/Seatbelt isolation).
+- Configurable sandboxes: AgentFS permits host-base write-through; nono uses Landlock/Seatbelt. Use disposable directories for AgentFS write exploration.
 - Network policy (`network: provider-only`, `network: none`).
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
@@ -91,7 +93,11 @@ Discovery retains valid siblings and reports at most 12 fixed diagnostics with s
 
 Invalid admitted definitions fail closed. Discovery retains a nonblank invalid string name exactly, including any whitespace or control characters, for dispatch checks without exposing it in the catalogue. An identified invalid override blocks dispatch for that exact name instead of selecting a lower-priority definition. A valid higher-priority definition can repair an invalid lower-priority definition with the same accepted name. Empty or whitespace-only names, missing names, and nonstring names have unresolved identities and produce `invalid_definition`. An unresolved identity sets `dispatchBlocked: true` and blocks all dispatch before launch, including calls with an omitted or empty selector. Symlinks outside the scanned directory remain excluded and nonblocking; discovery does not read their targets.
 
-`async: true` supports single dispatch only. `status` reports progress or final results. `resume` retrieves completed output and reviewer feedback; it does not restart execution. `interrupt` can stop only a run tracked by the same Pi process. Live steering is unsupported.
+`async: true` supports single dispatch only. It rejects `timeoutMs`, `output`, and `outputMode` before launch; use synchronous execution for those options. `status` reports progress or final results. `resume` retrieves completed output and reviewer feedback; it does not restart execution. `interrupt` can stop only a run tracked by the same Pi process. Live steering is unsupported.
+
+Ordinary tasks use a fixed plain-text envelope. Leading `/` and `!` remain task text instead of invoking Swival command dispatch. Stored task metadata keeps the original text.
+
+Ordinary `cwd` and `output` are caller-selected, not constrained to approved roots. Output writes occur in Pi outside the child sandbox. They provide no confidentiality guarantee. Synchronous output defaults to file-only metadata when `output` is set, except that failed chains inline nonempty partial output even in file-only mode. Parallel results require per-task output paths; top-level output does not bind them. Chain top-level output binds the last successful step, or the failing step on failure. Use unique paths to avoid overwriting results. `maxInlineBytes` counts characters, not bytes. See the [skill's output reference](skills/swival/SKILL.md#paths-and-output) for details.
 
 ### Optional async observation
 
@@ -163,7 +169,7 @@ Unchanged unresolved activity backs off through 1, 2, 4, 8, 16, and 30 seconds b
 
 | Skill | Use |
 |-------|-----|
-| `swival` | Drive swival from any Pi agent — dispatch examples, agent authoring, capabilities reference, troubleshooting. |
+| `swival` | Drive swival from any Pi agent: dispatch examples, agent authoring, capabilities reference, troubleshooting. |
 | `auditing-with-swival` | Run native audit on committed source with isolated artifacts and explicit coverage checks. |
 | `swival-worker-briefs` | Draft precise, verifiable task briefs for `self-review-worker` dispatches. |
 
@@ -179,10 +185,10 @@ Bundled in `agents/` for the `swival-subagent` tool:
 
 | Agent | Use when |
 |-------|----------|
-| `swival` | Generic delegate — no system prompt, no review. The implicit default when `agent` is omitted. |
+| `swival` | Generic delegate: no system prompt, no review. The implicit default when `agent` is omitted. |
 | `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks. |
 | `test-runner` | Task has a runnable test command as acceptance criterion (caller passes `reviewerOverride`). |
-| `sandboxed-explorer` | Exploratory changes you want to inspect before applying. |
+| `sandboxed-explorer` | Exploration in a disposable cwd; fresh sessions do not prevent host-base writes. |
 | `a2a-coordinator` | Coordinate tasks across remote Agent2Agent (A2A) endpoints configured via a2aConfig; requires network: full. |
 
 ### Native audit
@@ -203,7 +209,7 @@ The profile name is illustrative, not bundled or reserved. With no specialist se
 
 Swival 1.9.3 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Native audit requires Swival 1.9.3, LiteLLM 1.106.6, Python 3.13+, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
+Native audit requires Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
 
 For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks auth-store metadata, never its contents. API-key/local routes forward only the selected credential interface and receive no ChatGPT directory grant. Required encryption, filtering, strict-read isolation, proxies, unknown policy, and incompatible routing fail closed. These native restrictions do not change ordinary delegation.
 
@@ -217,7 +223,7 @@ Completion requires matching committed scope, route/policy, native `phase=done`,
 
 #### Native-only tool: `swival-native-audit`
 
-`extensions/index.ts` also exports `registerNativeAuditTool(pi, options)`. It registers one tool, `swival-native-audit`, and nothing else: no general dispatch, no parallel or chain modes, no `action` controls, no catalogue. The package manifest never loads it; the default extension still registers only `swival-subagent`. Use it from an explicitly configured wrapper extension, in the same layout as the observation wrapper above, when a session must be able to run a native audit but must not receive general Swival delegation:
+`extensions/index.ts` also exports `registerNativeAuditTool(pi, options)`. It registers one tool, `swival-native-audit`, and nothing else: no general dispatch, no parallel or chain modes, no `action` controls, no catalogue. The package manifest never loads it; the default extension still registers only `swival-subagent`. Use an explicitly configured wrapper when a session needs native auditing without general delegation. Follow the observation wrapper layout above:
 
 ```typescript
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -228,13 +234,13 @@ export default function (pi: ExtensionAPI) {
 }
 ```
 
-Disable the package's default extension as in the observation-wrapper setup (`"extensions": []` on the pi-swival package entry, with any direct `pi-swival/extensions` entries removed), so this wrapper is the only Swival extension entry point.
+Set `"extensions": []` on the pi-swival package entry, as in the observation wrapper setup. Remove direct `pi-swival/extensions` entries. This wrapper must be the only Swival extension entry point.
 
-The tool takes the same `audit` object as `swival-subagent`, required rather than optional, plus the native selection and bounding fields the native validator accepts: `profileOverride`, `modelOverride`, `providerOverride`, `reasoningEffortOverride`, `temperatureOverride`, `topPOverride`, `seedOverride`, `maxTurnsOverride`, `maxOutputTokensOverride`, `providerTimeoutOverride`, `maxInlineBytes`, `timeoutMs`, and `encryptSecretsOverride`. `encryptSecretsOverride` accepts only `false`; the schema declares it as the constant `false` and the validator rejects every other value, including `true`, `"false"`, `0`, and `null` on direct calls. Passing `false` admits a global `encrypt_secrets = true` Swival configuration for the audit, exactly as it does through `swival-subagent`: the run's inert configuration never enables encryption, project configuration, `SWIVAL_ENCRYPT_KEY`, filters, proxies, and every other preflight guard stay fail-closed, and no file, auth, or process grant changes. `maxInlineBytes` defaults to 65536 characters and truncates loudly with a marker pointing at the artifact evidence. `timeoutMs` defaults to the smaller of 15 minutes and the native ceiling (30 minutes unless the wrapper sets `nativeMaxTimeoutMs`) and may not exceed that ceiling. The schema declares no other properties and rejects undeclared ones. Execution rejects any undeclared field again before preparation, including `async: false`, so a direct call that bypasses schema validation cannot reach `agent`, `task`, `tasks`, `chain`, `action`, `id`, `cwd`, `agentScope`, `async`, network, sandbox, reviewer, output, or credential inputs. The audit root is always the session's working directory, which must be the repository root. The same preparation, committed snapshot, route preflight, AgentFS launch, timeout ceiling, cancellation, session-shutdown drain, artifact collection, and completion evidence apply; `artifactRoot`, `nativePython`, and `nativeMaxTimeoutMs` options are honored and no other option grants anything. The tool has no custom renderer; Pi shows its name and the returned text.
+The tool requires the same `audit` object as `swival-subagent`. It also accepts these native selection and bounding fields: `profileOverride`, `modelOverride`, `providerOverride`, `reasoningEffortOverride`, `temperatureOverride`, `topPOverride`, `seedOverride`, `maxTurnsOverride`, `maxOutputTokensOverride`, `providerTimeoutOverride`, `maxInlineBytes`, `timeoutMs`, and `encryptSecretsOverride`. `encryptSecretsOverride` accepts only the constant `false`. The validator rejects every other value, including `true`, `"false"`, `0`, and `null` on direct calls. Passing `false` admits global `encrypt_secrets = true` for the audit, as through `swival-subagent`. The inert run configuration never enables encryption. Project configuration, `SWIVAL_ENCRYPT_KEY`, filters, proxies, and every other preflight guard stay fail-closed. No file, auth, or process grant changes. `maxInlineBytes` defaults to 65536 characters and truncates loudly with a marker pointing at the artifact evidence. `timeoutMs` defaults to the smaller of 15 minutes and the native ceiling (30 minutes unless the wrapper sets `nativeMaxTimeoutMs`) and may not exceed that ceiling. The schema declares no other properties and rejects undeclared ones. Execution also rejects undeclared fields before preparation, including `async: false`. Direct calls cannot supply `agent`, `task`, `tasks`, `chain`, `action`, `id`, `cwd`, `agentScope`, `async`, network, sandbox, reviewer, output, or credential inputs. The audit root is always the session's working directory, which must be the repository root. The same preparation, snapshot, route preflight, AgentFS launch, timeout ceiling, cancellation, shutdown drain, artifact collection, and completion evidence apply. Wrapper options `artifactRoot`, `nativePython`, and `nativeMaxTimeoutMs` apply; other options grant nothing. The tool has no custom renderer; Pi shows its name and the returned text.
 
 Registering or activating `swival-native-audit` authorizes nothing by itself. Provider access, installation guidance, specialist selection, and the decision to send a repository to a provider remain separate operator decisions, exactly as for `swival-subagent`.
 
-Keep two lifetimes distinct. A consumer may run the Pi session that holds this tool as a headless child Pi in the background, for example from a subagent framework; that outer run is asynchronous only from the consumer's point of view. The inner native audit stays synchronous: the tool call returns only after verified shutdown of the owned process group, and native `async`, `status`, `resume`, and `interrupt` remain unsupported. Closing the outer session triggers the same shutdown drain as any other native run.
+Keep two lifetimes distinct. A consumer can run this Pi session as a headless background child, for example through a subagent framework. The outer run is asynchronous from the consumer's perspective. The inner native call returns only after verified shutdown of the owned process group. Native `async`, `status`, `resume`, and `interrupt` remain unsupported. Closing the outer session triggers the same shutdown drain as any other native run.
 
 ## Layout
 
@@ -296,7 +302,7 @@ The isolated subprocess imports the selected package's public `external-runs` an
 
 Temporary transpilation, script, and typecheck files are removed afterward. The subprocess uses fixed argv with no shell, a 60-second timeout, a 1 MiB output cap per stream, and synthetic session and home paths.
 
-The smoke test checks manifest paths and agent frontmatter, then creates isolated working and agent directories to load only this package through `DefaultResourceLoader` with in-memory settings. It checks the extension and `swival-subagent` tool, bundled skills and prompt without starting a session or reading stdin. It also runs the guarded offline catalogue loader test. Run setup separately; smoke never installs dependencies.
+The smoke test checks manifest paths and agent frontmatter. It creates isolated working and agent directories, loading only this package through `DefaultResourceLoader` with in-memory settings. It checks the extension and `swival-subagent` tool, bundled skills and prompt without starting a session or reading stdin. It also runs the guarded offline catalogue loader test. Run setup separately; smoke never installs dependencies.
 
 The unit suite uses synthetic CLI processes, released native phases, denied sockets/DNS, and mocked auth HTTP. It covers standard login/refresh/auth writes, inherited same-route policy-error retries, terminal errors, no fallback, tool denials, timeout/cancellation, descendants, and parent loss. The explicit native AgentFS integration command requires installed binaries and never skips a missing prerequisite. Its synthetic nono registration proves availability, not authenticity. API/local fixtures combine the real released zero-finding producer, resolver, AgentFS and finalizer with HTTP doubles. ChatGPT fixtures test standard refresh persistence and model-tool auth denial with synthetic evidence. These runs do not prove live account access or inference. Other platforms and live providers remain unverified.
 
@@ -329,17 +335,18 @@ Pi does not ship a subagent tool by default. The closest reference points are th
 | Chain mode (`{previous}`) | yes                   | yes                   |
 | Async / background runs   | no                    | yes (single-mode only) |
 
-Use the example subagent (or a third-party equivalent) when fine-grained tool-call visibility matters more than correctness checks. Use `swival-subagent` when correctness or sandboxing matters more than display fidelity. The two coexist — install both and pick per task.
+Use the example subagent (or a third-party equivalent) when fine-grained tool-call visibility matters more than correctness checks. Use `swival-subagent` when correctness or sandboxing matters more than display fidelity. The two coexist: install both and pick per task.
 
 ## Known limitations
 
 - Swival's normal one-shot traces arrive at finalization, not as live tool events. The ordinary watcher retains its existing behavior.
-- Swival receives the task on command-line arguments unless the agent explicitly sets `sandbox: builtin`, which pipes it over standard input (keeping it out of `ps aux` and clear of `ARG_MAX`). Project-scope agents cannot use standard input delivery because they are upgraded to `agentfs`. The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) can enable a re-executing sandbox (AgentFS or nono).
+- Swival receives tasks on argv unless the agent explicitly sets `sandbox: builtin`. That setting pipes tasks over stdin, keeping them out of `ps aux` and avoiding task-size `ARG_MAX` failures. Project-scope agents cannot use standard input delivery because they are upgraded to `agentfs`. The default is conservative because ambient configuration (`~/.config/swival/config.toml`, `swival.toml`) can enable a re-executing sandbox (AgentFS or nono).
 - The agent system prompt body is always passed as `--system-prompt` command-line arguments. Large bodies can hit platform `ARG_MAX` even under `sandbox: builtin`; split long guidance into a skills directory passed via `skillsDir` (or `skillsDirOverride` at dispatch) instead.
-- Parallel tasks share the host working tree (no git worktree isolation). Tasks that mutate overlapping files must be dispatched serially or run with per-task `cwd` pointing at pre-created worktrees.
-- `async: true` is single-mode only. Parallel and chain modes always run synchronously.
-- Ordinary artifact directories under `~/.pi/agent/swival-artifacts/` are eligible for pruning after 7 days. Native directories remain retained. Back up reports you need longer.
-- Swival's interactive `/goal` REPL command is not available here — the extension always invokes swival non-interactively.
+- Parallel tasks share the host filesystem. Use distinct pre-created worktrees or disposable copies for writable tasks. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption. Fresh AgentFS sessions and command-name allowlists do not qualify.
+- `async: true` is single-mode only. Parallel and chain modes always run synchronously. Async `timeoutMs`, `output`, and `outputMode` are unsupported and rejected before side effects. Retrieve completed output with `resume`.
+- Fresh AgentFS sessions separate session state, not host-base writes. Swival 1.9.3 grants `--allow <base-dir>` write-through access. Use a disposable cwd. Native committed snapshots keep original source separate from that grant.
+- Ordinary artifact directories under `~/.pi/agent/swival-artifacts/` are eligible for pruning after 7 days when completion and readable object metadata are present. Missing, malformed, oversized, or symlinked metadata prevents pruning. Native directories remain retained. Back up reports you need longer.
+- Swival's interactive `/goal` REPL command is unavailable here; the extension invokes Swival non-interactively.
 
 ## License
 
