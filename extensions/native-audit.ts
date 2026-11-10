@@ -813,11 +813,15 @@ export async function prepareNativeAudit(
 	await fs.mkdir(path.dirname(runDir), { recursive: true, mode: 0o700 });
 	await fs.mkdir(runDir, { mode: 0o700 });
 	const snapshot = path.join(runDir, "snapshot");
+	// Linux AgentFS overlays cwd even when it is also explicitly allowed.
+	// Keep the host-visible snapshot outside that disposable overlay.
+	const sandboxCwd = path.join(runDir, "sandbox-cwd");
 	let args: string[];
 	const meta: RunMeta = { runId, agent: "native-audit", task: "/audit (committed source-only scope)",
 		startedAt: Date.now(), pid: undefined, artifactDir: runDir, stdoutFile: path.join(runDir, "diagnostics.json"),
 		stderrFile: path.join(runDir, "diagnostics.json"), nativeAuditRequested: true };
 	try {
+		await fs.mkdir(sandboxCwd, { mode: 0o700 });
 		const manifest = await createCommittedSnapshot(cwd, snapshot, trustedGit);
 		request.snapshot = snapshot;
 		const { scope, route: secondRoute } = await preflight();
@@ -850,7 +854,7 @@ export async function prepareNativeAudit(
 		throw error;
 	}
 	const proc = spawn(agentfs, buildNativeAgentfsArgs(cli, snapshot, authStore?.directory, session, args), {
-		cwd: snapshot, env, shell: false, detached: true,
+		cwd: sandboxCwd, env, shell: false, detached: true,
 		stdio: ["ignore", "pipe", "pipe"] });
 	meta.pid = proc.pid;
 	const diagnostics = { bytes: 0, closed: false, expansionFailures: 0, ambiguous: false,

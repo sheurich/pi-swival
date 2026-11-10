@@ -21,28 +21,14 @@ EOF
 	exit 1
 fi
 
-pinned_types_present() {
-	node -e 'const pins = require("./package.json").devDependencies;
-	for (const name of ["typescript", "@types/node"]) {
-		try { if (require("./node_modules/" + name + "/package.json").version !== pins[name]) process.exit(1); }
-		catch { process.exit(1); }
-	}'
-}
-if [[ ! -d node_modules/vitest || ! -f node_modules/typescript/package.json ||
-	! -f node_modules/@types/node/package.json ]] || ! pinned_types_present; then
-	npm install --ignore-scripts --no-audit --no-fund --legacy-peer-deps
-fi
-pinned_types_present
+# Rebuild both dependency trees from their lockfiles without lifecycle scripts.
+npm ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+(
+	cd ..
+	npm ci --ignore-scripts --no-audit --no-fund --legacy-peer-deps
+)
 
-# Install the extension's declared runtime dependency without installing peers.
-if ! node -e '
-	const expected = require("../package.json").dependencies.yaml;
-	const installed = require("../node_modules/yaml/package.json").version;
-	process.exit(installed === expected ? 0 : 1);
-' >/dev/null 2>&1; then
-	npm install --prefix .. --ignore-scripts --no-audit --no-fund \
-		--legacy-peer-deps --package-lock=false
-fi
+# npm ci removes peer links, so restore them from the selected Pi host last.
 
 npm_global_root="$(npm root -g 2>/dev/null || true)"
 NPM_GLOBAL_ROOT="$npm_global_root" node ../scripts/test-peer-bootstrap.mjs --link "$PWD/node_modules"
