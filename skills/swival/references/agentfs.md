@@ -1,6 +1,6 @@
 # AgentFS sandbox
 
-[AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.9.3 invokes it with `--no-default-allows --allow <base-dir>`. That absolute base directory has write-through access to the host. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
+[AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.9.3 invokes it with `--no-default-allows --allow <base-dir>`. On macOS, that grant permits host-base write-through. On Linux, AgentFS 0.6.4 overlays its launch cwd before applying grants, so an identical base path remains in the overlay. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
 
 For native audit, the adapter launches upstream AgentFS directly with `--no-default-allows` and a disposable committed snapshot grant. ChatGPT alone also receives a dedicated auth-store directory grant inside HOME. API-key/local routes receive no ChatGPT directory grant. Auth cannot overlap source, artifacts, or prospective AgentFS/service state, including all of HOME's `.agentfs`. These explicit grants are not the entire upstream write policy. The auth directory never enters Swival `--add-dir` or model-tool roots. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap. Original source and Git metadata stay outside the writable scope. After verified shutdown, the adapter reads bounded artifacts from the snapshot. It does not export from guessed delta paths or automatically apply patches.
 
@@ -8,7 +8,7 @@ AgentFS does not establish host-read confidentiality or provider-process egress 
 
 ## Ordinary delegation
 
-Use a disposable cwd for write exploration. A fresh AgentFS session does not remove Swival's host-base write-through grant. `noSandboxAutoSession: true` separates session state only.
+Use a disposable cwd for write exploration. A fresh AgentFS session does not remove Swival's explicit base-directory grant or provide a portable host-write isolation guarantee. `noSandboxAutoSession: true` separates session state only.
 
 Parallel writable tasks need distinct disposable directories or worktrees. The same-cwd guard treats fresh AgentFS sessions and command-name allowlists as write-capable. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption. Ordinary cwd and output paths are caller-selected, not restricted to approved roots. Pi writes requested output outside the child sandbox; no confidentiality guarantee applies.
 

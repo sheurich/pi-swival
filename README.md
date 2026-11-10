@@ -59,7 +59,7 @@ A Pi tool that dispatches single, parallel, or chained tasks, or one structured 
 Key features beyond pi's example subagent extension:
 
 - Reviewer loop (`selfReview` or test-as-contract `reviewer`) that retries until the reviewer accepts.
-- Configurable sandboxes: AgentFS permits host-base write-through; nono uses Landlock/Seatbelt. Use disposable directories for AgentFS write exploration.
+- Configurable sandboxes: AgentFS can permit host-base write-through; nono uses Landlock/Seatbelt. Use disposable directories for AgentFS write exploration.
 - Network policy (`network: provider-only`, `network: none`).
 - Format-preserving secret encryption (`encryptSecrets`).
 - LLM request auditing (`extraArgs: ["--llm-filter", "..."]`).
@@ -344,7 +344,7 @@ Use the example subagent (or a third-party equivalent) when fine-grained tool-ca
 - The agent system prompt body is always passed as `--system-prompt` command-line arguments. Large bodies can hit platform `ARG_MAX` even under `sandbox: builtin`; split long guidance into a skills directory passed via `skillsDir` (or `skillsDirOverride` at dispatch) instead.
 - Parallel tasks share the host filesystem. Use distinct pre-created worktrees or disposable copies for writable tasks. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption. Fresh AgentFS sessions and command-name allowlists do not qualify.
 - `async: true` is single-mode only. Parallel and chain modes always run synchronously. Async `timeoutMs`, `output`, and `outputMode` are unsupported and rejected before side effects. Retrieve completed output with `resume`.
-- Fresh AgentFS sessions separate session state, not host-base writes. Swival 1.9.3 grants `--allow <base-dir>` write-through access. Use a disposable cwd. Native committed snapshots keep original source separate from that grant.
+- Fresh AgentFS sessions separate session state, not host-base writes. Swival 1.9.3 passes `--allow <base-dir>`, permitting host-base write-through on macOS. Linux AgentFS 0.6.4 overlays its launch cwd even when that path is allowed. Use a disposable cwd. Native committed snapshots keep original source separate from that grant.
 - Ordinary artifact directories under `~/.pi/agent/swival-artifacts/` are eligible for pruning after 7 days when completion and readable object metadata are present. Missing, malformed, oversized, or symlinked metadata prevents pruning. Native directories remain retained. Back up reports you need longer.
 - Swival's interactive `/goal` REPL command is unavailable here; the extension invokes Swival non-interactively.
 

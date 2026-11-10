@@ -93,7 +93,7 @@ A per-profile `api_key` is fine here because the profile also sets `provider = "
 
 Swival's builtin file tools default to the base directory, usually the detected project root or current directory. Command execution defaults to unrestricted (`--commands all`); file-tool checks do not confine unrestricted commands. Add `yolo = true` only if you also want to lift the file-access restriction; otherwise leave it out and scope access with `--add-dir` / `--add-dir-ro`.
 
-Ordinary delegation accepts caller-selected cwd and output paths without approved-root confinement. Swival 1.9.3 grants AgentFS host-base write-through access, even with a fresh session. Use disposable directories for write exploration and distinct writable directories for parallel tasks. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption; fresh AgentFS sessions remain write-capable. No host-read confidentiality guarantee applies.
+Ordinary delegation accepts caller-selected cwd and output paths without approved-root confinement. Swival 1.9.3 can permit AgentFS host-base write-through, even with a fresh session. See [AgentFS platform behavior](./agentfs.md) for the Linux overlay distinction. Use disposable directories for write exploration and distinct writable directories for parallel tasks. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption; fresh AgentFS sessions remain write-capable. No host-read confidentiality guarantee applies.
 
 ## Native audit prerequisites
 

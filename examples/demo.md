@@ -82,7 +82,7 @@ If swival rejects the first answer, the header shows `1 rounds` or more. If the 
 
 ## Demo 3: sandboxed exploration (AgentFS)
 
-Use a disposable cwd and disposable target files. Swival 1.9.3 grants AgentFS host-base write-through access through `--allow <base-dir>`. Fresh sessions do not prevent those writes. Use the explorer only with disposable files; its session does not isolate host-base writes.
+Use a disposable cwd and disposable target files. Swival 1.9.3 can permit AgentFS host-base write-through through `--allow <base-dir>`. See [AgentFS platform behavior](../skills/swival/references/agentfs.md) for the Linux overlay distinction. Fresh sessions do not prevent those writes. Use the explorer only with disposable files; its session does not isolate host-base writes.
 
 Prerequisite: `agentfs` installed (see `skills/swival/references/agentfs.md`). Set `cwd` to your disposable directory on the following call. Keep a separate copy if you want to compare the original file.
 
@@ -123,7 +123,7 @@ Inspect native coverage and artifact pairs before treating the pipeline as compl
 
 ## Demo 5: parallel dispatch
 
-Prepare two distinct disposable directories first. Add a different per-task `cwd` to each item below and use targets within those directories. The abbreviated example omits those required paths; do not dispatch it unchanged. The same-cwd guard rejects these ordinary writable tasks. It also rejects fresh AgentFS sessions sharing a writable cwd because they still permit host-base writes.
+Prepare two distinct disposable directories first. Add a different per-task `cwd` to each item below and use targets within those directories. The abbreviated example omits those required paths; do not dispatch it unchanged. The same-cwd guard rejects these ordinary writable tasks. It also rejects fresh AgentFS sessions sharing a writable cwd because they can still permit host-base writes.
 
 ```text
 Use swival-subagent with tasks: [

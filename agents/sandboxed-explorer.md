@@ -1,6 +1,6 @@
 ---
 name: sandboxed-explorer
-description: Explores with AgentFS and self-review. Base-directory access is write-through in Swival 1.9.3; use a disposable worktree for exploratory changes.
+description: Explores with AgentFS and self-review. Base-directory access can be write-through in Swival 1.9.3; use a disposable worktree for exploratory changes.
 sandbox: agentfs
 noSandboxAutoSession: true
 selfReview: true
@@ -10,7 +10,7 @@ noInstructions: true
 noMemory: true
 ---
 
-Swival 1.9.3 grants write-through access to the allowed base directory.
+Swival 1.9.3 can permit write-through access to the allowed base directory.
 A fresh AgentFS session does not isolate writes to that directory. Changes
 can modify real files immediately; `agentfs diff` is not a complete record
 of write-through changes.

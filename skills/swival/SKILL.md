@@ -57,7 +57,7 @@ swival-subagent with agent: "test-runner",
   task: "Make the failing tests pass"
 ```
 
-Exploration requires a disposable cwd containing only files you can discard. Set `cwd` explicitly on the following call. Swival 1.9.3 grants host-base write-through access, including fresh AgentFS sessions.
+Exploration requires a disposable cwd containing only files you can discard. Set `cwd` explicitly on the following call. Swival 1.9.3 can permit host-base write-through, including fresh AgentFS sessions.
 
 ```
 swival-subagent with agent: "sandboxed-explorer",
@@ -271,7 +271,7 @@ Swival supports three sandbox backends:
 
 The read-before-write guard prevents overwriting unread files. `noReadGuard: true` disables it.
 
-Swival 1.9.3 passes `--allow <base-dir>` to AgentFS, allowing host write-through even with a fresh session. Use a disposable cwd for write exploration. `agentfs diff` shows overlay changes, not a complete record of host-base writes. See [references/agentfs.md](./references/agentfs.md) for session inspection and native snapshot boundaries.
+Swival 1.9.3 passes `--allow <base-dir>` to AgentFS, permitting host write-through on macOS even with a fresh session. Linux AgentFS 0.6.4 overlays its launch cwd instead when that path is also the allowed base. Use a disposable cwd for write exploration. `agentfs diff` shows overlay changes, not a complete record of host-base writes. See [references/agentfs.md](./references/agentfs.md) for session inspection and native snapshot boundaries.
 
 Configure network egress policies with `network` in agent frontmatter or `networkOverride` at dispatch:
 
