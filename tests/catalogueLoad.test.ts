@@ -105,10 +105,11 @@ it("catalogueLoad: Pi loads the package and lists offline", async () => {
 			if (part.type === "text") expect(part.text.length).toBeLessThanOrEqual(8192);
 		}
 		expect(result.details).toMatchObject({
-			mode: "list", schemaVersion: 1, agentScope: "user", total: 6, omitted: 0,
+			mode: "list", schemaVersion: 1, agentScope: "user", total: 7, omitted: 0,
 			diagnostics: [], diagnosticsTotal: 0, diagnosticsOmitted: 0, dispatchBlocked: false,
 			agents: expect.arrayContaining([
 				expect.objectContaining({ name: "swival", source: "bundled" }),
+				expect.objectContaining({ name: "sandboxed-reviewer", source: "bundled" }),
 				expect.objectContaining({
 					name: "loader-only", source: "user",
 					configured: { sandbox: "builtin", network: "none" }, effectiveRuntime: "unknown",

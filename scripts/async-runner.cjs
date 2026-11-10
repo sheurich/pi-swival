@@ -4,28 +4,45 @@
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { claimScratch, cleanupScratch, claimArtifacts, atomicWrite, transferEvidence } = require("./async-evidence.cjs");
 
-const [artifactDir, ...swivalArgs] = process.argv.slice(2);
-if (!artifactDir) {
-	process.stderr.write("async-runner: artifact directory is required\n");
+// Internal option only. Legacy [artifactDir, ...swivalArgs] remains supported.
+const argv = process.argv.slice(2);
+const scratchPath = argv[0] === "--scratch-dir" ? (argv.shift(), argv.shift()) : undefined;
+const [artifactDir, ...swivalArgs] = argv;
+let scratch;
+let artifacts;
+try {
+	if (!artifactDir) throw new Error("missing artifact directory");
+	artifacts = claimArtifacts(artifactDir);
+	if (scratchPath !== undefined) scratch = claimScratch(scratchPath);
+} catch {
+	process.stderr.write("async-runner: invalid evidence directories\n");
 	process.exit(2);
-}
-
-function writeAtomic(name, content) {
-	const target = path.join(artifactDir, name);
-	const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
-	fs.writeFileSync(temporary, content, "utf-8");
-	fs.renameSync(temporary, target);
 }
 
 let finished = false;
 function finish(exitCode, spawnError) {
 	if (finished) return;
 	finished = true;
-	if (spawnError) {
-		writeAtomic("spawn-error.txt", `swival failed to start: ${spawnError.message}`);
+	const errors = [];
+	try {
+		if (scratch) errors.push(...transferEvidence(scratch, artifacts));
+	} catch {
+		errors.push("evidence_transfer_failed");
+		// Refuse stale/partial report evidence even if a host-side export failed.
+		try { atomicWrite(artifacts, "report.json", ""); }
+		catch { throw new Error("async-runner: evidence finalization failed"); }
+	} finally {
+		if (scratch) {
+			const error = cleanupScratch(scratch);
+			if (error) errors.push(error);
+		}
 	}
-	writeAtomic("completed.json", JSON.stringify({
+	if (errors.length) atomicWrite(artifacts, "transfer-error.txt", [...new Set(errors)].join("\n") + "\n");
+	if (spawnError) atomicWrite(artifacts, "spawn-error.txt", `swival failed to start: ${spawnError.message}`);
+	// Terminal visibility is last: never announce completion before exporting.
+	atomicWrite(artifacts, "completed.json", JSON.stringify({
 		exitCode,
 		exitedAt: new Date().toISOString(),
 	}, null, 2));
@@ -34,31 +51,30 @@ function finish(exitCode, spawnError) {
 
 const taskFile = path.join(artifactDir, "task.txt");
 let stdinFd = "ignore";
-// Only pipe task.txt if the task was not already provided on argv
 const lastDashDash = swivalArgs.lastIndexOf("--");
 const hasArgvTask = lastDashDash !== -1 && lastDashDash < swivalArgs.length - 1;
 if (!hasArgvTask) {
-	try {
-		stdinFd = fs.openSync(taskFile, "r");
-	} catch {
-		/* no task file: stdin stays ignored */
-	}
+	try { stdinFd = fs.openSync(taskFile, "r"); }
+	catch { /* No task file: stdin stays ignored. */ }
 }
 
-const child = spawn("swival", swivalArgs, {
-	stdio: [stdinFd, "inherit", "inherit"],
-});
-
-child.once("error", (error) => {
+let child;
+try {
+	child = spawn("swival", swivalArgs, { stdio: [stdinFd, "inherit", "inherit"] });
+} catch (error) {
 	finish(null, error);
-});
-child.once("close", (code, signal) => {
-	const signalExit = signal === "SIGKILL" ? 137 : signal === "SIGTERM" ? 143 : 1;
-	finish(code ?? signalExit);
-});
-
-for (const signal of ["SIGINT", "SIGTERM"]) {
-	process.on(signal, () => {
-		try { child.kill(signal); } catch { /* child already exited */ }
+} finally {
+	if (typeof stdinFd === "number") fs.closeSync(stdinFd);
+}
+if (child) {
+	child.once("error", (error) => finish(null, error));
+	child.once("close", (code, signal) => {
+		const signalExit = signal === "SIGKILL" ? 137 : signal === "SIGTERM" ? 143 : 1;
+		finish(code ?? signalExit);
 	});
+	for (const signal of ["SIGINT", "SIGTERM"]) {
+		process.on(signal, () => {
+			try { child.kill(signal); } catch { /* Child already exited. */ }
+		});
+	}
 }

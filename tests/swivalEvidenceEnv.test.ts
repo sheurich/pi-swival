@@ -1,0 +1,39 @@
+import { expect, it } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { ANTHROPIC_OAUTH_SHIM_DIR, resolveSwivalEvidenceEnv } from "../extensions/index.js";
+
+it.each([
+	{ args: ["--sandbox", "agentfs"], project: "", global: "", granted: true },
+	{ args: ["--sandbox=builtin"], project: 'sandbox="agentfs"', global: "", granted: false },
+	{ args: [], project: 'sandbox="agentfs"', global: 'sandbox="nono"', granted: true },
+	{ args: [], project: "", global: 'sandbox="agentfs"', granted: true },
+	{ args: ["--profile", "chosen"], project: '[profiles.chosen]\nsandbox="agentfs"', global: "", granted: false },
+	{ args: ["--sandbox", "agentfs", "--network=none"], project: "", global: "", granted: false },
+	{ args: ["--sandbox", "agentfs"], project: 'network="none"', global: "", granted: false },
+	{ args: [], project: 'sandbox="agentfs"', global: 'network="none"', granted: false },
+	{ args: ["--network", "provider-only"], project: 'sandbox="agentfs"', global: 'network="none"', granted: true },
+	{ args: ["--", "--sandbox", "agentfs"], project: "", global: "", granted: false },
+	{ args: [], project: "", global: 'sandbox="agentfs"', emptyProject: true, granted: true },
+	{ args: [], project: 'sandbox="agentfs"', global: 'network="none"', symlinked: true, granted: false },
+	{ args: [], project: "", global: 'sandbox="agentfs"', symlinked: true, granted: true },
+])("resolves only effective AgentFS evidence grants: %j", ({ args, project, global, emptyProject, symlinked, granted }) => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "swival-evidence-env-"));
+	try {
+		const cwd = path.join(root, "cwd"), base = path.join(cwd, "base"), xdg = path.join(root, "xdg");
+		fs.mkdirSync(base, { recursive: true });
+		fs.mkdirSync(path.join(xdg, "swival"), { recursive: true });
+		for (const [file, content] of [[path.join(base, "swival.toml"), project], [path.join(xdg, "swival/config.toml"), global]]) {
+			if (!content && !emptyProject) continue;
+			fs.writeFileSync(symlinked ? `${file}.target` : file, content);
+			if (symlinked) fs.symlinkSync(`${file}.target`, file);
+		}
+		const env = { XDG_CONFIG_HOME: xdg, PYTHONPATH: ["/other", ANTHROPIC_OAUTH_SHIM_DIR].join(path.delimiter) };
+		const evidence = path.join(root, "evidence");
+		const result = resolveSwivalEvidenceEnv(["--base-dir", "base", ...args], evidence, env, root, cwd);
+		expect(result).toEqual(granted ? { ...env, PI_SWIVAL_EVIDENCE_DIR: evidence, PYTHONDONTWRITEBYTECODE: "1",
+			PYTHONPATH: [ANTHROPIC_OAUTH_SHIM_DIR, "/other"].join(path.delimiter) } : undefined);
+		expect(env).not.toHaveProperty("PI_SWIVAL_EVIDENCE_DIR");
+	} finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

@@ -16,6 +16,12 @@ vi.mock("node:child_process", async () => ({
 	spawn: execution.spawn,
 }));
 
+function artifactDirectoryFromSpawn(call: any[]): string {
+	const argv = call[1] as string[];
+	expect(argv[1]).toBe("--scratch-dir");
+	return argv[3];
+}
+
 const OWNER = "11111111-1111-4111-8111-111111111111";
 const OTHER = "22222222-2222-4222-8222-222222222222";
 const roots: string[] = [];
@@ -335,7 +341,7 @@ describe("session-scoped async observation lifecycle", () => {
 			expect(result.isError).not.toBe(true);
 			expect(registrations).toHaveLength(count);
 			if (change !== "shutdown") expect(registrations.at(-1)!.dispose).not.toHaveBeenCalled();
-			const artifactDir = (execution.spawn.mock.calls as any)[0][1][1];
+			const artifactDir = artifactDirectoryFromSpawn(execution.spawn.mock.calls[0]);
 			expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "run-meta.json"), "utf8")))
 				.toMatchObject({ ownerSessionId: OWNER, ownerSessionFile: "/synthetic/session.jsonl" });
 			proc.emit("close", 1);
@@ -404,7 +410,7 @@ describe("session-scoped async observation lifecycle", () => {
 		// The launch still proceeds with its captured owner; only observation is retired.
 		expect(result.isError).not.toBe(true);
 		expect(execution.spawn).toHaveBeenCalledOnce();
-		const artifactDir = (execution.spawn.mock.calls as any)[0][1][1];
+		const artifactDir = artifactDirectoryFromSpawn(execution.spawn.mock.calls[0]);
 		expect(JSON.parse(fs.readFileSync(path.join(artifactDir, "run-meta.json"), "utf8")))
 			.toMatchObject({ ownerSessionId: OWNER, ownerSessionFile: "/synthetic/session.jsonl" });
 		expect.soft(adapter).toHaveBeenCalledOnce();
@@ -714,7 +720,7 @@ describe("B1/B2 opt-in and owner-index regressions", () => {
 				const proc = new EventEmitter() as any; proc.unref = vi.fn(); execution.spawn.mockReturnValue(proc);
 				const result = await r.tool.execute("call", { agent: "test", task: "task", agentScope: "project", async: true }, undefined, undefined, ctx);
 				expect(result.isError).not.toBe(true);
-				const dir = (execution.spawn.mock.calls as any).at(-1)[1][1];
+				const dir = artifactDirectoryFromSpawn(execution.spawn.mock.calls.at(-1)!);
 				expect(JSON.parse(fs.readFileSync(path.join(dir, "run-meta.json"), "utf8"))).toMatchObject({ ownerSessionId: OWNER });
 				disposers.push(() => proc.emit("close", 1));
 			}
@@ -1079,7 +1085,7 @@ describe("async launch observation", () => {
 				const result = await r.tool.execute("call", { agent: "project-test", task: "task",
 					agentScope: "project", async: true }, undefined, undefined, ctx);
 				expect(result.isError).not.toBe(true);
-				const artifactDir = (execution.spawn.mock.calls as any)[0][1][1];
+				const artifactDir = artifactDirectoryFromSpawn(execution.spawn.mock.calls[0]);
 				const { runId } = JSON.parse(fs.readFileSync(path.join(artifactDir, "run-meta.json"), "utf8"));
 				// No refresh or asynchronous observation work is required after the acknowledgement.
 				expect.soft(provider.listActiveWork()).toEqual([{ id: runId, sessionId: "/synthetic/session.jsonl" }]);
@@ -1161,9 +1167,14 @@ describe("async launch observation", () => {
 		const agent: any = { name: "test", source: "user", description: "test", systemPrompt: "", filePath: "/test.md" };
 		const launched = await extension.runSingleSwivalAsync(root, [agent], "test", "task", undefined, {}, root,
 			{ ownerSessionId: OWNER });
-		expect((execution.spawn.mock.calls as any)[0][1].slice(-2)).toEqual(["--", "Delegated task (plain text):\n\ntask"]);
+		const spawnArgv = (execution.spawn.mock.calls as any)[0][1] as string[];
+		// Wrapper layout from async-round3; the CLI payload carries PR #34's plain-text envelope.
+		expect(spawnArgv[1]).toBe("--scratch-dir");
+		expect(spawnArgv[3]).toBe(launched.artifactDir);
+		expect(spawnArgv.slice(-2)).toEqual(["--", "Delegated task (plain text):\n\ntask"]);
 		expect(await extension.readAsyncRunObservations(OWNER, root)).toMatchObject([{ state: "running" }]);
 		const meta = JSON.parse(fs.readFileSync(path.join(launched.artifactDir, "run-meta.json"), "utf8"));
+		expect(meta.task).toBe("task");
 		complete(meta); proc.emit("close", 0);
 		expect(await extension.readAsyncRunObservations(OWNER, root)).toMatchObject([{ state: "completed" }]);
 		const r = runtime({ artifactRoot: root });

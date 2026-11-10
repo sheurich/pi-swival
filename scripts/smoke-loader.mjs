@@ -50,7 +50,7 @@ try {
 	if (skills.skills.length !== 3) fail(`Expected 3 skills, found ${skills.skills.length}`);
 	if (prompts.prompts.length !== 1) fail(`Expected 1 prompt, found ${prompts.prompts.length}`);
 	const agentFiles = readdirSync(join(packageRoot, "agents")).filter((name) => name.endsWith(".md")).sort();
-	if (agentFiles.length !== 5) fail(`Expected 5 bundled agents, found ${agentFiles.length}`);
+	if (agentFiles.length !== 6) fail(`Expected 6 bundled agents, found ${agentFiles.length}`);
 	for (const file of agentFiles) {
 		const content = readFileSync(join(packageRoot, "agents", file), "utf8");
 		if (!/^---\n[\s\S]*?^name:/m.test(content) || !/^---\n[\s\S]*?^description:/m.test(content)) fail(`Invalid bundled agent frontmatter: ${file}`);

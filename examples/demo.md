@@ -39,7 +39,7 @@ Confirm it shows up in your settings:
 pi list | grep pi-swival
 ```
 
-All five bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`) are auto-discovered from the package's `agents/` directory.
+All six bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxed-reviewer`, `sandboxed-explorer`, and `a2a-coordinator`) are auto-discovered from the package's `agents/` directory.
 
 ## Demo 1: generic delegation
 

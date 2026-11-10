@@ -1,9 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
-import { buildSwivalArgs, isAgentFsRequested, isReexecSandboxRequested, readConfiguredAllowedDirsRo, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, type SwivalOverrides } from "../extensions/index.js";
-import type { SwivalAgentConfig } from "../extensions/agents.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildSwivalArgs, checkRequiresReviewer, isAgentFsRequested, isReexecSandboxRequested, readConfiguredAllowedDirsRo, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, resolveSwivalReviewEnv, ANTHROPIC_OAUTH_SHIM_DIR, type SwivalOverrides } from "../extensions/index.js";
+import { discoverSwivalAgents, type SwivalAgentConfig } from "../extensions/agents.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
 	return {
@@ -17,6 +17,136 @@ function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfi
 }
 
 describe("buildSwivalArgs", () => {
+	it("suppresses inherited self-review with a required shim while retaining external reviewers", () => {
+		const env = resolveSwivalReviewEnv(["--sandbox", "builtin", "--reviewer", "acceptance.sh"], true, { PYTHONPATH: "/original" });
+		expect(env).toMatchObject({ PI_SWIVAL_NO_SELF_REVIEW: "1", PI_SWIVAL_SHIM_REQUIRED: "1", PYTHONDONTWRITEBYTECODE: "1" });
+		expect(env?.PYTHONPATH).toBe(ANTHROPIC_OAUTH_SHIM_DIR + path.delimiter + "/original");
+		expect(resolveSwivalReviewEnv(["--self-review"], true, {})).toBeUndefined();
+		expect(resolveSwivalReviewEnv(["--sandbox", "agentfs"], true, {})).toBeDefined();
+	});
+	it.each([
+		[],
+		["--sandbox", "nono"],
+		["--sandbox=nono", "--add-dir-ro", ANTHROPIC_OAUTH_SHIM_DIR],
+		["--sandbox", "agentfs", "--sandbox=nono"],
+		["--sandbox", "builtin", "--network", "none"],
+		["--sandbox=agentfs", "--network=none"],
+		["--network", "none"],
+		["--", "--sandbox", "agentfs"],
+	].map((args) => ({ args })))("rejects unsupported explicit-false shim arguments $args", ({ args }) => {
+		expect(() => resolveSwivalReviewEnv(args, true, {})).toThrow(/No silent fallback/);
+		expect(resolveSwivalReviewEnv(args, false, {})).toBeUndefined();
+	});
+	it("preflights self-review compatibility using final extraArgs before dispatch", () => {
+		expect(() => buildSwivalArgs(makeAgent({ selfReview: false }), "", "/cwd")).toThrow(/explicit sandbox/);
+		expect(() => buildSwivalArgs(makeAgent({ sandbox: "agentfs", extraArgs: ["--sandbox=nono"] }), "", "/cwd", { selfReview: false })).toThrow(/explicit sandbox/);
+		expect(buildSwivalArgs(makeAgent({ selfReview: false, sandbox: "nono", extraArgs: ["--sandbox=agentfs"] }), "", "/cwd")).toContain("--sandbox=agentfs");
+		expect(buildSwivalArgs(makeAgent({ selfReview: false, sandbox: "builtin", extraArgs: ["--self-review"] }), "", "/cwd")).toContain("--self-review");
+	});
+	it("emits discovered bundled reviewer flags without enabling self-review or shell", () => {
+		const agent = discoverSwivalAgents("/cwd", "project").agents.find((agent) => agent.name === "sandboxed-reviewer");
+		expect(agent).toBeDefined();
+		const args = buildSwivalArgs(agent!, "/tmp/r.json", "/cwd");
+		for (const flag of ["--no-skills", "--no-instructions", "--no-memory", "--no-sandbox-auto-session"]) expect(args).toContain(flag);
+		expect(args).not.toContain("--self-review");
+		expect(args).toEqual(expect.arrayContaining(["--commands", "none", "--network", "provider-only", "--sandbox", "agentfs"]));
+	});
+	it("directory overrides replace frontmatter and reject project agents, injection and protected grants", () => {
+		const args = buildSwivalArgs(makeAgent({ addDir: ["/old"], addDirRo: ["/old-ro"] }), "/tmp/r.json", "/cwd", { addDir: ["/new"], addDirRo: ["/new-ro"] });
+		expect(args).toEqual(expect.arrayContaining(["--add-dir", "/new", "--add-dir-ro", "/new-ro"]));
+		expect(args).not.toContain("/old"); expect(args).not.toContain("/old-ro");
+		expect(buildSwivalArgs(makeAgent({ addDir: ["/old"] }), "/tmp/r.json", "/cwd", { addDir: [] })).not.toContain("/old");
+		for (const value of ["", " ", "--flag", "x\nvalue", "/", os.homedir(), path.join(os.homedir(), ".aws")]) {
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { addDirRo: [value] })).toThrow();
+		}
+		expect(() => buildSwivalArgs(makeAgent({ source: "project" }), "/tmp/r.json", "/cwd", { addDirRo: [] })).toThrow(/Project-scope/);
+	});
+	describe("directory override canonicalization", () => {
+		const hostPlatform = process.platform;
+		const roots: string[] = [];
+		afterEach(() => {
+			Object.defineProperty(process, "platform", { value: hostPlatform });
+			vi.unstubAllEnvs();
+			for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+		});
+		function fakeHome() {
+			const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-grants-"))); roots.push(root);
+			const home = path.join(root, "home");
+			const repo = path.join(home, "src", "owner", "repo");
+			fs.mkdirSync(path.join(home, ".ssh"), { recursive: true });
+			fs.mkdirSync(repo, { recursive: true });
+			const linkDir = path.join(root, "a", "b", "c"); fs.mkdirSync(linkDir, { recursive: true });
+			const link = path.join(linkDir, "link"); fs.symlinkSync(repo, link);
+			vi.stubEnv("HOME", home);
+			return { root, home, repo, linkDir, link };
+		}
+		it("resolves symlinks before `..` so a link cannot climb into a protected directory", () => {
+			const { root, repo, linkDir, link } = fakeHome();
+			const escape = `${link}/../../../.ssh`;
+			expect(path.resolve(escape)).toBe(path.join(root, "a", ".ssh"));
+			for (const overrides of [{ addDir: [escape] }, { addDirRo: [escape] }, { addDirRo: ["link/../../../.ssh"] }] as SwivalOverrides[]) {
+				expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", linkDir, overrides)).toThrow(/overlapping protected directory/);
+			}
+			// A benign override is emitted as the canonical path that was validated.
+			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", linkDir, { addDirRo: ["link/../repo/future"] });
+			expect(args[args.indexOf("--add-dir-ro") + 1]).toBe(path.join(repo, "future"));
+			// Frontmatter entries are not canonicalized.
+			const frontmatter = buildSwivalArgs(makeAgent({ addDirRo: [link] }), "/tmp/r.json", linkDir);
+			expect(frontmatter[frontmatter.indexOf("--add-dir-ro") + 1]).toBe(link);
+		});
+		it("resumes symlink resolution after stepping back out of a missing component", () => {
+			const { home, repo, link, linkDir } = fakeHome();
+			fs.symlinkSync(path.join(home, ".ssh"), path.join(repo, "escape"));
+			for (const overrides of [{ addDir: ["missing/../escape"] }, { addDirRo: ["missing/../escape"] },
+				{ addDirRo: [`${repo}/missing/../escape`] }] as SwivalOverrides[]) {
+				expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", repo, overrides)).toThrow(/overlapping protected directory/);
+			}
+			// The emitted grant is already canonical: resolving it again is a no-op.
+			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", linkDir, { addDirRo: ["missing/../link/future"] });
+			expect(args[args.indexOf("--add-dir-ro") + 1]).toBe(path.join(repo, "future"));
+			expect(args).not.toContain(link);
+		});
+		it("protects symlinked and dangling home directories under both spellings", () => {
+			const { root, home } = fakeHome();
+			const external = path.join(root, "external"); fs.mkdirSync(external);
+			fs.symlinkSync(path.join(external, "future-aws"), path.join(home, ".aws"));
+			const dotfilesSsh = path.join(root, "dotfiles", "ssh"); fs.mkdirSync(dotfilesSsh, { recursive: true });
+			fs.rmSync(path.join(home, ".ssh"), { recursive: true }); fs.symlinkSync(dotfilesSsh, path.join(home, ".ssh"));
+			const refused = ["~/.aws", path.join(home, ".aws"), path.join(external, "future-aws"), external,
+				"~/.ssh", "~/missing/../.ssh", dotfilesSsh, path.join(dotfilesSsh, "keys")];
+			for (const entry of refused) {
+				for (const overrides of [{ addDir: [entry] }, { addDirRo: [entry] }] as SwivalOverrides[]) {
+					expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", home, overrides), entry).toThrow(/overlapping protected directory/);
+				}
+			}
+			// The ancestor of a protected target is refused too; an unrelated sibling is not.
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", home, { addDirRo: [path.join(root, "dotfiles")] })).toThrow(/overlapping protected directory/);
+			expect(buildSwivalArgs(makeAgent(), "/tmp/r.json", home, { addDirRo: [path.join(root, "a")] })).toContain(path.join(root, "a"));
+		});
+		it("reports unresolvable override paths as argument errors", () => {
+			const { repo } = fakeHome();
+			fs.writeFileSync(path.join(repo, "README.md"), "# inert\n");
+			fs.symlinkSync("loop", path.join(repo, "loop"));
+			for (const entry of ["README.md/sub", "loop/sub", path.join(repo, "loop")]) {
+				for (const overrides of [{ addDir: [entry] }, { addDirRo: [entry] }] as SwivalOverrides[]) {
+					expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", repo, overrides), entry).toThrow(/Cannot resolve --add-dir(?:-ro)? path/);
+					// Dispatch guards convert argument errors into messages instead of rejecting.
+					expect(checkRequiresReviewer(makeAgent({ requiresReviewer: true }), overrides, repo)).toMatch(/Cannot resolve/);
+				}
+			}
+		});
+		it("case-folds protected home directories on case-insensitive platforms", () => {
+			const { home } = fakeHome();
+			expect(fs.existsSync(path.join(home, ".aws"))).toBe(false);
+			Object.defineProperty(process, "platform", { value: "darwin" });
+			for (const entry of ["~/.AWS", "~/.AWS/credentials", path.join(home, ".Ssh")]) {
+				expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { addDirRo: [entry] })).toThrow(/overlapping protected directory/);
+			}
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { addDirRo: [path.join(path.dirname(home), "HOME")] })).toThrow(/protected root/);
+			Object.defineProperty(process, "platform", { value: "linux" });
+			expect(buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd", { addDirRo: ["~/.AWS"] })).toContain(path.join(home, ".AWS"));
+		});
+	});
 	it("always disables lifecycle / MCP / A2A / web-search / history / continue / memory / subagents by default", () => {
 		const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", "/cwd");
 		expect(args).toContain("--no-lifecycle");
@@ -261,6 +391,8 @@ describe("buildSwivalArgs", () => {
 			expect(extraBdArgs).toContain(realMainGit);
 			const dedupArgs = buildSwivalArgs(makeAgent({ addDirRo: [mainGit] }), "/tmp/r.json", wtDir);
 			expect(dedupArgs.filter((a) => a === "--add-dir-ro").length).toBe(1);
+			const overrideArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir, { addDirRo: [mainGit] });
+			expect(overrideArgs.filter((a) => a === "--add-dir-ro").length).toBe(1);
 			const parentRwArgs = buildSwivalArgs(makeAgent({ addDir: [path.dirname(mainGit)] }), "/tmp/r.json", wtDir);
 			expect(parentRwArgs).not.toContain("--add-dir-ro");
 			// Relative addDirRo resolves against cwd, not baseDir: when baseDir != cwd, a relative path matching baseDir does not suppress the grant

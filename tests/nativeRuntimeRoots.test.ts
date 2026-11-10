@@ -198,6 +198,135 @@ describe("native runtime configuration roots", () => {
 			expect(f.started).toEqual([f.runtime.python]); expect(spawn).not.toHaveBeenCalled();
 			expect(fs.existsSync(f.artifacts)).toBe(false);
 		});
+	// Bedrock and Vertex routes run host-side `aws` / `gcloud` before AgentFS exists.
+	async function credentialFixture(provider: "bedrock" | "geap") {
+		const f = await fixture(); const home = f.runtime.environment!.HOME!;
+		const bin = path.dirname(f.runtime.python!);
+		const tool = provider === "bedrock" ? "aws" : "gcloud";
+		fs.writeFileSync(path.join(bin, tool), `#!${f.runtime.python}\n`, { mode: 0o700 });
+		f.runtime.searchPath = [bin, "/usr/bin", "/bin"].join(path.delimiter);
+		const stateRoot = provider === "bedrock" ? path.join(home, ".aws") : path.join(home, ".config", "gcloud");
+		const route = { version: 2, runtime: { swival: "1.9.3", litellm: "1.106.6" }, provider, model: "concrete-model",
+			endpoint: provider === "bedrock" ? "us-east-2" : null, profile: null, reasoningEffort: null, options: {},
+			selection: { profileSource: null, explicitFields: [] }, reportIdentity: { provider, model: "concrete-model" },
+			...(provider === "geap" ? { project: "synthetic-project", location: "global" } : {}) };
+		const original = vi.mocked(execFile).getMockImplementation()!;
+		const probes: string[] = [];
+		const credentialEnvironments: NodeJS.ProcessEnv[] = [];
+		vi.mocked(execFile).mockImplementation(((exe: string, args: string[], options: any, callback: any) => {
+			if (exe === fs.realpathSync(f.runtime.git!)) return (original as any)(exe, args, options, callback);
+			probes.push(path.basename(exe));
+			if (exe === f.runtime.python) callback(null, JSON.stringify(route));
+			else { credentialEnvironments.push(options.env); callback(new Error("intercepted credential export")); }
+			return {};
+		}) as typeof execFile);
+		return { ...f, home, tool, stateRoot, probes, credentialEnvironments };
+	}
+	// Entries the CLIs read or write beneath their state root. File aliases point at
+	// a file inside the protected root; directory aliases point at the root itself.
+	const fileAliases = ["config", "credentials", "sso/cache/token.json", "application_default_credentials.json", "configurations/config_default"];
+	const nestedAliases = { bedrock: ["config", "credentials", "cli/cache", "sso/cache", "sso/cache/token.json"],
+		geap: ["application_default_credentials.json", "logs", "configurations", "configurations/config_default"] };
+	async function refusedCredentialState(f: Awaited<ReturnType<typeof credentialFixture>>) {
+		await expect(f.start()).rejects.toThrow(/refuses repository-owned runtime paths/);
+		expect(f.probes).toEqual(["python"]);
+		expect(f.credentialEnvironments).toEqual([]);
+		expect(spawn).not.toHaveBeenCalled(); expect(fs.existsSync(f.artifacts)).toBe(false);
+	}
+	it.each((["bedrock", "geap"] as const).flatMap((provider) =>
+		(["source", "commonGit", "worktreeGit"] as const).flatMap((root) =>
+			["root", "dangling-root", ...nestedAliases[provider]].map((alias) => [provider, root, alias] as const))))(
+		"refuses %s credential state aliased into %s via %s before the host credential CLI runs", async (provider, root, alias) => {
+			const f = await credentialFixture(provider);
+			fs.mkdirSync(path.dirname(f.stateRoot), { recursive: true });
+			if (alias === "root") fs.symlinkSync(f[root], f.stateRoot);
+			else if (alias === "dangling-root") fs.symlinkSync(path.join(f[root], "not-created"), f.stateRoot);
+			else {
+				const location = path.join(f.stateRoot, alias); fs.mkdirSync(path.dirname(location), { recursive: true });
+				let target = f[root];
+				if (fileAliases.includes(alias)) { target = path.join(target, "aliased-state"); fs.writeFileSync(target, "# inert\n"); }
+				fs.symlinkSync(target, location);
+			}
+			await refusedCredentialState(f);
+		});
+	it.each((["bedrock", "geap"] as const).flatMap((provider) =>
+		["root", provider === "bedrock" ? "cli/cache" : "logs"].map((alias) => [provider, alias] as const)))(
+		"refuses %s credential state %s aliased to an ancestor of source and Git", async (provider, alias) => {
+			const f = await credentialFixture(provider);
+			const location = alias === "root" ? f.stateRoot : path.join(f.stateRoot, alias);
+			fs.mkdirSync(path.dirname(location), { recursive: true });
+			fs.symlinkSync(f.root, location);
+			await refusedCredentialState(f);
+		});
+	it.each(((["bedrock", "geap"] as const).flatMap((provider) =>
+		(["source", "commonGit", "worktreeGit"] as const).map((root) => [provider, root] as const))))(
+		"refuses %s credential state reaching %s through a symlinked external directory before the host credential CLI runs", async (provider, root) => {
+			const f = await credentialFixture(provider);
+			// Stow-style layout: the state entry is a directory symlink to safe external
+			// operator state whose own child aliases the protected root.
+			const external = path.join(f.root, "operator-state"); fs.mkdirSync(external);
+			fs.mkdirSync(f.stateRoot, { recursive: true });
+			if (provider === "bedrock") {
+				fs.symlinkSync(f[root], path.join(external, "cache"));
+				fs.symlinkSync(external, path.join(f.stateRoot, "cli"));
+			} else {
+				const target = path.join(f[root], "aliased-state"); fs.writeFileSync(target, "# inert\n");
+				fs.symlinkSync(target, path.join(external, "config_default"));
+				fs.symlinkSync(external, path.join(f.stateRoot, "configurations"));
+			}
+			await refusedCredentialState(f);
+		});
+	it.each(((["source", "commonGit", "worktreeGit"] as const).flatMap((root) =>
+		(["configurations-alias", "dated-directory"] as const).map((layout) => [root, layout] as const))))(
+		"refuses geap credential state reaching %s through the gcloud logs directory via %s before the host credential CLI runs", async (root, layout) => {
+			const f = await credentialFixture("geap");
+			// Disabled file logging does not make `logs` inert: gcloud reads
+			// `configurations/config_default` through a `configurations -> logs` alias,
+			// and prunes dated directories beneath an ordinary `logs` regardless.
+			const logs = path.join(f.stateRoot, "logs"); fs.mkdirSync(logs, { recursive: true });
+			if (layout === "configurations-alias") {
+				const target = path.join(f[root], "aliased-state"); fs.writeFileSync(target, "# inert\n");
+				fs.symlinkSync(target, path.join(logs, "config_default"));
+				fs.symlinkSync(logs, path.join(f.stateRoot, "configurations"));
+			} else {
+				fs.symlinkSync(f[root], path.join(logs, "2000.01.01"));
+			}
+			await refusedCredentialState(f);
+		});
+	it.each(["bedrock", "geap"] as const)("binds validated %s credential state for the host CLI only", async (provider) => {
+		const f = await credentialFixture(provider);
+		// Ordinary nested state, including a symlink to populated external operator
+		// state that contains its own symlink cycle, is accepted without looping.
+		for (const nested of provider === "bedrock" ? ["cli/cache", "sso/cache"] : ["logs/2030.01.01", "configurations"]) {
+			fs.mkdirSync(path.join(f.stateRoot, nested), { recursive: true });
+			fs.writeFileSync(path.join(f.stateRoot, nested, "entry"), "# inert\n");
+		}
+		const external = path.join(f.root, "operator-state"); fs.mkdirSync(path.join(external, "nested"), { recursive: true });
+		fs.writeFileSync(path.join(external, "nested", "entry"), "# inert\n");
+		fs.symlinkSync(external, path.join(external, "nested", "loop"));
+		fs.symlinkSync(external, path.join(f.stateRoot, "external"));
+		await expect(f.start()).rejects.toThrow(/credential is unavailable; no fallback/);
+		expect(f.probes).toEqual(["python", f.tool]);
+		expect(f.credentialEnvironments).toHaveLength(1);
+		const env = f.credentialEnvironments[0];
+		if (provider === "bedrock") {
+			expect(env).toMatchObject({ AWS_CONFIG_FILE: path.join(f.stateRoot, "config"), AWS_SHARED_CREDENTIALS_FILE: path.join(f.stateRoot, "credentials") });
+		} else {
+			expect(env).toMatchObject({ CLOUDSDK_CONFIG: f.stateRoot, CLOUDSDK_CORE_DISABLE_FILE_LOGGING: "1" });
+		}
+		expect(spawn).not.toHaveBeenCalled(); expect(fs.existsSync(f.artifacts)).toBe(false);
+	});
+	it.each(["bedrock", "geap"] as const)("skips %s credential state inspection when ambient credentials avoid the host CLI", async (provider) => {
+		const f = await credentialFixture(provider);
+		fs.mkdirSync(path.dirname(f.stateRoot), { recursive: true }); fs.symlinkSync(f.source, f.stateRoot);
+		Object.assign(f.runtime.environment!, provider === "bedrock"
+			? { AWS_ACCESS_KEY_ID: "synthetic-access", AWS_SECRET_ACCESS_KEY: "synthetic-secret", AWS_SESSION_TOKEN: "synthetic-session" }
+			: { GOOGLE_OAUTH_ACCESS_TOKEN: "synthetic-token" });
+		// The aliased state is never bound or inspected; preparation proceeds to the AgentFS probe.
+		await expect(f.start()).rejects.toThrow(/local agentfs check failed/);
+		expect(f.probes).toEqual(["python", "agentfs"]);
+		expect(spawn).not.toHaveBeenCalled(); expect(fs.existsSync(f.artifacts)).toBe(false);
+	});
 	it.each(["unset", "separate", "aliased"])("accepts an ancestor HOME with %s external configuration", async (kind) => {
 		const f = await fixture();
 		f.runtime.environment!.HOME = f.root; // Ordinary /home/user containing its repository.

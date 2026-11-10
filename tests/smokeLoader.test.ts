@@ -94,7 +94,7 @@ describe("offline loader smoke", () => {
 		expect(result.output).toContain("extensions=1");
 		expect(result.output).toContain("skills=3");
 		expect(result.output).toContain("prompts=1");
-		expect(result.output).toContain("agents=5");
+		expect(result.output).toContain("agents=6");
 	});
 
 	it("keeps loader diagnostics when declared resources are invalid", async () => {

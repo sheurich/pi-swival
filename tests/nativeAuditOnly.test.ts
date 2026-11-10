@@ -23,7 +23,7 @@ const GENERAL_SCHEMA_KEYS = [
 	"maxReviewRoundsOverride", "maxTurnsOverride", "maxOutputTokensOverride", "temperatureOverride", "topPOverride",
 	"seedOverride", "reasoningEffortOverride", "instructionsFullOverride", "networkOverride", "a2aConfigOverride",
 	"providerTimeoutOverride", "initialToolChoiceOverride", "nonoRollbackOverride", "nonoBlockNetOverride",
-	"commandMiddlewareOverride", "maxOutputKbOverride", "maxOutputLinesOverride", "skillsDirOverride", "shareSkills",
+	"commandMiddlewareOverride", "maxOutputKbOverride", "maxOutputLinesOverride", "skillsDirOverride", "addDirOverride", "addDirRoOverride", "shareSkills",
 	"subagentsOverride", "cacheOverride", "cacheDirOverride", "verifyOverride", "encryptSecretsOverride", "concurrency",
 	"maxInlineBytes", "output", "outputMode", "timeoutMs", "async", "action", "id",
 ];

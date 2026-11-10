@@ -53,7 +53,7 @@ import fs from "node:fs";
 import path from "node:path";
 if (process.argv.includes("--version")) { console.log("1.0.46"); process.exit(0); }
 const report = process.argv[process.argv.indexOf("--report") + 1];
-const dir = path.dirname(report);
+const dir = ${JSON.stringify(f.root)}; // Fixture IPC is independent of report storage.
 fs.writeFileSync(path.join(dir, "ready"), "ready");
 const timeout = setTimeout(() => process.exit(2), 5000);
 const timer = setInterval(() => {
@@ -72,7 +72,7 @@ const timer = setInterval(() => {
 		started = await runSingleSwivalAsync(f.root, [agent], name, "fixed fixture task", undefined, {}, f.artifactRoot);
 		const meta: RunMeta = JSON.parse(fs.readFileSync(path.join(started.artifactDir, "run-meta.json"), "utf8"));
 		groups.push(meta.pid!);
-		await waitFor(() => fs.existsSync(path.join(started.artifactDir, "ready")));
+		await waitFor(() => fs.existsSync(path.join(f.root, "ready")));
 	} finally { process.env.PATH = originalPath; }
 	return { ...f, ...started! };
 }
@@ -112,7 +112,7 @@ describe.each(ordinaryNames)("ordinary async controls for %s", (name) => {
 	});
 	it("resumes completed output from the same process", async () => {
 		const f = await startOrdinary(name);
-		fs.writeFileSync(path.join(f.artifactDir, "release"), "release");
+		fs.writeFileSync(path.join(f.root, "release"), "release");
 		await waitFor(() => fs.existsSync(path.join(f.artifactDir, "completed.json")));
 		await vi.waitFor(async () => {
 			const result = await f.control("resume", f.runId);
@@ -122,11 +122,72 @@ describe.each(ordinaryNames)("ordinary async controls for %s", (name) => {
 	});
 	it("recovers completed ordinary status and output from disk", async () => {
 		const f = fixture(); const meta = writeOrdinary(f, name);
+		const kill = vi.spyOn(process, "kill");
 		const status = await f.control("status", meta.runId);
 		const resume = await f.control("resume", meta.runId);
 		expect.soft(status.content[0].text).toContain("completed (exit 0");
 		expect.soft(resume.content[0].text).toContain("ordinary completed answer");
 		expect(status.isError).not.toBe(true); expect(resume.isError).not.toBe(true);
+		expect(kill).not.toHaveBeenCalled();
+	});
+});
+
+describe("live versus disk-recovered ordinary run state", () => {
+	it("reports a live same-process run as running without probing its PID", async () => {
+		const f = await startOrdinary("ordinary-live");
+		const kill = vi.spyOn(process, "kill");
+		const status = await f.control("status", f.runId);
+		const resume = await f.control("resume", f.runId);
+		expect(status.isError).not.toBe(true);
+		expect(status.content[0].text).toContain("is still running");
+		expect(resume.isError).toBe(true);
+		expect(resume.content[0].text).toContain("is still in progress");
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	const invalidMarkers = {
+		"exit code only": JSON.stringify({ exitCode: 0 }),
+		"empty object": "{}",
+		"non-canonical timestamp": JSON.stringify({ exitCode: 0, exitedAt: "2026-10-01 00:00:00" }),
+		"timestamp before launch": JSON.stringify({ exitCode: 0, exitedAt: "1970-01-01T00:00:00Z" }),
+		"negative exit code": JSON.stringify({ exitCode: -1, exitedAt: "2026-10-01T00:00:00Z" }),
+		"truncated JSON": "{\"exitCode\":0,\"exitedAt\":",
+	};
+	it.each([["missing", undefined], ...Object.entries(invalidMarkers)])("reports unknown for a recovered run whose completed.json is %s", async (_label, marker) => {
+		const f = fixture(); const meta = writeOrdinary(f, "ordinary-helper");
+		if (marker === undefined) fs.unlinkSync(path.join(meta.artifactDir, "completed.json"));
+		else fs.writeFileSync(path.join(meta.artifactDir, "completed.json"), marker);
+		const kill = vi.spyOn(process, "kill");
+		const status = await f.control("status", meta.runId);
+		expect(status.isError).not.toBe(true);
+		expect(status.content[0].text).toContain("status is unknown");
+		expect(status.content[0].text).not.toContain("still running");
+		expect(status.content[0].text).not.toContain("completed (exit");
+		const resume = await f.control("resume", meta.runId);
+		expect(resume.isError).toBe(true);
+		expect(resume.content[0].text).toContain("completion is unknown");
+		expect(resume.content[0].text).not.toContain("still in progress");
+		expect(resume.content[0].text).not.toContain("ordinary stdout");
+		expect(resume.content[0].text).not.toContain("ordinary completed answer");
+		const interrupt = await f.control("interrupt", meta.runId);
+		expect(interrupt.isError).toBe(true);
+		expect(interrupt.content[0].text).toContain("cannot safely interrupt the recorded PID");
+		expect(kill).not.toHaveBeenCalled();
+	});
+
+	it("reports a recorded startup failure even without completed.json", async () => {
+		const f = fixture(); const meta = writeOrdinary(f, "ordinary-helper");
+		fs.unlinkSync(path.join(meta.artifactDir, "completed.json"));
+		fs.writeFileSync(path.join(meta.artifactDir, "spawn-error.txt"), "spawn swival ENOENT");
+		const kill = vi.spyOn(process, "kill");
+		for (const action of ["status", "resume"] as const) {
+			const result = await f.control(action, meta.runId);
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toContain("failed to start: spawn swival ENOENT");
+			expect(result.content[0].text).not.toMatch(/still running|still in progress|is unknown/);
+			expect(result.content[0].text).not.toContain("ordinary stdout");
+		}
+		expect(kill).not.toHaveBeenCalled();
 	});
 });
 

@@ -5,7 +5,7 @@ argument-hint: "[relative paths or globs]"
 
 Audit the configured repository with these requested relative scopes: $ARGUMENTS
 
-Read the `auditing-with-swival` skill. Confirm scope and the operator's provider and data boundaries. Start Pi from the intended Git root; do not clone another repository or pass a caller-supplied host path.
+Read the `auditing-with-swival` skill. Confirm scope and the operator's provider and data boundaries. Native audit runs only on the current session's Git root: open a Pi session in another checkout to audit it; do not clone another repository or pass `cwd`. Bedrock requires an explicit region and host-exported session credentials; Vertex requires explicit project/location and a host-minted ADC token. SDK file fallback is disabled; expired Vertex credentials stop with `CREDENTIAL_EXPIRED` without changing accounts.
 
 Require Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. The real bootstrap/export gate passed on macOS; Linux and live routes remain unverified. Support means a Swival-supported route satisfying native policies on this runtime. Dynamic model-list routes fail when upstream cannot prevent model replacement. Never broaden permissions.
 

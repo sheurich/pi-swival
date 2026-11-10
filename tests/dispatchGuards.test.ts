@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import registerExtension, {
 	checkRequiresReviewer,
 	isMutatingCwdAgent,
@@ -184,7 +184,7 @@ describe("checkRequiresReviewer", () => {
 
 	it("rejects when an override disables the only configured reviewer", () => {
 		expect(
-			checkRequiresReviewer(makeAgent({ requiresReviewer: true, selfReview: true }), { selfReview: false }),
+			checkRequiresReviewer(makeAgent({ requiresReviewer: true, selfReview: true, sandbox: "builtin" }), { selfReview: false }),
 		).toMatch(/requires a reviewer/);
 		expect(
 			checkRequiresReviewer(makeAgent({ requiresReviewer: true, reviewer: "/bin/true" }), { reviewer: "" }),
@@ -218,6 +218,40 @@ describe("checkRequiresReviewer", () => {
 				extraArgs: ["--reviewer="],
 			}), {}),
 		).toMatch(/requires a reviewer/);
+	});
+});
+
+describe("dispatch guards resolve relative directory overrides against the run cwd", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		vi.unstubAllEnvs();
+		for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+	});
+	// Pi's process cwd is the operator's HOME, so "." against process.cwd() is a
+	// protected root while "." against the dispatched repository is legitimate.
+	function repoOutsideHome() {
+		vi.stubEnv("HOME", process.cwd());
+		const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-run-cwd-"))); roots.push(repo);
+		return repo;
+	}
+	it("isMutatingCwdAgent and checkRequiresReviewer validate overrides against runCwd", () => {
+		const repo = repoOutsideHome();
+		const overrides = { addDirRo: ["."] };
+		expect(() => isMutatingCwdAgent(makeAgent(), overrides)).toThrow(/protected root/);
+		expect(isMutatingCwdAgent(makeAgent(), overrides, repo)).toBe(true);
+		const gated = makeAgent({ requiresReviewer: true, reviewer: "/bin/true" });
+		expect(checkRequiresReviewer(gated, overrides)).toMatch(/protected root/);
+		expect(checkRequiresReviewer(gated, overrides, repo)).toBeUndefined();
+	});
+	it("parallel dispatch with cwd and addDirRoOverride reaches the shared-cwd refusal instead of throwing", async () => {
+		const repo = repoOutsideHome();
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any);
+		const result = await tool.execute("test",
+			{ cwd: repo, addDirRoOverride: ["."], tasks: [{ agent: "sandboxed-reviewer", task: "A" }, { agent: "sandboxed-reviewer", task: "B" }] },
+			undefined, undefined, { cwd: process.cwd(), hasUI: false });
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toContain(`Refusing to dispatch 2 write-capable tasks against the same cwd (${repo})`);
 	});
 });
 

@@ -24,6 +24,11 @@ function frontmatter(content: string): string {
 }
 
 describe("bundled swival agents", () => {
+	it("bundled reviewer states read-only limits and carries all isolation flags", () => {
+		const content = readAgent("sandboxed-reviewer.md");
+		for (const flag of ["sandbox: agentfs", "selfReview: false", "commands: none", "noSkills: true", "noInstructions: true", "noMemory: true", "network: provider-only"]) expect(frontmatter(content)).toContain(flag);
+		expect(content).toContain("write-through"); expect(content).toContain("prompt-level");
+	});
 	it.each(bundledAgentFiles())("%s inherits model routing from swival config", (fileName) => {
 		expect(frontmatter(readAgent(fileName))).not.toMatch(/^(model|provider|baseUrl):/m);
 	});

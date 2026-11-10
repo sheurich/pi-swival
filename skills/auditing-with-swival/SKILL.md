@@ -9,7 +9,7 @@ Use the structured `audit` API from Pi at the target Git repository root. The ad
 
 ## Preconditions and selection
 
-- Confirm scope and the operator's provider and data boundaries before sending source to a provider.
+- Confirm scope and the operator's provider and data boundaries before sending source to a provider. Native audit always runs on the current session's Git repository root (`cwd` is rejected); auditing another checkout requires opening a Pi session in that checkout.
 - Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
 - With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
 - Use Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. Native preflight rejects mismatched package versions and Python below 3.13; it does not enforce Python's upper support bound. The real bootstrap/export gate passed on macOS; Linux remains unverified.
@@ -37,13 +37,17 @@ Swival 1.9.3 can retry the same request on the same provider, model, and endpoin
 
 Support means a Swival-supported route meeting required native policies on the pinned runtime, not a promise that every route/version works. Swival owns provider/auth integration.
 
-| Route | Native requirements |
-| --- | --- |
-| Configured ChatGPT | Concrete model; standard upstream auth; dedicated runtime-only auth-directory grant. |
-| API-key OpenRouter | Concrete model; selected `OPENROUTER_API_KEY`; no ChatGPT directory or grant. |
-| Explicit OpenRouter-compatible loopback endpoint | Deliberately configured adapter/model/`base_url`, `max_context_tokens`, and a dedicated endpoint key through `OPENROUTER_API_KEY`; no remote-key inheritance or automatic conversion. |
-| Dynamic model-list adapters, including generic, LMStudio, llama.cpp and Google's generic transport | Refused with `MODEL_REPLACEMENT_UNCONTROLLABLE`: this runtime can replace a selected model after model-not-found. |
-| Other Swival routes | Evaluate credential authority, command execution, replacement, and policy requirements. Additional credential directories are not granted. |
+| Provider / Route | Outcome (`scripts/native_audit.py:_admit_route`) | Native requirements |
+| --- | --- | --- |
+| `chatgpt` | Admitted | Concrete model; standard upstream auth; dedicated runtime-only auth-directory grant. |
+| `openrouter` (OpenRouter API-key or explicit loopback endpoint) | Admitted | Concrete model; selected `OPENROUTER_API_KEY`; loopback requires deliberately configured adapter/model/`base_url`, `max_context_tokens`, and a dedicated endpoint key with no ChatGPT grant. |
+| `anthropic` | Admitted | Concrete model; `base_url` must be unset; `ANTHROPIC_API_KEY` or OAuth bridged on host. |
+| `bedrock` | Admitted via host session export | Concrete model; AWS region in `base_url`; short-lived `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` exported on host from `aws_profile` (never forwarded to the child); rejected with `CREDENTIAL_INTERFACE_UNSUPPORTED` if unbridged `aws_profile` or file fallback remains reachable. |
+| `geap` (`vertexai`) | Admitted via host token minting | Concrete bare model, `project`, and `location`; short-lived `GOOGLE_OAUTH_ACCESS_TOKEN` minted on host via `gcloud auth application-default print-access-token`; rejected with `CREDENTIAL_INTERFACE_UNSUPPORTED` if ADC file fallback remains reachable; a local 55-minute deadline caps token use, but cached tokens may expire sooner; expired tokens or a provider 401 fail closed with `CREDENTIAL_EXPIRED`, without refreshing or switching accounts. |
+| `generic`, `lmstudio`, `llamacpp`, `applefm`, `google` | Refused: `MODEL_REPLACEMENT_UNCONTROLLABLE` | Dynamic model-list adapters where this runtime can replace a selected model after model-not-found. |
+| `command` | Refused: `COMMAND_EXECUTION_REQUIRED` | Requires command execution, incompatible with `commands=none`. |
+
+Note: upstream `/audit` scans recognized source and configuration file extensions only.
 
 Automatic/multi-model selectors are unsupported. Client evidence does not prove backend alias resolution or routing. Configure local endpoints deliberately; never convert a rejected generic route to another adapter. Supply only that endpoint's dedicated credential, not a remote account key.
 

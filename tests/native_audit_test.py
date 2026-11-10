@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -366,7 +367,8 @@ class NativeEntryTests(unittest.TestCase):
             'max_context_tokens=128000\nreasoning_effort="xhigh"\n' +
             (f'base_url="{endpoint}"\n' if endpoint else ''))
         self.routing = {}
-        self.enterContext(patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key"}))
+        self.enterContext(patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key",
+            "ANTHROPIC_API_KEY": "synthetic-anthropic-key"}))
         return bridge.resolve_native_config(self.request())
 
     def test_released_default_active_and_explicit_profile_dispatch(self):
@@ -404,7 +406,7 @@ class NativeEntryTests(unittest.TestCase):
                 self.assertFalse(agent._MODEL_AUTOFIX)
 
     def test_released_terminal_errors_timeouts_and_notfound_keep_selected_route(self):
-        for provider, endpoint in (("chatgpt", None), ("openrouter", None),
+        for provider, endpoint in (("chatgpt", None), ("openrouter", None), ("anthropic", None),
                 ("openrouter", "http://127.0.0.1:8444/v1")):
             route = self.representative(provider, endpoint)
             model, api_base, key, _context, kwargs = agent.resolve_provider(provider,
@@ -461,7 +463,7 @@ class NativeEntryTests(unittest.TestCase):
 
     def assert_offline_policy_error_retries(self, *, exhausted):
         self.enterContext(patch.object(authenticator, "Authenticator", side_effect=FORBIDDEN))
-        for provider, endpoint in (("chatgpt", None), ("openrouter", None),
+        for provider, endpoint in (("chatgpt", None), ("openrouter", None), ("anthropic", None),
                 ("openrouter", "http://127.0.0.1:8444/v1")):
             route = self.representative(provider, endpoint)
             for error_type in (litellm.BadRequestError, litellm.APIError):
@@ -924,6 +926,224 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_released_triage_promotion_preserves_full_deep_review(self):
         self.released_finding("# Synthetic source-only report\n", recovery="triage-promoted")
+
+    def test_cloud_route_admission_and_fallback_refusal(self):
+        credentials = {"AWS_ACCESS_KEY_ID": "synthetic-access", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
+            "AWS_SESSION_TOKEN": "synthetic-session", "GOOGLE_OAUTH_ACCESS_TOKEN": "synthetic-google"}
+        configs = {
+            "bedrock": 'provider="bedrock"\nmodel="concrete"\nbase_url="us-east-2"\n',
+            "geap": 'provider="geap"\nmodel="gemini-concrete"\nproject="synthetic-project"\nlocation="global"\n',
+        }
+        self.routing = {}
+        for provider, config in configs.items():
+            self.write_config(config + 'max_context_tokens=128000\n')
+            with patch.dict(os.environ, credentials):
+                route = bridge.resolve_native_config(self.request())
+                self.assertEqual(route["provider"], provider)
+                unrelated = "AWS_PROFILE" if provider == "geap" else "GOOGLE_APPLICATION_CREDENTIALS"
+                with patch.dict(os.environ, {unrelated: "present"}):
+                    self.assertEqual(bridge.resolve_native_config(self.request())["provider"], provider)
+                if provider == "geap": self.assertEqual(route["project"], "synthetic-project")
+                for fallback in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE") if provider == "bedrock" else ("GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG", "VERTEXAI_CREDENTIALS"):
+                    with patch.dict(os.environ, {fallback: "present"}), self.assertRaisesRegex(
+                            bridge.NativeAuditError, "CREDENTIAL_INTERFACE_UNSUPPORTED"):
+                        bridge.resolve_native_config(self.request())
+        self.write_config(configs["bedrock"] + 'aws_profile="selected"\n')
+        deferred = bridge.resolve_native_config({**self.request(), "deferCredentials": True})
+        self.assertEqual(deferred["awsProfile"], "selected")
+        with patch.dict(os.environ, credentials), self.assertRaisesRegex(bridge.NativeAuditError, "CREDENTIAL_INTERFACE_UNSUPPORTED"):
+            bridge.resolve_native_config(self.request())
+        with patch.dict(os.environ, {**credentials, "PI_SWIVAL_AWS_PROFILE_MINTED": "present"}):
+            self.assertEqual(bridge.resolve_native_config(self.request())["awsProfile"], "selected")
+        self.write_config(configs["bedrock"].replace('"us-east-2"', '"https://arbitrary.invalid"'))
+        with patch.dict(os.environ, credentials), self.assertRaisesRegex(bridge.NativeAuditError, "ENDPOINT_REQUIREMENT_UNSUPPORTED"):
+            bridge.resolve_native_config(self.request())
+        self.write_config(configs["geap"].replace('"geap"', '"vertexai"'))
+        with patch.dict(os.environ, credentials):
+            self.assertEqual(bridge.resolve_native_config(self.request())["provider"], "geap")
+
+    def cloud_shim(self):
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+        self.enterContext(patch.object(VertexBase, "load_auth", VertexBase.load_auth))
+        self.enterContext(patch.object(litellm, "completion", litellm.completion))
+        spec = importlib.util.spec_from_file_location("cloud_shim", WORKTREE / "scripts/anthropic_oauth_shim/sitecustomize.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_agentfs_evidence_grant_preserves_swival_tool_roots(self):
+        from swival import sandbox_agentfs
+        original = sandbox_agentfs.build_agentfs_argv
+        swival_argv = ["swival", "--add-dir", str(self.repo), "--", "task --allow evidence"]
+        add_dirs = [str(self.repo)]
+        kwargs = dict(agentfs_bin="agentfs", base_dir=str(self.repo), add_dirs=add_dirs,
+                      session="evidence-test", swival_argv=swival_argv)
+        before = original(**kwargs)
+        original_import = __import__
+
+        def without_provider_hooks(name, *args, **kwargs):
+            if name.startswith("litellm"):
+                raise AssertionError("Evidence-only startup must not load provider hooks")
+            return original_import(name, *args, **kwargs)
+
+        with patch.object(sandbox_agentfs, "build_agentfs_argv", original), \
+             patch.dict(os.environ, {"PI_SWIVAL_EVIDENCE_DIR": str(self.evidence / ".." / "evidence")}):
+            spec = importlib.util.spec_from_file_location("evidence_shim", WORKTREE / "scripts/anthropic_oauth_shim/sitecustomize.py")
+            module = importlib.util.module_from_spec(spec)
+            with patch("builtins.__import__", side_effect=without_provider_hooks):
+                spec.loader.exec_module(module)
+            wrapped = sandbox_agentfs.build_agentfs_argv
+            module._install_agentfs_evidence_grant()
+            self.assertIs(sandbox_agentfs.build_agentfs_argv, wrapped)
+            result = wrapped(**kwargs)
+            boundary = before.index("--")
+            self.assertEqual(result, before[:boundary] + ["--allow", str(self.evidence.resolve())] + before[boundary:])
+            self.assertEqual(result[result.index("--") + 1:], swival_argv)
+            self.assertEqual(add_dirs, [str(self.repo)])
+            already_allowed = wrapped(**{**kwargs, "add_dirs": [str(self.evidence)]})
+            self.assertEqual(already_allowed, original(**{**kwargs, "add_dirs": [str(self.evidence)]}))
+        link = self.root / "evidence-link"
+        link.symlink_to(self.evidence, target_is_directory=True)
+        for invalid in (str(self.root / "missing"), str(link)):
+            with patch.dict(os.environ, {"PI_SWIVAL_EVIDENCE_DIR": invalid}), \
+                 self.assertRaisesRegex(SystemExit, "PI_SWIVAL_SHIM_INSTALL_FAILED"):
+                self.cloud_shim()
+        with patch.dict(os.environ, {"PI_SWIVAL_EVIDENCE_DIR": str(self.evidence)}), \
+             patch.object(sandbox_agentfs, "build_agentfs_argv", None), \
+             self.assertRaisesRegex(SystemExit, "PI_SWIVAL_SHIM_INSTALL_FAILED"):
+            self.cloud_shim()
+
+    def test_cloud_signed_and_bearer_transports_without_files_or_sockets(self):
+        self.cloud_shim()
+        adc_disabled = self.root / "adc-disabled.json"
+        adc_disabled.write_text("{}")
+        with patch.dict(os.environ, {"AWS_ACCESS_KEY_ID": "ASIASYNTHETIC", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
+                "AWS_SESSION_TOKEN": "synthetic-session", "AWS_CONFIG_FILE": "/dev/null",
+                "AWS_SHARED_CREDENTIALS_FILE": "/dev/null", "AWS_EC2_METADATA_DISABLED": "true",
+                "GOOGLE_OAUTH_ACCESS_TOKEN": "synthetic-google", "GOOGLE_APPLICATION_CREDENTIALS": str(adc_disabled)}), \
+             patch("google.auth.default", side_effect=FORBIDDEN):
+            for provider, model, endpoint in (("bedrock", "global.anthropic.claude-sonnet-5-5", "us-east-2"),
+                    ("geap", "gemini-3.8-flash", None)):
+                mid, api, key, _, kwargs = agent.resolve_provider(provider, model, None, endpoint, 128000, False,
+                    **({"project": "synthetic-project", "location": "global"} if provider == "geap" else {}))
+                requests = []
+                def send(request, **_kwargs):
+                    requests.append(request)
+                    payload = {"output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+                        "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5, "totalTokens": 15}, "metrics": {"latencyMs": 10}} \
+                        if provider == "bedrock" else {"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5, "totalTokenCount": 15}}
+                    return httpx.Response(200, request=request, json=payload)
+                with patch.object(httpx.Client, "send", side_effect=send):
+                    response = agent.call_llm(api, mid, [{"role": "user", "content": "synthetic"}],
+                        100, None, None, None, None, False, max_retries=1, **kwargs)
+                self.assertEqual(agent._msg_get(response[0], "content"), "ok")
+                self.assertTrue(requests)
+                if provider == "bedrock":
+                    self.assertIn("AWS4-HMAC-SHA256", requests[0].headers["authorization"])
+                    self.assertEqual(requests[0].headers["x-amz-security-token"], "synthetic-session")
+                else:
+                    self.assertEqual(requests[0].url.host, "aiplatform.googleapis.com")
+                    self.assertEqual(requests[0].headers["authorization"], "Bearer synthetic-google")
+                self.assertEqual(agent._list_server_models("vertex_ai" if provider == "geap" else provider, None, None), [])
+
+    def test_vertex_expiry_is_fixed_sentinel_and_cannot_refresh_adc(self):
+        module = self.cloud_shim()
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+        output = io.StringIO()
+        with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "synthetic-google", "GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER": "1"}), \
+             contextlib.redirect_stderr(output), self.assertRaisesRegex(RuntimeError, "PI_SWIVAL_CREDENTIAL_EXPIRED"):
+            VertexBase().load_auth(None, "synthetic-project")
+        self.assertIn("\nPI_SWIVAL_CREDENTIAL_EXPIRED\n", output.getvalue())
+        # A cached token can expire before the local deadline: HTTP 401 also signals expiry.
+        with patch.object(litellm, "completion", side_effect=litellm.AuthenticationError(
+                "private-error", llm_provider="vertex_ai", model="synthetic")):
+            module._install_anthropic_shim()
+            with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "synthetic-google"}), \
+                 contextlib.redirect_stderr(output), self.assertRaises(litellm.AuthenticationError):
+                litellm.completion(model="vertex_ai/synthetic")
+        self.assertNotIn("private-error", output.getvalue())
+
+    def test_shim_is_silent_in_non_swival_python_children(self):
+        script = 'import importlib.util; assert importlib.util.find_spec("swival") is None; print("child-ok")'
+        env = {**os.environ, "PYTHONPATH": str(WORKTREE / "scripts/anthropic_oauth_shim"),
+            "PI_SWIVAL_SHIM_REQUIRED": "1", "PI_SWIVAL_NO_SELF_REVIEW": "1", "LITELLM_MODE": "PRODUCTION"}
+        # A fresh stdlib-only venv guarantees no Swival regardless of host packages
+        # or whether /usr/bin/python3 exists. No pip or dependencies are installed.
+        child_venv = self.root / "child-python"
+        created = subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(child_venv)],
+            capture_output=True, timeout=15)
+        self.assertEqual(created.returncode, 0, created.stderr.decode())
+        python = child_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        result = subprocess.run([str(python), "-B", "-c", script], env=env,
+            capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout.strip(), b"child-ok")
+        self.assertEqual(result.stderr, b"")
+
+    def test_real_entrypoint_suppresses_inherited_self_review(self):
+        self.write_config('provider="openrouter"\nmodel="concrete"\nself_review=true\nreviewer="external.sh"\n')
+        script = '''
+import sys, socket
+from unittest.mock import patch
+from swival import config, agent
+assert getattr(config.apply_config_to_args, "_pi_swival_no_self_review", False)
+base_dir, explicit_flags = sys.argv[-1], sys.argv[1:-1]
+original_apply = config.apply_config_to_args
+def checked_apply(args, values):
+    original_apply(args, values)
+    assert args.self_review is bool(explicit_flags)
+    assert args.reviewer == "external.sh"
+    raise SystemExit(73)
+config.apply_config_to_args = checked_apply
+sys.argv = ["swival", "--base-dir", base_dir, "--objective", "synthetic", *explicit_flags]
+with patch.object(socket.socket, "connect", side_effect=AssertionError("no network")), patch.object(socket, "getaddrinfo", side_effect=AssertionError("no DNS")):
+    agent.main()
+'''
+        env = {**os.environ, "PYTHONPATH": str(WORKTREE / "scripts/anthropic_oauth_shim"),
+            "PI_SWIVAL_SHIM_REQUIRED": "1", "PI_SWIVAL_NO_SELF_REVIEW": "1", "LITELLM_MODE": "PRODUCTION"}
+        result = subprocess.run([sys.executable, "-B", "-c", script, str(self.repo)], env=env,
+            capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 73, result.stderr.decode())
+        # Exercise the real external-reviewer subprocess environment, not only
+        # a config helper: descendants inherit the shim but explicit CLI wins.
+        reviewer = self.root / "reviewer.py"
+        reviewer.write_text(script)
+        with patch.dict(os.environ, env, clear=True):
+            for flag in (None, "--self-review", "--self-rev"):
+                command = shlex.join([sys.executable, "-B", str(reviewer), *([flag] if flag else [])])
+                code, stdout, stderr = agent.run_reviewer(command, str(self.repo), "synthetic", False, timeout=15)
+                self.assertEqual(code, 73, stderr)
+                self.assertEqual(stdout, "")
+
+    def test_shim_forces_local_cost_map_before_first_litellm_import(self):
+        script = '''
+import importlib.util, os, socket, sys
+from unittest.mock import patch
+os.environ.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+os.environ["PI_SWIVAL_SHIM_REQUIRED"] = "1"
+os.environ["PI_SWIVAL_NO_SELF_REVIEW"] = "1"
+with patch.object(socket.socket, "connect", side_effect=AssertionError("no network")) as calls, \
+     patch.object(socket, "getaddrinfo", side_effect=AssertionError("no DNS")) as dns:
+    spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    from litellm.litellm_core_utils.get_model_cost_map import get_model_cost_map_source_info
+    assert get_model_cost_map_source_info()["is_env_forced"] is True
+    import litellm
+    assert len(litellm.model_cost) > 0
+    assert "claude-mythos-5-2" in litellm.model_cost
+    from swival import config, agent
+    args = agent.build_parser().parse_args([])
+    config.apply_config_to_args(args, {"self_review": True, "reviewer": "keep-external.sh"})
+    assert args.self_review is False and args.reviewer == "keep-external.sh"
+    calls.assert_not_called()
+    dns.assert_not_called()
+'''
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script,
+            str(WORKTREE / "scripts/anthropic_oauth_shim/sitecustomize.py")],
+            capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_anthropic_mythos_profile_admission_and_oauth_shim(self):
         self.write_config(

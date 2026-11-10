@@ -11,7 +11,7 @@ The package bundles:
 - `auditing-with-swival` skill: one native audit on an isolated committed snapshot, with preserved state, reports, and patch proposals.
 - `swival-worker-briefs` skill: task brief structure and evidence standards for `self-review-worker` dispatches.
 - `swival-audit` prompt template: slash-command-style invocation that walks an interactive operator through the audit pipeline.
-- Five swival agents: `swival`, `self-review-worker`, `test-runner`, `sandboxed-explorer`, and `a2a-coordinator`.
+- Six swival agents: `swival`, `self-review-worker`, `test-runner`, `sandboxed-reviewer`, `sandboxed-explorer`, and `a2a-coordinator`.
 
 ## Install
 
@@ -33,7 +33,7 @@ pi install /path/to/pi-swival
 
 Pi installs runtime dependencies for managed git/npm packages. For a local checkout, install the pinned runtime dependency, `yaml` 2.9.0, from the checkout root with `npm install --ignore-scripts --legacy-peer-deps`.
 
-The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The five bundled swival agents under `agents/` are discovered automatically by the extension at runtime: no symlinks or manual copies needed.
+The package registers `extensions/`, `skills/`, and `prompts/` automatically per its `package.json` `pi` manifest. The six bundled swival agents under `agents/` are discovered automatically by the extension at runtime: no symlinks or manual copies needed.
 
 To override a bundled agent or add your own, place `.md` files in `~/.pi/agent/swival-agents/` (user scope) or `.pi/swival-agents/` in a project root (project scope). Discovery priority: project > user > bundled.
 
@@ -98,6 +98,10 @@ Invalid admitted definitions fail closed. Discovery retains a nonblank invalid s
 Ordinary tasks use a fixed plain-text envelope. Leading `/` and `!` remain task text instead of invoking Swival command dispatch. Stored task metadata keeps the original text.
 
 Ordinary `cwd` and `output` are caller-selected, not constrained to approved roots. Output writes occur in Pi outside the child sandbox. They provide no confidentiality guarantee. Synchronous output defaults to file-only metadata when `output` is set, except that failed chains inline nonempty partial output even in file-only mode. Parallel results require per-task output paths; top-level output does not bind them. Chain top-level output binds the last successful step, or the failing step on failure. Use unique paths to avoid overwriting results. `maxInlineBytes` counts characters, not bytes. See the [skill's output reference](skills/swival/SKILL.md#paths-and-output) for details.
+
+Ordinary async runs write their report and default trace files into private system temporary storage. The host-side runner exports evidence before writing `completed.json`, without adding a sandbox write grant to the artifact directory. Export accepts only owned, single-link regular files: a report up to 16 MiB and traces of up to 4 MiB each, scanning at most 16 trace-directory entries (including rejected names), with a 64 MiB total limit. Rejected evidence produces value-free codes in `transfer-error.txt`; the worker exit code is preserved, and missing/invalid sandbox reports still fail bootstrap validation. Explicit trace destinations remain caller-owned and are not included in the default export. Default report/trace artifacts become available only after worker exit; forced-kill escalation can discard unexported evidence, and oversized traces are dropped rather than truncated.
+
+The runner owns scratch storage after launch; the parent cleans it after confirmed runner termination if necessary. Abrupt Pi/runner SIGKILL can leave `pi-swival-async-*` temporary directories or incomplete `.tmp` artifact files for normal temporary-file hygiene. No background scavenger or completion-notification guarantee is added. If the runner cannot safely claim its directories or write a valid terminal marker, a run recovered from disk after a Pi restart reports `unknown` status (and `resume` returns an error) because process liveness is never probed. The offline integration gate checks host visibility using the actual `TMPDIR` directory family; macOS results do not establish Linux support.
 
 ### Optional async observation
 
@@ -188,8 +192,11 @@ Bundled in `agents/` for the `swival-subagent` tool:
 | `swival` | Generic delegate: no system prompt, no review. The implicit default when `agent` is omitted. |
 | `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks. |
 | `test-runner` | Task has a runnable test command as acceptance criterion (caller passes `reviewerOverride`). |
-| `sandboxed-explorer` | Exploration in a disposable cwd; fresh sessions do not prevent host-base writes. |
+| `sandboxed-reviewer` | Read-only code and security review (`selfReview: false`, `commands: none`, `noSkills: true`, `network: provider-only`). Requires nono and its profile pack; read-only is prompt-level, not OS-enforced, because base-dir writes remain write-through. |
+| `sandboxed-explorer` | Exploration in a disposable cwd; fresh sessions do not prevent host-base writes. Use `sandboxed-reviewer` for read-only reviews. |
 | `a2a-coordinator` | Coordinate tasks across remote Agent2Agent (A2A) endpoints configured via a2aConfig; requires network: full. |
+
+Explicit `selfReview: false` (including `selfReviewOverride: false`) uses a Swival-only startup shim to suppress inherited self-review without removing external reviewer gates. It requires an explicit `sandbox: agentfs` or `sandbox: builtin`. Nono, inherited/unspecified sandbox selection, and explicit `network: none` are refused before allocating run resources; `addDirRo` does not grant nono startup-shim access. An inherited `network = "none"` is rejected by Swival against the explicit sandbox before re-exec. The AgentFS reviewer still needs nono for `provider-only` command isolation.
 
 ### Native audit
 
@@ -209,7 +216,7 @@ The profile name is illustrative, not bundled or reserved. With no specialist se
 
 Swival 1.9.3 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
 
-Native audit requires Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, and a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
+Native audit requires Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. Support means Swival-supported routes meeting required native policies on this runtime. Offline representatives cover ChatGPT, API-key OpenRouter, a deliberately configured OpenRouter-compatible loopback endpoint with a dedicated key and context limit, direct Anthropic, and synthetic Bedrock/Vertex transports. Bedrock uses a region in `base_url` and host-exported session credentials (configured `aws_profile` outranks ambient keys); Vertex uses explicit `project`/`location` and a host-minted ADC bearer token. SDK credential-file fallback is disabled in the child. Cached Vertex tokens may expire before the local 55-minute use limit; expiry or a provider 401 yields `CREDENTIAL_EXPIRED` without refresh or account fallback. Dynamic model-list adapters fail before launch because upstream can replace the selected model after NotFound. Other routes receive concrete capability diagnostics; this is not universal provider/version support. Native mode rejects `baseUrlOverride`; configure endpoints through trusted Swival configuration. No model, provider, endpoint, profile, or sandbox fallback exists. Linux and live routes remain unverified.
 
 For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks auth-store metadata, never its contents. API-key/local routes forward only the selected credential interface and receive no ChatGPT directory grant. Required encryption, filtering, strict-read isolation, proxies, unknown policy, and incompatible routing fail closed. These native restrictions do not change ordinary delegation.
 
@@ -253,7 +260,7 @@ pi-swival/
 │   ├── index.ts                # swival-subagent tool; registerNativeAuditTool for swival-native-audit
 │   ├── agents.ts               # agent discovery from ~/.pi/agent/swival-agents/
 │   └── native-audit.ts         # CLI preparation, committed snapshot, native evidence
-├── agents/                     # five bundled swival agents (auto-discovered)
+├── agents/                     # six bundled swival agents (auto-discovered)
 ├── skills/
 │   ├── swival/                 # SKILL.md, references/{agentfs,setup}.md
 │   ├── auditing-with-swival/    # native audit workflow

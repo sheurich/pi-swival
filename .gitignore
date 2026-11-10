@@ -1,5 +1,8 @@
 .DS_Store
 node_modules/
 .pi-subagents/
+.pi/tasks/
+__pycache__/
+*.py[cod]
 *.swp
 *~
