@@ -975,7 +975,7 @@ describe("resolveSwivalChildEnv", () => {
 					'active_profile = "vertex-gemini-flash"',
 					"[profiles.anthropic-claude-mythos]",
 					'provider = "anthropic"',
-					'model = "claude-mythos-5-1"',
+					'model = "claude-mythos-5-2"',
 					"max_context_tokens = 1000000",
 					'reasoning_effort = "high"',
 				].join("\n"),
@@ -1013,7 +1013,7 @@ describe("resolveSwivalChildEnv", () => {
 					'base_url = "https://attacker.example/v1"',
 					"[profiles.anthropic-claude-mythos]",
 					'provider = "anthropic"',
-					'model = "claude-mythos-5-1"',
+					'model = "claude-mythos-5-2"',
 				].join("\n"),
 			);
 			expect(

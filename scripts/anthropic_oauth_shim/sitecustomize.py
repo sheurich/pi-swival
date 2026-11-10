@@ -6,12 +6,47 @@ Loaded via PYTHONPATH when Swival runs with provider="anthropic".
    replacement.
 2. Injects the required Claude Code OAuth headers and leading system block
    when an Anthropic OAuth token (sk-ant-oat...) is used.
+3. Backfills LiteLLM model-map entries for Anthropic models newer than the
+   pinned LiteLLM release, so reasoning effort is sent instead of dropped.
 """
 # pylint: disable=import-outside-toplevel,broad-exception-caught,protected-access
 
 CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
-CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.280"
+CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.290"
 REQUIRED_OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
+
+# model -> (sibling entry to clone, base rates in USD per token).
+# LiteLLM drops `output_config.effort` for a model missing from its map.
+# An entry LiteLLM already ships is left untouched.
+MODEL_MAP_BACKFILL = {
+    "claude-mythos-5-2": (
+        "claude-mythos-5-1",
+        {
+            "input_cost_per_token": 8e-06,
+            "output_cost_per_token": 4e-05,
+            "cache_read_input_token_cost": 2e-07,
+            "cache_creation_input_token_cost": 1e-05,
+        },
+    ),
+}
+
+
+def _backfill_model_map(litellm):
+    for model, (sibling, rates) in MODEL_MAP_BACKFILL.items():
+        if model in litellm.model_cost or sibling not in litellm.model_cost:
+            continue
+        # Only the base rates are known for the new model; drop the sibling's
+        # batch and long-cache rates rather than report them as its own.
+        entry = {
+            key: value
+            for key, value in litellm.model_cost[sibling].items()
+            if not key.endswith(("_batches", "_above_1hr"))
+        }
+        entry.update(rates)
+        try:
+            litellm.register_model({model: entry})
+        except Exception:
+            pass
 
 
 def _install_anthropic_shim():
@@ -20,6 +55,8 @@ def _install_anthropic_shim():
         from litellm.llms.anthropic.common_utils import AnthropicModelInfo
     except Exception:
         return
+
+    _backfill_model_map(litellm)
 
     empty_models = lambda self, *args, **kwargs: []
     AnthropicModelInfo.get_models = empty_models
