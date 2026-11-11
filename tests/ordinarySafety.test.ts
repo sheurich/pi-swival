@@ -115,6 +115,14 @@ describe("explicit async recovery containment", () => {
 		save();
 		expect(await findRunMeta(meta.runId, f.artifactRoot)).toBeUndefined();
 	});
+	it.each((["stdoutFile", "stderrFile"] as const).flatMap((field) => ["", "/missing"].map((suffix) => ({ field, suffix }))))("rejects dangling $field aliases whose parent traversal follows a symlink: $suffix", async ({ field, suffix }) => {
+		const f = fixture(); const { meta, save } = writeMeta(f);
+		const outside = path.join(f.root, "outside", "child"); fs.mkdirSync(outside, { recursive: true });
+		fs.symlinkSync(outside, path.join(meta.artifactDir, "hop"));
+		const alias = path.join(meta.artifactDir, "alias"); fs.symlinkSync("hop/../future", alias);
+		meta[field] = alias + suffix; save();
+		expect(await findRunMeta(meta.runId, f.artifactRoot)).toBeUndefined();
+	});
 	it("accepts a legitimate root alias and contained nonexistent streams", async () => {
 		const f = fixture(); const { meta } = writeMeta(f);
 		const alias = path.join(f.root, "alias"); fs.symlinkSync(f.artifactRoot, alias);

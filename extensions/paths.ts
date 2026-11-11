@@ -16,7 +16,11 @@ export async function canonicalFuturePath(target: string, links = 0): Promise<st
 				return undefined;
 			});
 			if (stat?.isSymbolicLink()) {
-				const target = path.resolve(path.dirname(parent), await fs.readlink(parent));
+				const link = await fs.readlink(parent);
+				// Lexical normalization can erase a symlink before its following `..`.
+				// Missing targets cannot be canonicalized by realpath; reject that ambiguity.
+				if (link.split(/[\\/]/).includes("..")) throw new Error("Ambiguous dangling symlink target");
+				const target = path.resolve(path.dirname(parent), link);
 				return path.join(await canonicalFuturePath(target, links + 1), ...suffix.reverse());
 			}
 			suffix.push(path.basename(parent));
