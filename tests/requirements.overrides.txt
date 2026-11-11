@@ -1,0 +1,2 @@
+# litellm 1.106.6 caps filelock below 4.0; the published filelock fixes require >=4.2.1.
+filelock>=4.2.10,<5

@@ -93,7 +93,7 @@ Swival's builtin file tools default to the base directory, while command executi
 
 ## Native audit prerequisites
 
-Native `/audit` requires Swival `1.9.3`, LiteLLM `1.106.6`, Python `>=3.13`, AgentFS `>=0.6.4`, and an installed `nono` profile (validated on macOS; Linux remains unverified). Dynamic model-list providers (`generic`, `lmstudio`, `llamacpp`, `google`) are refused in native audit mode because upstream can substitute models on not-found errors. See [auditing-with-swival](../../auditing-with-swival/SKILL.md) for route admission, credential bridging, and snapshot isolation.
+Native `/audit` requires the pinned runtime in the compatibility manifest in [auditing-with-swival](../../auditing-with-swival/SKILL.md), which also covers route admission, credential bridging, and snapshot isolation. Dynamic model-list providers (`generic`, `lmstudio`, `llamacpp`, `google`) are refused in native audit mode because upstream can substitute models on not-found errors.
 
 ## Verify
 

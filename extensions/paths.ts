@@ -129,14 +129,17 @@ export function readSafeRegularText(filePath: string, maxBytes: number, options:
 /**
  * Read one provider credential from Pi's `~/.pi/agent/auth.json`. Anthropic
  * OAuth tokens must be unexpired `sk-ant-oat...` values; API keys pass through.
+ * OAuth entries for any other provider are refused.
  */
-export function readPiAuthToken(homeDir: string, provider: "anthropic" | "fastly-arc"): string | undefined {
+export function readPiAuthToken(homeDir: string, provider: string): string | undefined {
+	if (!provider) return undefined;
 	const raw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "auth.json"), 65536, { requirePrivatePerms: true });
 	if (raw === undefined) return undefined;
 	try {
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const entry = parsed?.[provider] as Record<string, unknown> | undefined;
-		if (!entry || typeof entry !== "object") return undefined;
+		const parsed = JSON.parse(raw) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Object.hasOwn(parsed, provider)) return undefined;
+		const entry = (parsed as Record<string, unknown>)[provider] as Record<string, unknown> | undefined;
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
 		if (provider === "anthropic" && entry.type === "oauth") {
 			const expires = entry.expires;
 			if (typeof expires === "number" && Number.isFinite(expires) && expires <= Date.now()) return undefined;
@@ -155,6 +158,56 @@ export function readPiAuthToken(homeDir: string, provider: "anthropic" | "fastly
 
 export function readAnthropicAuthToken(homeDir: string): string | undefined {
 	return readPiAuthToken(homeDir, "anthropic");
+}
+
+export interface CanonicalHttpsEndpoint {
+	/** Lower-cased `https://host[:port]`. */
+	origin: string;
+	/** Pathname without trailing slashes; `/` when empty. */
+	pathPrefix: string;
+}
+
+/**
+ * Parse a provider base URL into a comparable origin and path prefix. Accepts
+ * only trimmed `https:` URLs without userinfo, query, fragment, backslashes, or
+ * raw/percent-encoded dot segments and slashes, so a credential bridge can
+ * never match through normalization tricks.
+ */
+export function parseCanonicalHttpsEndpoint(raw: string): CanonicalHttpsEndpoint | undefined {
+	if (typeof raw !== "string" || raw !== raw.trim() || !raw || raw.includes("\\")) return undefined;
+	if (/%2e|%2f|%5c/i.test(raw) || raw.split("/").some((segment) => segment === "." || segment === "..")) return undefined;
+	let url: URL;
+	try { url = new URL(raw); } catch { return undefined; }
+	if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !url.hostname) return undefined;
+	return { origin: url.origin.toLowerCase(), pathPrefix: url.pathname.replace(/\/+$/, "") || "/" };
+}
+
+/**
+ * Resolve the Pi custom-provider key in `~/.pi/agent/models.json` whose
+ * `baseUrl` serves `targetBaseUrl`. A provider matches on identical origin when
+ * its path prefix equals or is an ancestor of the target path. Returns the key
+ * only when exactly one non-Anthropic HTTPS provider matches; zero or several
+ * matches fail closed.
+ */
+export function resolvePiCustomProviderForBaseUrl(homeDir: string, targetBaseUrl: string): string | undefined {
+	const target = parseCanonicalHttpsEndpoint(targetBaseUrl);
+	if (!target) return undefined;
+	const raw = readSafeRegularText(path.join(homeDir, ".pi", "agent", "models.json"), 262144, { requirePrivatePerms: true });
+	if (raw === undefined) return undefined;
+	let providers: unknown;
+	try { providers = (JSON.parse(raw) as { providers?: unknown })?.providers; } catch { return undefined; }
+	if (!providers || typeof providers !== "object" || Array.isArray(providers)) return undefined;
+	const matches: string[] = [];
+	for (const [name, entry] of Object.entries(providers as Record<string, unknown>)) {
+		if (name === "anthropic" || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const baseUrl = (entry as { baseUrl?: unknown }).baseUrl;
+		if (typeof baseUrl !== "string") continue;
+		const candidate = parseCanonicalHttpsEndpoint(baseUrl);
+		if (!candidate || candidate.origin !== target.origin) continue;
+		if (candidate.pathPrefix === target.pathPrefix || candidate.pathPrefix === "/" ||
+			target.pathPrefix.startsWith(candidate.pathPrefix + "/")) matches.push(name);
+	}
+	return matches.length === 1 ? matches[0] : undefined;
 }
 
 export function parseSemver(v: string): [number, number, number] | null {

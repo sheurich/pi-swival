@@ -100,7 +100,7 @@ Review direct file changes alongside any overlay diff. Native audit uses a separ
 
 ## Demo 4: native audit prompt template
 
-Start Pi at the root of a disposable Git repository (requires Swival `1.9.3`, LiteLLM `1.106.6`, Python `>=3.13`, AgentFS `>=0.6.4`, and an installed `nono` profile; see [skills/auditing-with-swival/SKILL.md](../skills/auditing-with-swival/SKILL.md)):
+Start Pi at the root of a disposable Git repository (requires the pinned runtime in the compatibility manifest in [skills/auditing-with-swival/SKILL.md](../skills/auditing-with-swival/SKILL.md)):
 
 ```text
 /swival-audit src/**/*.py

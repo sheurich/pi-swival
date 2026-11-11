@@ -14,7 +14,7 @@ it("executes released CLI phases, inherited same-route policy retries, terminal 
 		}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
 	});
 	expect(result.code, result.output).toBe(0);
-	expect(result.output).toContain("Ran 40 tests"); expect(result.output).toMatch(/\bOK\b/);
+	expect(result.output).toContain("Ran 41 tests"); expect(result.output).toMatch(/\bOK\b/);
 }, 95_000);
 
 it.each(["complete", "empty", "whitespace", "lost", "recovered", "out-of-scope"])(
