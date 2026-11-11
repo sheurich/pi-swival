@@ -150,13 +150,16 @@ export function isCatalogueAgentName(name: string | undefined): name is string {
 type RawFrontmatter = Record<string, unknown>;
 type Diagnose = (code: AgentDiscoveryCode, source: AgentSource) => void;
 
-function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; body: string } {
-	// Normalize Pi's BOM/newline forms, but require whole-line frontmatter delimiters.
+/** Normalize Pi's BOM/newline forms, but require whole-line frontmatter delimiters. */
+function splitAgentFrontmatter(content: string): { yaml?: string; body: string } {
 	const normalized = content.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 	const match = normalized.match(/^---\n([\s\S]*?)\n---(?:\n|$)/);
-	if (!match) return { frontmatter: {}, body: normalized };
-	const yaml = match[1];
-	const body = normalized.slice(match[0].length).trim();
+	if (!match) return { body: normalized };
+	return { yaml: match[1], body: normalized.slice(match[0].length).trim() };
+}
+
+function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; body: string } {
+	const { yaml, body } = splitAgentFrontmatter(content);
 	if (!yaml) return { frontmatter: {}, body };
 
 	// "error" prevents conversion warnings without "silent", which hides MULTIPLE_DOCS errors.
@@ -164,6 +167,26 @@ function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; 
 	const document = parseDocument(yaml, { logLevel: "error", prettyErrors: false });
 	if (document.errors.length > 0 || document.warnings.length > 0) throw new Error("invalid_yaml");
 	return { frontmatter: document.toJS({ maxAliasCount: 100 }) ?? {}, body };
+}
+
+/**
+ * Identity of a definition whose YAML the parser rejected, so the broken
+ * override tombstones that name instead of silently falling back to a
+ * lower-priority definition. Only one column-0 `name:` line carrying a plain
+ * or quoted unescaped scalar counts; indented, duplicate, or escaped forms
+ * are ambiguous and leave the file unidentified.
+ */
+function invalidYamlAgentName(content: string): string | undefined {
+	const { yaml } = splitAgentFrontmatter(content);
+	if (!yaml) return undefined;
+	const lines = yaml.split("\n").filter((line) => /^name[ \t]*:/.test(line));
+	if (lines.length !== 1) return undefined;
+	// A `#` starts a comment only after whitespace; a plain scalar may embed it otherwise.
+	const scalar = /^name[ \t]*:[ \t]+(?:"([^"\\]*)"|'([^']*)'|([^"'#&*!|>%@`{}[\]][^\n]*?))(?:[ \t]+#.*|[ \t]*)$/.exec(lines[0]);
+	if (!scalar) return undefined;
+	const name = scalar[1] ?? scalar[2] ?? scalar[3];
+	if (scalar[3] !== undefined && /[ \t]#/.test(scalar[3])) return undefined;
+	return isCatalogueAgentName(name) ? name : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose) {
@@ -211,7 +234,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 		try {
 			parsed = parseAgentFrontmatter(content);
 		} catch {
-			reject("invalid_yaml");
+			reject("invalid_yaml", invalidYamlAgentName(content));
 			continue;
 		}
 		const { frontmatter: fm, body } = parsed;

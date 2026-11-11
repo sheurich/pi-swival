@@ -95,7 +95,7 @@ class NativeEntryTests(unittest.TestCase):
                               capture_output=True, check=True, timeout=5).stdout.decode().strip()
 
     def request(self):
-        return {"source": str(self.repo), "shimPath": SHIM_PATH, "routing": dict(self.routing), "shimPath": SHIM_PATH}
+        return {"source": str(self.repo), "shimPath": SHIM_PATH, "routing": dict(self.routing)}
 
     def cli(self, diagnostic_path=None, all_files=True):
         """Real CLI parsing and native phases; synthetic bootstrap/transport only."""

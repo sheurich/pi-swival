@@ -120,6 +120,87 @@ describe("discoverSwivalAgents definition isolation", () => {
 		expect(result.agents.some((a) => a.name === "swival")).toBe(true);
 	});
 
+	it.each([
+		["user", "plain", "name: swival"],
+		["user", "double-quoted", 'name: "swival"'],
+		["user", "single-quoted", "name: 'swival'"],
+		["user", "trailing comment", "name: swival # override"],
+		["project", "plain", "name: sandboxed-reviewer"],
+		["project", "double-quoted", 'name: "sandboxed-reviewer"'],
+	] as const)("tombstones an identifiable %s invalid_yaml override (%s) instead of falling back to the bundled agent", (scope, _label, nameLine) => {
+		const dir = scope === "user" ? userDir : projectDir;
+		const name = nameLine.includes("sandboxed-reviewer") ? "sandboxed-reviewer" : "swival";
+		write(dir, "override.md", `${nameLine}\ndescription: rejected override\nbroken: [`);
+		write(dir, "valid.md", "name: valid\ndescription: visible sibling");
+		const result = discoverSwivalAgents(root, "both");
+		expect(result.diagnostics).toEqual([{ code: "invalid_yaml", source: scope }]);
+		expect(result.agents.some((a) => a.name === name)).toBe(false);
+		expect(result.invalidAgentNames).toEqual([name]);
+		expect(result.agents.some((a) => a.name === "valid")).toBe(true);
+	});
+
+	it("tombstones an identifiable invalid_yaml project override over a valid user definition", () => {
+		write(userDir, "trusted.md", "name: shared\ndescription: user helper");
+		write(projectDir, "override.md", "name: shared\ndescription: *absent");
+		const result = discoverSwivalAgents(root, "both");
+		expect(result.agents.some((a) => a.name === "shared")).toBe(false);
+		expect(result.invalidAgentNames).toEqual(["shared"]);
+	});
+
+	// `#` only opens a comment after whitespace, so `shared#helper` is one plain
+	// scalar and must tombstone exactly that name, never the shorter `shared`.
+	it.each([
+		["embedded hash", "name: shared#helper", "shared#helper"],
+		["embedded hash before a comment", "name: shared#helper # note", "shared#helper"],
+		["plain scalar before a tab comment", "name: shared-helper\t# note", "shared-helper"],
+		["plain scalar before a comment", "name: shared #helper", "shared"],
+	])("tombstones the exact plain scalar with %s", (_label, nameLine, expected) => {
+		write(userDir, "shared.md", "name: shared\ndescription: user helper");
+		write(userDir, "hash.md", "name: shared#helper\ndescription: user helper");
+		write(projectDir, "override.md", `${nameLine}\ndescription: rejected override\nbroken: [`);
+		const result = discoverSwivalAgents(root, "both");
+		expect(result.invalidAgentNames).toEqual([expected]);
+		expect(result.agents.some((a) => a.name === expected)).toBe(false);
+		for (const untouched of ["shared", "shared#helper"].filter((name) => name !== expected)) {
+			expect(result.agents.find((a) => a.name === untouched)).toMatchObject({ source: "user" });
+		}
+	});
+
+	it.each([
+		["quoted scalar with a trailing token", 'name: "shared"#trailing'],
+		["quoted scalar with a trailing word", 'name: "shared" trailing'],
+		["single-quoted scalar with a trailing token", "name: 'shared'extra"],
+	])("leaves invalid_yaml unidentified for a %s instead of tombstoning the shorter name", (_label, nameLine) => {
+		write(userDir, "shared.md", "name: shared\ndescription: user helper");
+		write(projectDir, "override.md", `${nameLine}\ndescription: rejected override\nbroken: [`);
+		const result = discoverSwivalAgents(root, "both");
+		expect(result.diagnostics).toEqual([{ code: "invalid_yaml", source: "project" }]);
+		expect(result.invalidAgentNames).toEqual([]);
+		expect(result.agents.find((a) => a.name === "shared")).toMatchObject({ source: "user" });
+	});
+
+	it.each([
+		["indented name inside a block scalar", "description: |\n  name: swival\nbroken: ["],
+		["indented name inside a nested mapping", "nested:\n  name: swival\nbroken: ["],
+		["duplicate name lines", "name: swival\nname: other\nbroken: ["],
+		["escaped double-quoted name", 'name: "swi\\u0076al"\nbroken: ['],
+		["single-quoted name with an escaped quote", "name: 'swival''\nbroken: ["],
+		["block scalar name", "name: |\n  swival\nbroken: ["],
+		["flow collection name", "name: [swival]\nbroken: ["],
+		["anchored name", "name: &id swival\nbroken: ["],
+		["quoted name followed by trailing text", 'name: "swival" extra\nbroken: ['],
+		["name without a value", "name:\nbroken: ["],
+		["name outside the frontmatter block", "broken: [\n---\nname: swival"],
+	])("leaves invalid_yaml unidentified for %s without tombstoning the bundled agent", (_label, frontmatter) => {
+		write(userDir, "invalid.md", frontmatter);
+		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
+		const result = discoverSwivalAgents(root, "user");
+		expect(result.diagnostics).toEqual([{ code: "invalid_yaml", source: "user" }]);
+		expect(result.invalidAgentNames).toEqual([]);
+		expect(result.agents.find((a) => a.name === "swival")?.source).toBe("bundled");
+		expect(result.agents.some((a) => a.name === "valid")).toBe(true);
+	});
+
 	it("bounds diagnostics without losing named invalid tombstones", () => {
 		for (let i = 0; i < 30; i++) {
 			write(userDir, `${String(i).padStart(2, "0")}.md`, `name: invalid-${i}`);

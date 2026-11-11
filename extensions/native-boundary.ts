@@ -205,8 +205,16 @@ export async function resolveTrustedCredentialState(tool: "aws" | "gcloud", home
 		}
 	};
 	const realStateRoot = await assertTrustedState(stateRoot);
-	if (!realStateRoot || !(await fs.stat(realStateRoot)).isDirectory()) return bindings;
+	if (!realStateRoot) return bindings;
+	if (!(await fs.stat(realStateRoot)).isDirectory()) throw refusal();
 	const identities = await Promise.all(protectedRoots.map((root) => fs.stat(root)));
+	const aliasesProtectedRoot = (stat: fsSync.Stats) => identities.some((root) => stat.dev === root.dev && stat.ino === root.ino);
+	/** Only a regular file with one link is inert: a hard link shares its inode with a
+	 * file the CLI may read or write anywhere, and a FIFO or socket blocks or redirects it. */
+	const assertUnlinkedFile = async (location: string): Promise<void> => {
+		const stat = await fs.lstat(location);
+		if (!stat.isFile() || stat.nlink !== 1 || aliasesProtectedRoot(stat)) throw refusal();
+	};
 	let budget = 65_536;
 	// Every subtree is inspected uniformly, including gcloud `logs`: file logging
 	// is disabled, but gcloud still prunes dated log directories beneath it and a
@@ -216,7 +224,7 @@ export async function resolveTrustedCredentialState(tool: "aws" | "gcloud", home
 	const visited = new Set<string>();
 	const walk = async (directory: string): Promise<void> => {
 		const dirStat = await fs.stat(directory);
-		if (identities.some((root) => dirStat.dev === root.dev && dirStat.ino === root.ino)) throw refusal();
+		if (aliasesProtectedRoot(dirStat)) throw refusal();
 		const identity = `${dirStat.dev}:${dirStat.ino}`;
 		if (visited.has(identity)) return;
 		visited.add(identity);
@@ -225,8 +233,11 @@ export async function resolveTrustedCredentialState(tool: "aws" | "gcloud", home
 			const location = path.join(directory, entry.name);
 			if (entry.isSymbolicLink()) {
 				const target = await assertTrustedState(location);
-				if (target && (await fs.stat(target)).isDirectory()) await walk(target);
+				if (!target) continue;
+				if ((await fs.stat(target)).isDirectory()) await walk(target);
+				else await assertUnlinkedFile(target);
 			} else if (entry.isDirectory()) await walk(location);
+			else await assertUnlinkedFile(location);
 		}
 	};
 	await walk(realStateRoot);
@@ -244,9 +255,9 @@ export function gitEnvironment(): NodeJS.ProcessEnv {
 }
 
 export function boundedExec(executable: string, args: string[], cwd: string, input?: string | Buffer,
-	env = process.env, timeout = 5000, maxBuffer = 8 * 1024 * 1024): Promise<Buffer> {
+	env = process.env, timeout = 5000, maxBuffer = 8 * 1024 * 1024, signal?: AbortSignal): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const child = execFile(executable, args, { cwd, env, timeout, maxBuffer, encoding: "buffer", shell: false },
+		const child = execFile(executable, args, { cwd, env, timeout, maxBuffer, encoding: "buffer", shell: false, signal },
 			(error, stdout) => { if (error) reject(new Error(`Native audit local ${path.basename(executable)} check failed.`)); else resolve(stdout); });
 		child.stdin?.on("error", () => {});
 		child.stdin?.end(input);

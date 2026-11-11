@@ -23,53 +23,191 @@ import {
 	readPiAuthToken,
 	readSafeRegularText,
 	resolvePiCustomProviderForBaseUrl,
+	walkCanonicalPathSync,
 } from "./paths.js";
 
 // --------------------------------------------------------- TOML subset --
 
+/** Multiline strings can hide table headers or key lines from line-oriented reading. */
+const hasTomlMultilineString = (text: string) => text.includes('"""') || text.includes("'''");
+
+interface TomlLine {
+	readonly text: string;
+	readonly start: number;
+	/** The line begins outside every array and inline table, so it can carry a key or header. */
+	readonly topLevel: boolean;
+}
+
+/**
+ * Split TOML into physical lines while tracking single-line strings, comments,
+ * array depth, and inline-table depth, so a `[` that continues a multiline
+ * array is never mistaken for a table header and array elements are never
+ * mistaken for assignments. Returns `null` for anything the subset cannot read
+ * line by line: an unclosed string, a line continuation, an inline table
+ * spanning lines, unbalanced brackets, or content after a closing bracket.
+ */
+function scanTomlLines(text: string): TomlLine[] | null {
+	if (hasTomlMultilineString(text)) return null;
+	const lines: TomlLine[] = [];
+	let lineStart = 0, lineTopLevel = true, bracket = 0, brace = 0;
+	let quote: '"' | "'" | undefined;
+	let inComment = false, tailOnly = false;
+	const endLine = (end: number) => {
+		if (brace > 0) return false;
+		lines.push({ text: text.slice(lineStart, end), start: lineStart, topLevel: lineTopLevel });
+		lineStart = end + 1; lineTopLevel = bracket === 0; inComment = false; tailOnly = false;
+		return true;
+	};
+	for (let i = 0; i < text.length; i++) {
+		const c = text[i];
+		if (quote) {
+			if (c === "\n" || c === "\r") return null;
+			if (c === quote) quote = undefined;
+			else if (quote === '"' && c === "\\") {
+				const next = text[i + 1];
+				if (next === undefined || next === "\n" || next === "\r") return null;
+				i++;
+			}
+			continue;
+		}
+		if (c === "\n") { if (!endLine(i)) return null; continue; }
+		if (inComment) continue;
+		if (c === "#") { inComment = true; continue; }
+		if (tailOnly && c !== " " && c !== "\t" && c !== "\r") return null;
+		if (c === '"' || c === "'") quote = c;
+		else if (c === "[") bracket++;
+		else if (c === "{") brace++;
+		else if (c === "]" || c === "}") {
+			if (c === "]" ? --bracket < 0 : --brace < 0) return null;
+			if (!lineTopLevel && bracket === 0 && brace === 0) tailOnly = true;
+		}
+	}
+	if (quote || bracket !== 0 || brace !== 0 || !endLine(text.length)) return null;
+	return lines;
+}
+
+interface TomlHeader {
+	/** Header text between the brackets with whitespace around dots removed. */
+	readonly inner: string;
+	readonly arrayTable: boolean;
+	readonly start: number;
+	readonly bodyStart: number;
+}
+
+/** Real table headers only: a top-level line that opens with `[` must be a complete header. */
+function tomlHeaders(raw: string, lines: TomlLine[]): TomlHeader[] | null {
+	const headers: TomlHeader[] = [];
+	for (const line of lines) {
+		if (!line.topLevel || !/^\s*\[/.test(line.text)) continue;
+		const header = /^\s*(\[\[?)([^\[\]]+?)(\]\]?)\s*(?:#.*)?$/.exec(line.text);
+		if (!header || header[1].length !== header[3].length) return null;
+		headers.push({ inner: header[2].trim().replace(/[ \t]*\.[ \t]*/g, "."), arrayTable: header[1] === "[[",
+			start: line.start, bodyStart: Math.min(raw.length, line.start + line.text.length + 1) });
+	}
+	return headers;
+}
+
+/**
+ * Locate the single top-level `key =` assignment in one section. Returns the
+ * line and its index, `undefined` when absent, or `null` when the section
+ * cannot be interpreted safely: unreadable layout, a duplicate key, a dotted
+ * key, an escaped quoted key, or a quoted key spelling `key`. Unrelated plain
+ * quoted keys and multiline arrays are inert.
+ */
+function uniqueTomlAssignment(lines: TomlLine[], key: string): { line: TomlLine; index: number } | null | undefined {
+	let found: { line: TomlLine; index: number } | undefined;
+	for (const [index, line] of lines.entries()) {
+		if (!line.topLevel || /^\s*(?:#|$)/.test(line.text)) continue;
+		if (/^\s*\[/.test(line.text)) return null;
+		const bare = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(line.text);
+		if (bare) {
+			if (bare[1] !== key) continue;
+			if (found) return null;
+			found = { line, index };
+			continue;
+		}
+		const quoted = /^\s*(?:"([^"\\]*)"|'([^']*)')\s*=/.exec(line.text);
+		if (!quoted || (quoted[1] ?? quoted[2]) === key) return null;
+	}
+	return found;
+}
+
 function parseUniqueTomlString(sectionText: string, key: string): string | null | undefined {
-	if (/^\s*["']/m.test(sectionText)) return null;
-	const matches = sectionText.match(new RegExp(`^\\s*${key}\\s*=`, "gm"));
-	if (!matches || matches.length === 0) return undefined;
-	if (matches.length > 1) return null;
-	const m = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"\\\\]*)"|'([^']*)')\\s*(?:#.*)?$`, "m").exec(sectionText);
+	const lines = scanTomlLines(sectionText);
+	if (!lines) return null;
+	const found = uniqueTomlAssignment(lines, key);
+	if (!found) return found;
+	const m = new RegExp(`^\\s*${key}\\s*=\\s*(?:"([^"\\\\]*)"|'([^']*)')\\s*(?:#.*)?$`).exec(found.line.text);
 	if (!m) return null;
 	return m[1] ?? m[2];
 }
 
 function parseUniqueTomlPositiveInt(sectionText: string, key: string): number | null | undefined {
-	if (/^\s*["']/m.test(sectionText)) return null;
-	const matches = sectionText.match(new RegExp(`^\\s*${key}\\s*=`, "gm"));
-	if (!matches || matches.length === 0) return undefined;
-	if (matches.length > 1) return null;
-	const m = new RegExp(`^\\s*${key}\\s*=\\s*([0-9]+)\\s*(?:#.*)?$`, "m").exec(sectionText);
+	const lines = scanTomlLines(sectionText);
+	if (!lines) return null;
+	const found = uniqueTomlAssignment(lines, key);
+	if (!found) return found;
+	const m = new RegExp(`^\\s*${key}\\s*=\\s*([0-9]+)\\s*(?:#.*)?$`).exec(found.line.text);
 	if (!m) return null;
 	const n = Number(m[1]);
 	return Number.isSafeInteger(n) && n > 0 ? n : null;
 }
 
-function extractTomlProfileSection(raw: string, profileName: string): string | undefined {
-	if (!/^[A-Za-z0-9_-]+$/.test(profileName)) return undefined;
-	const escaped = profileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-	const anyHeaderRe = new RegExp(`(?:^|\\n)\\s*\\[profiles\\.(?:${escaped}|"${escaped}"|'${escaped}')\\]\\s*(?:#.*)?(?:\\n|$)`, "g");
-	const first = anyHeaderRe.exec(raw);
-	if (!first || anyHeaderRe.exec(raw) !== null) return undefined;
-	if (!new RegExp(`(?:^|\\n)\\s*\\[profiles\\.${escaped}\\]\\s*(?:#.*)?(?:\\n|$)`).test(first[0])) return undefined;
-	const rest = raw.slice(first.index + first[0].length);
-	const nextHeader = /(?:^|\n)\s*\[/.exec(rest);
-	return nextHeader ? rest.slice(0, nextHeader.index) : rest;
+/**
+ * Exactly one plain `[profiles.<name>]` header selects a profile. Returns
+ * `undefined` only when the profile is absent from this file, and `null` when
+ * the file addresses profiles in any way this subset cannot attribute: an
+ * unsafe name, a bare or quoted `[profiles]` table, a quoted or nested profile
+ * header, an array of tables, or a duplicate header.
+ */
+function extractTomlProfileSection(raw: string, headers: TomlHeader[], profileName: string): string | null | undefined {
+	if (!/^[A-Za-z0-9_-]+$/.test(profileName)) return null;
+	for (const header of headers) {
+		if (!/^(?:profiles|"profiles"|'profiles')(?:\.|$)/.test(header.inner)) continue;
+		if (header.arrayTable || !/^profiles\.[A-Za-z0-9_-]+$/.test(header.inner)) return null;
+	}
+	const matches = headers.filter((header) => header.inner === `profiles.${profileName}`);
+	if (matches.length > 1) return null;
+	if (matches.length === 0) return undefined;
+	const index = headers.indexOf(matches[0]);
+	const end = index + 1 < headers.length ? headers[index + 1].start : raw.length;
+	return raw.slice(matches[0].bodyStart, end);
 }
 
-function parseTomlRootStringArray(raw: string, key: string): string[] | null | undefined {
-	const firstTable = /(?:^|\n)\s*\[[A-Za-z0-9_."'-]+\]/.exec(raw);
-	const rootSection = firstTable ? raw.slice(0, firstTable.index) : raw;
-	if (/^\s*["'][^"'\r\n]*["']\s*=/m.test(rootSection)) return null;
-	const keyMatches = rootSection.match(new RegExp(`^\\s*${key}\\s*=`, "gm"));
-	if (!keyMatches || keyMatches.length === 0) return undefined;
-	if (keyMatches.length > 1) return null;
-	const match = new RegExp(`^\\s*${key}\\s*=\\s*\\[([\\s\\S]*?)\\]\\s*(?:#.*)?$`, "m").exec(rootSection);
-	if (!match) return null;
-	const body = match[1];
+/** Index of the `]` closing the array opened at `open`, ignoring brackets inside strings and comments; -1 when unclosed. */
+function tomlArrayEnd(text: string, open: number): number {
+	let depth = 0;
+	let quote: '"' | "'" | undefined;
+	for (let i = open; i < text.length; i++) {
+		const c = text[i];
+		if (quote) {
+			if (c === quote) quote = undefined;
+			else if (quote === '"' && c === "\\") i++;
+		} else if (c === "#") {
+			const newline = text.indexOf("\n", i);
+			if (newline === -1) return -1;
+			i = newline;
+		} else if (c === '"' || c === "'") quote = c;
+		else if (c === "[") depth++;
+		else if (c === "]" && --depth === 0) return i;
+	}
+	return -1;
+}
+
+function parseTomlRootStringArray(rootSection: string, key: string): string[] | null | undefined {
+	const lines = scanTomlLines(rootSection);
+	if (!lines) return null;
+	const found = uniqueTomlAssignment(lines, key);
+	if (!found) return found;
+	// The assignment runs until the next top-level line, so a multiline array stays whole.
+	let end = found.index + 1;
+	while (end < lines.length && !lines[end].topLevel) end++;
+	const assignment = lines.slice(found.index, end).map((line) => line.text).join("\n");
+	const opening = new RegExp(`^\\s*${key}\\s*=\\s*\\[`).exec(assignment);
+	if (!opening) return null;
+	const closing = tomlArrayEnd(assignment, opening[0].length - 1);
+	if (closing === -1 || !/^\s*(?:#.*)?$/.test(assignment.slice(closing + 1))) return null;
+	const body = assignment.slice(opening[0].length, closing);
 	const items: string[] = [];
 	let i = 0;
 	while (i < body.length) {
@@ -125,39 +263,54 @@ export interface SwivalTomlConfig {
 	readonly root: string;
 	string(section: string, key: string): string | null | undefined;
 	positiveInt(section: string, key: string): number | null | undefined;
-	profile(name: string): string | undefined;
+	/** `undefined` when the profile is absent; `null` when profile headers are ambiguous. */
+	profile(name: string): string | null | undefined;
 	rootStringArray(key: string): string[] | null | undefined;
 }
 
 export function readSwivalTomlConfig(file: string, maxBytes = 128 * 1024): SwivalTomlConfig | undefined {
 	const raw = readSafeRegularText(file, maxBytes);
 	if (raw === undefined) return undefined;
-	const firstTable = /(?:^|\n)\s*\[/.exec(raw);
+	const lines = scanTomlLines(raw);
+	if (!lines) return undefined;
+	const headers = tomlHeaders(raw, lines);
+	if (!headers) return undefined;
+	const root = headers.length ? raw.slice(0, headers[0].start) : raw;
 	return {
 		raw,
-		root: firstTable ? raw.slice(0, firstTable.index) : raw,
+		root,
 		string: parseUniqueTomlString,
 		positiveInt: parseUniqueTomlPositiveInt,
-		profile: (name) => extractTomlProfileSection(raw, name),
-		rootStringArray: (key) => parseTomlRootStringArray(raw, key),
+		profile: (name) => extractTomlProfileSection(raw, headers, name),
+		rootStringArray: (key) => parseTomlRootStringArray(root, key),
 	};
 }
 
 // ------------------------------------------------------- path helpers --
 
+/** Join without normalizing so a later `..` is applied after symlink resolution, not lexically. */
 export function expandTildePath(targetPath: string, homeDir: string = os.homedir()): string {
 	if (targetPath === "~") return homeDir;
-	if (targetPath.startsWith("~/") || targetPath.startsWith(`~${path.sep}`)) return path.join(homeDir, targetPath.slice(2));
+	if (targetPath.startsWith("~/") || targetPath.startsWith(`~${path.sep}`)) {
+		return `${homeDir.replace(/[\\/]+$/, "")}${path.sep}${targetPath.slice(2)}`;
+	}
 	return targetPath;
 }
 
 export function canonicalPathOrResolved(targetPath: string, baseDir?: string, homeDir: string = os.homedir()): string {
 	const expanded = expandTildePath(targetPath, homeDir);
-	const resolved = path.isAbsolute(expanded) ? path.resolve(expanded) : baseDir ? path.resolve(baseDir, expanded) : path.resolve(expanded);
-	try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+	const absolute = path.isAbsolute(expanded) ? expanded : `${baseDir ?? process.cwd()}${path.sep}${expanded}`;
+	let canonical: string;
+	try { canonical = walkCanonicalPathSync(absolute); } catch { return path.resolve(absolute); }
+	// Existing paths keep the on-disk spelling that realpath-derived Git directories use.
+	try { return fs.realpathSync.native(canonical); } catch { return canonical; }
 }
 
 export const PROTECTED_HOME_SUBDIRS = [".ssh", ".gnupg", ".aws", ".config", ".pi", ".agentfs"] as const;
+
+/** Default filesystems on these platforms are case-insensitive. */
+export const foldPathCase = (location: string): string =>
+	process.platform === "darwin" || process.platform === "win32" ? location.toLowerCase() : location;
 
 /**
  * Read effective root-level `allowed_dirs_ro` from `<baseDir>/swival.toml` or
@@ -170,21 +323,31 @@ export function readConfiguredAllowedDirsRo(
 	homeDir: string = os.homedir(),
 	env: NodeJS.ProcessEnv = process.env,
 ): string[] {
+	// Join without normalizing so a later `..` is applied after symlink resolution.
 	const resolveEntries = (entries: string[], configDir: string): string[] =>
 		entries.map((entry) => {
 			const expanded = expandTildePath(entry, homeDir);
-			return path.isAbsolute(expanded) ? expanded : path.join(configDir, expanded);
+			return path.isAbsolute(expanded) ? expanded : `${configDir.replace(/[\\/]+$/, "")}${path.sep}${expanded}`;
 		});
 	if (baseDir && path.isAbsolute(baseDir)) {
-		try {
-			const realBaseDir = fs.realpathSync.native(baseDir);
-			const project = readSwivalTomlConfig(path.join(realBaseDir, "swival.toml"), 65536);
-			if (project) {
+		let realBaseDir: string | undefined;
+		try { realBaseDir = fs.realpathSync.native(baseDir); } catch { /* No project directory: only global configuration applies. */ }
+		if (realBaseDir) {
+			// A present but unreadable project file fails closed rather than exposing
+			// global entries the project may have meant to replace. An empty file
+			// configures nothing, matching the evidence-grant reader.
+			const projectFile = path.join(realBaseDir, "swival.toml");
+			let projectStat: fs.Stats | undefined;
+			try { projectStat = fs.lstatSync(projectFile); }
+			catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") return []; }
+			if (projectStat && !(projectStat.isFile() && projectStat.size === 0)) {
+				const project = readSwivalTomlConfig(projectFile, 65536);
+				if (!project) return [];
 				const entries = project.rootStringArray("allowed_dirs_ro");
 				if (entries === null) return [];
 				if (entries !== undefined) return resolveEntries(entries, realBaseDir);
 			}
-		} catch { /* ignore */ }
+		}
 	}
 	try {
 		const xdg = env.XDG_CONFIG_HOME?.trim();
@@ -246,11 +409,12 @@ export function resolveLinkedWorktreeCommonGitDir(
 			if (st.isSymbolicLink() || !st.isDirectory()) return undefined;
 		}
 		const realHome = fs.existsSync(homeDir) ? fs.realpathSync.native(homeDir) : path.resolve(homeDir);
-		if (commonGitDir === realHome) return undefined;
+		const foldedCommonGitDir = foldPathCase(commonGitDir);
+		if (foldedCommonGitDir === foldPathCase(realHome)) return undefined;
 		for (const sub of PROTECTED_HOME_SUBDIRS) {
-			const protectedRoot = canonicalPathOrResolved(path.join(realHome, sub));
-			if (commonGitDir === protectedRoot || commonGitDir.startsWith(protectedRoot + path.sep) ||
-				protectedRoot.startsWith(commonGitDir + path.sep)) return undefined;
+			const protectedRoot = foldPathCase(canonicalPathOrResolved(path.join(realHome, sub)));
+			if (foldedCommonGitDir === protectedRoot || foldedCommonGitDir.startsWith(protectedRoot + path.sep) ||
+				protectedRoot.startsWith(foldedCommonGitDir + path.sep)) return undefined;
 		}
 		return commonGitDir;
 	} catch {

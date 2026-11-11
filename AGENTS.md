@@ -17,7 +17,7 @@ Pi extension wrapping the `swival` CLI for delegated subagents, reviewer loops, 
 - Trust OS, CLI, and Swival boundaries. Pass structured plans directly to child spawners rather than re-parsing emitted `argv`, hand-rolling duplicate TOML parsers, or re-implementing Swival Python internals in TypeScript.
 - Fix edge cases by tightening types and boundary contracts. Do not bolt on shadow state machines, tombstone flags, unrequested config knobs, or `// Fix N:` comment scar tissue.
 - Prefer `>=` minimum version checks for CLI integrations. Pin exact upstream versions only inside one explicit compatibility manifest when monkeypatching or reading private upstream state.
-- Agent discovery today fails closed: a malformed or unresolvable agent file blocks dispatch, and an identifiable invalid higher-priority definition never silently falls back to a lower-priority agent. The migration goal is to warn about unrelated malformed files and block only the requested agent; keep the no-silent-fallback contract when making that change.
+- Agent discovery blocks only identified names: an unidentifiable malformed or unreadable agent file emits a bounded discovery diagnostic without blocking unrelated agents, while an identifiable invalid higher-priority definition (including rejected YAML whose single column-0 `name:` is a plain or quoted scalar) tombstones that name and never silently falls back to a lower-priority definition. Never derive an identity from a filename.
 
 ## Load-Bearing Invariants
 

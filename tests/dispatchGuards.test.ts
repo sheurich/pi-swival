@@ -59,11 +59,18 @@ describe("isMutatingCwdAgent", () => {
 	});
 
 	it("treats bundled sandboxed-explorer as write-capable", () => {
-		const discovery = discoverSwivalAgents(process.cwd(), "user");
-		const explorer = discovery.agents.find((a) => a.name === "sandboxed-explorer");
-		expect(explorer).toBeDefined();
-		expect(explorer?.noSandboxAutoSession).toBe(true);
-		expect(isMutatingCwdAgent(explorer!)).toBe(true);
+		// An empty agent directory keeps a developer's user-scope overrides out of the bundled check.
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "swival-dispatch-guards-"));
+		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+		try {
+			const discovery = discoverSwivalAgents(process.cwd(), "user");
+			const explorer = discovery.agents.find((a) => a.name === "sandboxed-explorer");
+			expect(explorer).toMatchObject({ source: "bundled", noSandboxAutoSession: true });
+			expect(isMutatingCwdAgent(explorer!)).toBe(true);
+		} finally {
+			vi.unstubAllEnvs();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	it("returns true when sandbox=agentfs WITHOUT noSandboxAutoSession (shared overlay)", () => {
