@@ -1,6 +1,6 @@
 ---
 name: sandboxed-explorer
-description: Explores with AgentFS and self-review. Base-directory access can be write-through in Swival 1.9.3; use a disposable worktree for exploratory changes.
+description: Explores with AgentFS and self-review. Base-directory access can be write-through in Swival 1.9.3; use a disposable worktree for exploratory changes. Use `sandboxed-reviewer` instead for read-only reviews.
 sandbox: agentfs
 noSandboxAutoSession: true
 selfReview: true

@@ -54,10 +54,23 @@ ROUTING_KEYS = {
 OPTION_KEYS = ("max_output_tokens", "max_turns", "provider_timeout", "retries",
                "temperature", "top_p", "seed", "max_context_tokens")
 # Credential forwarding is an authority boundary, not a provider implementation.
-CREDENTIAL_ENV = {"openrouter": "OPENROUTER_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
-AMBIENT_ENDPOINTS = {"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE", "OPENAI_API_BASE",
-                     "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
-                     "ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"}
+CREDENTIAL_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "bedrock": "AWS_ACCESS_KEY_ID",
+    "geap": "GOOGLE_OAUTH_ACCESS_TOKEN",
+}
+FALLBACK_CREDENTIAL_ENV = {
+    "bedrock": {"AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"},
+    "geap": {"GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG", "VERTEXAI_CREDENTIALS"},
+}
+AMBIENT_ENDPOINTS = {
+    "CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE", "OPENAI_API_BASE",
+    "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
+    "ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL",
+    "AWS_BEDROCK_RUNTIME_ENDPOINT", "AWS_ENDPOINT_URL",
+    "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "VERTEXAI_API_BASE",
+}
 
 
 def _unpropagated_policy(key, value):
@@ -126,6 +139,10 @@ def _identifier(value, limit=160):
             and not re.search(r"[A-Za-z0-9]{40,}|(?:^|/)\.\.?(?:/|$)", value))
 
 
+def _aws_region(value):
+    return isinstance(value, str) and bool(re.fullmatch(r"[a-z]{2}(?:-[a-z]+)+-[0-9]+", value))
+
+
 def _endpoint(value):
     if value is None:
         return None
@@ -169,6 +186,7 @@ def _parse_route(parser, values):
 def resolve_native_config(request):
     """Select through released precedence, then admit concrete native capabilities."""
     routing = request.get("routing", {})
+    defer_credentials = request.get("deferCredentials") is True and not request.get("snapshot")
     if not isinstance(routing, dict) or set(routing) - (set(OVERRIDE_KEYS) | {"profile"}):
         raise NativeAuditError("CONFIG_INVALID")
     if (sys.version_info < (3, 13) or any(importlib.metadata.version(name) != version
@@ -211,19 +229,60 @@ def resolve_native_config(request):
             if not effective.get("provider") or not effective.get("model"):
                 raise NativeAuditError("ROUTE_INCOMPLETE")
             config_module.apply_config_to_args(args, config)
-            _parse_route(parser, {key: getattr(args, key) for key in
-                (*OPTION_KEYS, "provider", "model", "base_url", "reasoning_effort")})
+            if args.provider == "vertexai":
+                args.provider = "geap"
+            _parse_route(parser, {
+                **(
+                    {"gcp_project": args.gcp_project, "location": args.location}
+                    if args.provider == "geap"
+                    else {}
+                ),
+                **{
+                    key: getattr(args, key)
+                    for key in (*OPTION_KEYS, "provider", "model", "base_url", "reasoning_effort")
+                },
+            })
     except NativeAuditError:
         raise
     except Exception as exc:
         raise NativeAuditError("CONFIG_INVALID") from exc
     _requirements(effective)
-    return _admit_route(args, profile, routing)
+    return _admit_route(args, profile, routing, defer_credentials=defer_credentials)
 
 
-def _credential_capability(args):
+def _credential_capability(args, *, defer_credentials=False):
     if args.api_key is not None or getattr(args, "decision_api_key", None) is not None:
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED", "api_key")
+    if FALLBACK_CREDENTIAL_ENV.get(args.provider, set()) & os.environ.keys():
+        raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+    if args.provider == "bedrock":
+        if getattr(args, "gcp_project", None) or getattr(args, "location", None):
+            raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+        if args.aws_profile is not None and not _identifier(args.aws_profile, 80):
+            raise NativeAuditError("CONFIG_INVALID")
+        if not defer_credentials:
+            has_aws_env = bool(
+                os.environ.get("AWS_ACCESS_KEY_ID")
+                and os.environ.get("AWS_SECRET_ACCESS_KEY")
+                and os.environ.get("AWS_SESSION_TOKEN")
+            )
+            if not has_aws_env:
+                if args.aws_profile is not None or args.base_url is None:
+                    raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+                raise NativeAuditError("CREDENTIAL_UNAVAILABLE")
+            if args.aws_profile is not None and not os.environ.get("PI_SWIVAL_AWS_PROFILE_MINTED"):
+                raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+        return
+    if args.provider == "geap":
+        if getattr(args, "aws_profile", None):
+            raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+        if not _identifier(getattr(args, "gcp_project", None), 128) or not _identifier(
+            getattr(args, "location", None), 64
+        ):
+            raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
+        if not defer_credentials and not os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN"):
+            raise NativeAuditError("CREDENTIAL_UNAVAILABLE")
+        return
     if any(getattr(args, key, None) for key in ("aws_profile", "gcp_project", "location")):
         raise NativeAuditError("CREDENTIAL_INTERFACE_UNSUPPORTED")
     if args.provider != "chatgpt" and args.provider not in CREDENTIAL_ENV:
@@ -232,24 +291,38 @@ def _credential_capability(args):
         raise NativeAuditError("CREDENTIAL_UNAVAILABLE")
 
 
-def _admit_route(args, profile, routing):
+def _admit_route(args, profile, routing, *, defer_credentials=False):
     """No provider construction, catalog request, or inference for admission."""
     provider, model = args.provider, args.model
     if not _identifier(provider, 40) or not _identifier(model):
         raise NativeAuditError("CONFIG_INVALID")
-    endpoint = _endpoint(args.base_url)
     if provider == "command":
         raise NativeAuditError("COMMAND_EXECUTION_REQUIRED")
     if provider in {"lmstudio", "generic", "llamacpp", "applefm", "google"}:
         raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
-    _credential_capability(args)
+    if provider == "bedrock":
+        _credential_capability(args, defer_credentials=defer_credentials)
+        if args.base_url is None:
+            raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
+        if not _aws_region(args.base_url):
+            _ = _endpoint(args.base_url)
+            raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
+        endpoint = args.base_url
+    else:
+        endpoint = _endpoint(args.base_url)
+        _credential_capability(args, defer_credentials=defer_credentials)
+    if provider == "geap":
+        if "/" in model:
+            raise NativeAuditError("CONFIG_INVALID")
+        if endpoint is not None:
+            raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
     if model.rsplit("/", 1)[-1].split(":", 1)[0] in {"auto", "random", "free"}:
         raise NativeAuditError("ROUTE_SELECTOR_UNSUPPORTED")
     if provider == "chatgpt" and endpoint not in (None, "https://chatgpt.com/backend-api/codex"):
         raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
     if provider == "anthropic" and endpoint is not None:
         raise NativeAuditError("ENDPOINT_REQUIREMENT_UNSUPPORTED")
-    if endpoint and urlsplit(endpoint).hostname in ("localhost", "127.0.0.1", "::1"):
+    if endpoint and not _aws_region(endpoint) and urlsplit(endpoint).hostname in ("localhost", "127.0.0.1", "::1"):
         if args.max_context_tokens is None:
             raise NativeAuditError("POLICY_NOT_PROPAGATED", "max_context_tokens")
     options = {key: getattr(args, key) for key in OPTION_KEYS}
@@ -263,17 +336,25 @@ def _admit_route(args, profile, routing):
     # bundled catalog. Otherwise Swival's singleton NotFound retry can substitute.
     # Empty catalogs (len == 0, such as openrouter in LiteLLM 1.106.6) return None
     # in swival/agent.py:_handle_model_not_found and cannot substitute a model.
-    # For anthropic, endpoint is None and the runtime shim disables get_models.
-    adapter = LlmProviders(provider)
-    if ((provider != "anthropic"
+    # For anthropic, bedrock, and geap (vertex_ai), _list_server_models returns [].
+    adapter_name = "vertex_ai" if provider == "geap" else provider
+    adapter = LlmProviders(adapter_name)
+    if ((provider not in {"anthropic", "bedrock", "geap"}
             and ProviderConfigManager.get_provider_model_info(None, adapter) is not None)
-            or len(set(litellm.models_by_provider.get(provider, []))) == 1):
+            or len(set(litellm.models_by_provider.get(adapter_name, []))) == 1):
         raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
-    return {"version": 2, "runtime": RUNTIME_VERSIONS, "provider": provider, "model": model,
-            "reasoningEffort": args.reasoning_effort, "options": options, "profile": profile,
-            "endpoint": endpoint, "reportIdentity": {"provider": provider, "model": model},
-            "selection": {"profileSource": "explicit" if "profile" in routing else
-                "active" if profile else None, "explicitFields": sorted(routing)}}
+    result = {
+        "version": 2, "runtime": RUNTIME_VERSIONS, "provider": provider, "model": model,
+        "reasoningEffort": args.reasoning_effort, "options": options, "profile": profile,
+        "endpoint": endpoint, "reportIdentity": {"provider": provider, "model": model},
+        "selection": {"profileSource": "explicit" if "profile" in routing else
+            "active" if profile else None, "explicitFields": sorted(routing)},
+        **({"project": args.gcp_project, "location": args.location}
+           if provider == "geap" else {}),
+    }
+    if provider == "bedrock" and args.aws_profile:
+        result["awsProfile"] = args.aws_profile
+    return result
 
 
 def native_scope(request):

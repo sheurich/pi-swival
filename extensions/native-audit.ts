@@ -67,6 +67,9 @@ export function buildNativeAuditArgs(snapshot: string, route: Record<string, any
 		"--no-web-search", "--no-model-routing", "--no-decisions",
 		"--provider", route.provider, "--model", route.model, "--report", path.join(snapshot, "native-cli-report.json")];
 	if (route.endpoint != null) args.push("--base-url", route.endpoint);
+	if (route.provider === "geap") {
+		args.push("--gcp-project", route.project, "--location", route.location);
+	}
 	if (route.reasoningEffort != null) args.push("--reasoning-effort", route.reasoningEffort);
 	for (const [key, value] of Object.entries(route.options ?? {})) {
 		if (value != null) args.push(`--${key.replaceAll("_", "-")}`, String(value));
@@ -228,12 +231,25 @@ export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, 
 	const env: NodeJS.ProcessEnv = {};
 	const credentials = provider === "chatgpt" ? ["CHATGPT_TOKEN_DIR", "CHATGPT_AUTH_FILE", "CHATGPT_API_KEY"] :
 		provider === "openrouter" ? ["OPENROUTER_API_KEY"] :
-		provider === "anthropic" ? ["ANTHROPIC_API_KEY"] : [];
+		provider === "anthropic" ? ["ANTHROPIC_API_KEY"] :
+		provider === "bedrock" ? ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"] :
+		provider === "geap" ? ["GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER"] : [];
 	for (const key of ["HOME", "TMPDIR", "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", ...credentials]) {
 		if (input[key] !== undefined) env[key] = input[key];
 	}
-	if (provider === "anthropic" && anthropicShimDir) {
+	if ((provider === "anthropic" || provider === "bedrock" || provider === "geap") && anthropicShimDir) {
 		env.PYTHONPATH = anthropicShimDir;
+		env.PYTHONDONTWRITEBYTECODE = "1";
+		env.PI_SWIVAL_SHIM_REQUIRED = "1";
+	}
+	if (provider === "bedrock") {
+		env.AWS_CONFIG_FILE = "/dev/null";
+		env.AWS_SHARED_CREDENTIALS_FILE = "/dev/null";
+		env.AWS_EC2_METADATA_DISABLED = "true";
+	}
+	if (provider === "geap") {
+		env.GOOGLE_APPLICATION_CREDENTIALS = "/dev/null";
+		if (input.XDG_CONFIG_HOME) env.CLOUDSDK_CONFIG = path.join(input.XDG_CONFIG_HOME, "gcloud-empty");
 	}
 	return { ...env, PATH: searchPath, LITELLM_MODE: "PRODUCTION", LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1",
 		NO_COLOR: "1", TERM: "dumb", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
@@ -247,9 +263,15 @@ export function nativePreflightEnvironment(input: NodeJS.ProcessEnv, searchPath:
 		if (["http_proxy", "https_proxy", "all_proxy"].includes(key.toLowerCase()) ||
 			["USE_LITELLM_PROXY", "SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD",
 				"CHATGPT_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+				"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "PI_SWIVAL_AWS_PROFILE_MINTED",
+				"GOOGLE_OAUTH_ACCESS_TOKEN",
+				"AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE",
+				"GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG", "VERTEXAI_CREDENTIALS",
 				"CHATGPT_API_BASE", "OPENAI_CHATGPT_API_BASE",
 				"OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENROUTER_API_BASE", "LITELLM_API_BASE",
-				"ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL"].includes(key)) {
+				"ANTHROPIC_API_BASE", "ANTHROPIC_BASE_URL",
+				"AWS_BEDROCK_RUNTIME_ENDPOINT", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+				"VERTEXAI_API_BASE"].includes(key)) {
 			env[key] = input[key] ? "present" : "";
 		}
 	}
@@ -267,11 +289,15 @@ export interface NativeRoute {
 	options: Record<string, number | null>;
 	selection: { profileSource: "active" | "explicit" | null; explicitFields: string[] };
 	reportIdentity: { provider: string; model: string };
+	project?: string;
+	location?: string;
 }
 
 const routeIdentifier = (value: unknown, limit = 160): value is string => typeof value === "string" &&
 	value.length > 0 && value.length <= limit && /^[A-Za-z0-9][A-Za-z0-9_./:-]*$/.test(value) &&
 	!/[A-Za-z0-9]{40,}|(?:^|\/)\.\.?(?:\/|$)/.test(value);
+const awsRegionIdentifier = (value: unknown): value is string => typeof value === "string" &&
+	/^[a-z]{2}(?:-[a-z]+)+-[0-9]+$/.test(value);
 const routeOptions = new Set(["max_output_tokens", "max_turns", "provider_timeout", "retries",
 	"temperature", "top_p", "seed", "max_context_tokens"]);
 const explicitRouteFields = new Set(["profile", "provider", "model", "reasoningEffort",
@@ -279,15 +305,23 @@ const explicitRouteFields = new Set(["profile", "provider", "model", "reasoningE
 const routeFailure = () => new Error("Native audit configuration preflight failed: invalid or unsupported metadata. No native worker/provider was started.");
 
 export function parseNativeRoute(value: unknown): NativeRoute {
+	const allowedFields = new Set(["version", "runtime", "provider", "model", "endpoint", "profile",
+		"reasoningEffort", "options", "selection", "reportIdentity",
+		...(isPlainRecord(value) && value.provider === "geap" ? ["project", "location"] : [])]);
 	if (!isPlainRecord(value) || value.version !== 2 ||
-		!hasOnlyFields(value, new Set(["version", "runtime", "provider", "model", "endpoint", "profile",
-			"reasoningEffort", "options", "selection", "reportIdentity"])) ||
+		!hasOnlyFields(value, allowedFields) ||
 		!isDeepStrictEqual(value.runtime, { swival: "1.9.3", litellm: "1.106.6" }) ||
 		!routeIdentifier(value.provider, 40) || !routeIdentifier(value.model) ||
 		!(value.profile === null || routeIdentifier(value.profile, 80)) ||
 		!(value.reasoningEffort === null || ["none", "minimal", "low", "medium", "high", "xhigh", "default"].includes(value.reasoningEffort)) ||
 		!isPlainRecord(value.options) || !isPlainRecord(value.selection) || !isPlainRecord(value.reportIdentity)) throw routeFailure();
-	if (value.endpoint !== null) {
+	if (value.provider === "geap") {
+		if (!routeIdentifier(value.project, 128) || !routeIdentifier(value.location, 64) ||
+			value.endpoint !== null || value.model.includes("/")) throw routeFailure();
+	}
+	if (value.provider === "bedrock") {
+		if (!awsRegionIdentifier(value.endpoint)) throw routeFailure();
+	} else if (value.endpoint !== null) {
 		if (typeof value.endpoint !== "string" || value.endpoint.length > 512 ||
 			!/^https?:\/\/[A-Za-z0-9.:[\]-]+(?::[0-9]+)?(?:\/[A-Za-z0-9_./-]*)?$/.test(value.endpoint) ||
 			/[A-Za-z0-9]{40,}/.test(value.endpoint)) throw routeFailure();
@@ -315,7 +349,8 @@ export function parseNativeRoute(value: unknown): NativeRoute {
 	return { version: 2, runtime: { swival: "1.9.3", litellm: "1.106.6" }, provider: value.provider,
 		model: value.model, endpoint: value.endpoint, profile: value.profile, reasoningEffort: value.reasoningEffort,
 		options, selection: { profileSource: selection.profileSource, explicitFields: [...selection.explicitFields] },
-		reportIdentity: { provider: value.reportIdentity.provider, model: value.reportIdentity.model } };
+		reportIdentity: { provider: value.reportIdentity.provider, model: value.reportIdentity.model },
+		...(value.provider === "geap" ? { project: value.project as string, location: value.location as string } : {}) };
 }
 
 const preflightReasons: Record<string, string> = {
@@ -338,7 +373,66 @@ const policyFields = new Set(["encrypt_secrets", "secret_shield", "llm_filter", 
 	"nono_profile", "nono_rollback", "nono_block_net", "nono_allow_domain", "nono_network_profile", "nono_credential", "nono_audit_integrity",
 	"web_search"]);
 
-export function parseNativePreflight(output: string, success: boolean): { route: NativeRoute; scope?: unknown } {
+/** Host-side credential bridge. The caller supplies a bounded trusted CLI runner.
+ * No route parsing, credential persistence, retries, or account fallback here.
+ */
+export async function bridgeNativeCredentials(
+	route: NativeRoute, awsProfile: string | undefined, input: NodeJS.ProcessEnv,
+	timeoutMs: number,
+	execute: (tool: "aws" | "gcloud", args: string[]) => Promise<string>,
+	now: () => number = Date.now,
+): Promise<{ bedrockExpirationMs?: number; vertexNotAfterSec?: number }> {
+	const unavailable = () => new Error("Native audit configuration preflight failed: Selected provider credential is unavailable; no fallback. No native worker/provider was started.");
+	const singleValue = (value: unknown): value is string => typeof value === "string" &&
+		value.length > 0 && value.length <= 16_384 && !/[\s\x00-\x1f\x7f]/.test(value);
+	delete input.PI_SWIVAL_AWS_PROFILE_MINTED;
+	if (route.provider === "bedrock") {
+		// Configured identity outranks ambient keys. Export the default chain only
+		// when there is no explicit profile and no complete env session.
+		if (awsProfile === undefined && input.AWS_ACCESS_KEY_ID && input.AWS_SECRET_ACCESS_KEY && input.AWS_SESSION_TOKEN) return {};
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(await execute("aws", ["configure", "export-credentials",
+				...(awsProfile ? ["--profile", awsProfile] : []), "--format", "process"]));
+		} catch { throw unavailable(); }
+		if (!isPlainRecord(parsed) || !singleValue(parsed.AccessKeyId) ||
+			!singleValue(parsed.SecretAccessKey) || !singleValue(parsed.SessionToken) ||
+			typeof parsed.Expiration !== "string") throw unavailable();
+		const expiration = Date.parse(parsed.Expiration);
+		if (!Number.isFinite(expiration) || expiration - now() < Math.max(timeoutMs, 300_000)) throw unavailable();
+		input.AWS_ACCESS_KEY_ID = parsed.AccessKeyId;
+		input.AWS_SECRET_ACCESS_KEY = parsed.SecretAccessKey;
+		input.AWS_SESSION_TOKEN = parsed.SessionToken;
+		if (awsProfile) input.PI_SWIVAL_AWS_PROFILE_MINTED = "1";
+		return { bedrockExpirationMs: expiration };
+	}
+	if (route.provider === "geap") {
+		if (!input.GOOGLE_OAUTH_ACCESS_TOKEN) {
+			try { input.GOOGLE_OAUTH_ACCESS_TOKEN = (await execute("gcloud", ["auth", "application-default", "print-access-token"])).trim(); }
+			catch { throw unavailable(); }
+		}
+		if (!singleValue(input.GOOGLE_OAUTH_ACCESS_TOKEN)) throw unavailable();
+		// gcloud may return a cached token; this is a local use limit, NOT a
+		// claim that the token actually has 55 minutes left. HTTP 401 also stops.
+		const notAfter = Math.min(Number(input.GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER ?? Infinity),
+			Math.floor(now() / 1000) + 3300);
+		if (!Number.isFinite(notAfter) || notAfter * 1000 <= now()) throw unavailable();
+		input.GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER = String(notAfter);
+		return { vertexNotAfterSec: notAfter };
+	}
+	return {};
+}
+
+export function assertNativeCredentialLifetime(
+	deadline: { bedrockExpirationMs?: number; vertexNotAfterSec?: number }, timeoutMs: number, now = Date.now(),
+): void {
+	if ((deadline.bedrockExpirationMs !== undefined && deadline.bedrockExpirationMs - now < Math.max(timeoutMs, 300_000)) ||
+		(deadline.vertexNotAfterSec !== undefined && deadline.vertexNotAfterSec * 1000 <= now)) {
+		throw new Error("Native audit configuration preflight failed: Selected provider credential is unavailable; no fallback. No native worker/provider was started.");
+	}
+}
+
+export function parseNativePreflight(output: string, success: boolean): { route: NativeRoute; scope?: unknown; awsProfile?: string } {
 	let value: unknown;
 	try { value = JSON.parse(output); } catch { throw routeFailure(); }
 	if (isPlainRecord(value) && value.ok === false && hasOnlyFields(value, new Set(["ok", "reason", "field"]))) {
@@ -350,12 +444,17 @@ export function parseNativePreflight(output: string, success: boolean): { route:
 		throw routeFailure();
 	}
 	if (!success || !isPlainRecord(value)) throw routeFailure();
-	const { scope, ...route } = value;
-	return { route: parseNativeRoute(route), ...(scope === undefined ? {} : { scope }) };
+	const { scope, awsProfile, ...route } = value;
+	if (awsProfile !== undefined && (!routeIdentifier(awsProfile, 80) || route.provider !== "bedrock")) throw routeFailure();
+	return {
+		route: parseNativeRoute(route),
+		...(scope === undefined ? {} : { scope }),
+		...(awsProfile === undefined ? {} : { awsProfile }),
+	};
 }
 
 function nativePreflight(executable: string, cwd: string, request: string, env: NodeJS.ProcessEnv) {
-	return new Promise<{ route: NativeRoute; scope?: unknown }>((resolve, reject) => {
+	return new Promise<{ route: NativeRoute; scope?: unknown; awsProfile?: string }>((resolve, reject) => {
 		const child = execFile(executable, ["-I", "-B", path.join(scriptRoot, "native_audit.py"), "--preflight"],
 			{ cwd, env, timeout: 10_000, maxBuffer: 64 * 1024, encoding: "utf8", shell: false }, (error, stdout) => {
 				try { resolve(parseNativePreflight(stdout, !error)); } catch (failure) { reject(failure); }
@@ -771,20 +870,97 @@ export async function prepareNativeAudit(
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 	}
-	const preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
+	let preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	const routing: Record<string, unknown> = {};
 	for (const field of NATIVE_FIELDS) {
 		if (field.endsWith("Override") && params[field] !== undefined) routing[field.slice(0, -8)] = params[field];
 	}
-	const request: Record<string, any> = { source: identity.sourceRoot, routing, audit };
+	const request: Record<string, any> = { source: identity.sourceRoot, routing, audit, deferCredentials: true };
 	const preflight = async () => {
 		await assertRuntimePaths();
 		return nativePreflight(python, identity.sourceRoot, JSON.stringify(request), preflightEnv);
 	};
-	const { route } = await preflight();
+	const { route, awsProfile } = await preflight();
+	delete request.deferCredentials;
 	checkCancelled();
+	const resolveTrustedCliTool = async (name: string): Promise<string> => {
+		for (const dir of (trustedGit.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+			const candidate = path.join(dir, name);
+			try {
+				await assertTrustedRuntimePath(candidate, protectedRoots);
+				const resolved = await fs.realpath(candidate);
+				await fs.access(resolved, fsSync.constants.X_OK);
+				if ((await fs.stat(resolved)).isFile()) return resolved;
+			} catch { /* continue */ }
+		}
+		throw new Error("Native audit configuration preflight failed: Selected provider credential is unavailable; no fallback. No native worker/provider was started.");
+	};
+	// Host credential CLIs run outside AgentFS, load HOME-derived configuration
+	// that can select credential_process or external-account executables, and
+	// read or write caches anywhere beneath their state root. Refuse a state root
+	// that aliases, contains, or holds any symlink or directory aliasing source or
+	// Git, then bind the validated locations for the host call only; the native
+	// worker still receives the disabled SDK paths.
+	const resolveTrustedCredentialState = async (tool: "aws" | "gcloud"): Promise<NodeJS.ProcessEnv> => {
+		const stateRoot = tool === "aws" ? path.join(input.HOME!, ".aws") : path.join(input.HOME!, ".config", "gcloud");
+		const bindings: NodeJS.ProcessEnv = tool === "aws"
+			? { AWS_CONFIG_FILE: path.join(stateRoot, "config"), AWS_SHARED_CREDENTIALS_FILE: path.join(stateRoot, "credentials") }
+			: { CLOUDSDK_CONFIG: stateRoot, CLOUDSDK_CORE_DISABLE_FILE_LOGGING: "1" };
+		const refusal = () => new Error("Native audit refuses repository-owned runtime paths.");
+		/** Check every symlink hop and the resolved target; return the target when it exists. */
+		const assertTrustedState = async (location: string): Promise<string | undefined> => {
+			try {
+				await assertTrustedRuntimePath(location, protectedRoots);
+				const target = await fs.realpath(location);
+				for (const root of protectedRoots) if (await pathIsWithin(root, target)) throw refusal();
+				return target;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+				return undefined;
+			}
+		};
+		const realStateRoot = await assertTrustedState(stateRoot);
+		if (!realStateRoot || !(await fs.stat(realStateRoot)).isDirectory()) return bindings;
+		const identities = await Promise.all(protectedRoots.map((root) => fs.stat(root)));
+		let budget = 65_536;
+		// Every subtree is inspected uniformly, including gcloud `logs`: file logging
+		// is disabled, but gcloud still prunes dated log directories beneath it and a
+		// `configurations -> logs` alias makes it configuration input. Directory
+		// symlinks (Stow, chezmoi, dotfiles) are followed so their descendants are
+		// inspected too; visited identities keep symlink cycles from looping or
+		// exhausting the shared entry budget.
+		const visited = new Set<string>();
+		const walk = async (directory: string): Promise<void> => {
+			const dirStat = await fs.stat(directory);
+			if (identities.some((root) => dirStat.dev === root.dev && dirStat.ino === root.ino)) throw refusal();
+			const identity = `${dirStat.dev}:${dirStat.ino}`;
+			if (visited.has(identity)) return;
+			visited.add(identity);
+			for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+				if (--budget < 0) throw new Error("Native audit credential state exceeds the verifiable entry limit.");
+				const location = path.join(directory, entry.name);
+				if (entry.isSymbolicLink()) {
+					const target = await assertTrustedState(location);
+					if (target && (await fs.stat(target)).isDirectory()) await walk(target);
+				} else if (entry.isDirectory()) await walk(location);
+			}
+		};
+		await walk(realStateRoot);
+		return bindings;
+	};
+	let credentialStateRefusal: unknown;
+	const credentialDeadline = await bridgeNativeCredentials(route, awsProfile, input, Number(timeoutMs), async (tool, argv) => {
+		// Inspect host credential state only when the host CLI actually runs. The
+		// bridge reports every callback failure as unavailable, so surface a refusal.
+		const credentialState = await resolveTrustedCredentialState(tool).catch((error: unknown) => { credentialStateRefusal = error; throw error; });
+		const executable = await resolveTrustedCliTool(tool);
+		return (await boundedExec(executable, argv, input.HOME!, undefined,
+			{ ...nativeEnvironment(input, trustedGit.env.PATH!), ...credentialState, AWS_PAGER: "", AWS_EC2_METADATA_DISABLED: "true", CLOUDSDK_CORE_DISABLE_PROMPTS: "1" },
+			10_000, 16_384)).toString("utf8");
+	}).catch((error: unknown) => { throw credentialStateRefusal ?? error; });
+	preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	let anthropicShimDir: string | undefined;
-	if (route.provider === "anthropic") {
+	if (route.provider === "anthropic" || route.provider === "bedrock" || route.provider === "geap") {
 		anthropicShimDir = await canonicalRuntimePath(path.join(scriptRoot, "anthropic_oauth_shim"));
 		await assertTrustedRuntimePath(anthropicShimDir, protectedRoots);
 		await assertTrustedRuntimePath(path.join(anthropicShimDir, "sitecustomize.py"), protectedRoots);
@@ -824,13 +1000,21 @@ export async function prepareNativeAudit(
 		await fs.mkdir(sandboxCwd, { mode: 0o700 });
 		const manifest = await createCommittedSnapshot(cwd, snapshot, trustedGit);
 		request.snapshot = snapshot;
-		const { scope, route: secondRoute } = await preflight();
-		if (!isDeepStrictEqual(route, secondRoute)) throw new Error("Native route changed during preparation. No fallback.");
+		const { scope, route: secondRoute, awsProfile: secondAwsProfile } = await preflight();
+		if (!isDeepStrictEqual(route, secondRoute) || awsProfile !== secondAwsProfile) throw new Error("Native route changed during preparation. No fallback.");
 		if (!isPlainRecord(scope) || !scope.mandatory_files?.length) throw new Error("No auditable committed files in scope.");
 		checkCancelled();
 		const config = path.join(runDir, "config");
 		await fs.mkdir(path.join(config, "swival"), { recursive: true, mode: 0o700 });
 		await fs.writeFile(path.join(config, "swival", "config.toml"), "# Inert native configuration.\n", { mode: 0o600 });
+		if (route.provider === "geap") {
+			const gcloudEmpty = path.join(config, "gcloud-empty");
+			await fs.mkdir(gcloudEmpty, { mode: 0o700 });
+			env.CLOUDSDK_CONFIG = gcloudEmpty;
+			const adcDisabled = path.join(gcloudEmpty, "adc-disabled.json");
+			await fs.writeFile(adcDisabled, "{}\n", { mode: 0o600 });
+			env.GOOGLE_APPLICATION_CREDENTIALS = adcDisabled;
+		}
 		// Upstream checks the operator's installed nono profile. Do not copy it,
 		// replace its policy, or claim authenticity from an availability check.
 		await fs.symlink(runtimePaths.nonoRoot, path.join(config, "nono"));
@@ -847,6 +1031,7 @@ export async function prepareNativeAudit(
 		await fs.writeFile(path.join(runDir, "run-meta.json"), JSON.stringify(meta), { mode: 0o600 });
 		checkCancelled();
 		await assertRuntimePaths();
+		assertNativeCredentialLifetime(credentialDeadline, Number(timeoutMs));
 		// No asynchronous work may separate this final check from spawn.
 		checkCancelled();
 	} catch (error) {
@@ -871,6 +1056,9 @@ export async function prepareNativeAudit(
 		// LiteLLM 1.106.6 prints this fixed header before its device-code challenge.
 		if (line.trim() === "Sign in with ChatGPT using device code:") {
 			cancel("Native ChatGPT login is required. Authenticate with upstream Swival outside Pi, then rerun the audit.");
+		}
+		if (line.trim() === "PI_SWIVAL_CREDENTIAL_EXPIRED") {
+			cancel("CREDENTIAL_EXPIRED: short-lived provider credential expired during native audit; no fallback.");
 		}
 		if (line.includes("Failed to write ChatGPT auth file")) {
 			diagnostics.authPersistenceFailure = true;

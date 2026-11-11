@@ -152,8 +152,8 @@ describe("swival SKILL.md preserves package mechanics", () => {
 		}
 	});
 
-	it("covers all five bundled agents", () => {
-		expect(bundledAgentNames()).toHaveLength(5);
+	it("covers all six bundled agents", () => {
+		expect(bundledAgentNames()).toHaveLength(6);
 	});
 
 	it("stays under 500 lines", () => {

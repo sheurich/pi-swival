@@ -6,9 +6,9 @@ import { configDefaults, defineConfig } from "vitest/config";
 // `./node_modules/`. No aliases are needed once those symlinks exist.
 export default defineConfig({
 	test: {
-		include: process.env.NATIVE_AGENTFS_INTEGRATION === "1" ? ["nativeAgentfs.test.ts"] : ["**/*.test.ts"],
+		include: process.env.NATIVE_AGENTFS_INTEGRATION === "1" ? ["nativeAgentfs.test.ts", "asyncEvidenceAgentfs.test.ts"] : ["**/*.test.ts"],
 		exclude: [...configDefaults.exclude, "**/.scratch/**",
-			...(process.env.NATIVE_AGENTFS_INTEGRATION === "1" ? [] : ["**/nativeAgentfs.test.ts"])],
+			...(process.env.NATIVE_AGENTFS_INTEGRATION === "1" ? [] : ["**/nativeAgentfs.test.ts", "**/asyncEvidenceAgentfs.test.ts"])],
 		environment: "node",
 		watch: false,
 		testTimeout: 5000,

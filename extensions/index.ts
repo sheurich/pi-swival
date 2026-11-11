@@ -27,11 +27,12 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonicalFuturePath } from "./paths.js";
+import { canonicalFuturePath, walkCanonicalPathSync } from "./paths.js";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { StringEnum as PiStringEnum } from "@earendil-works/pi-ai";
 import { type ExtensionAPI, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -90,6 +91,13 @@ const ASYNC_RUNNER_PATH = path.resolve(
 	"../scripts/async-runner.cjs",
 );
 
+// Shared with the plain-Node detached runner; no runtime TypeScript loader.
+type AsyncScratch = { path: string; dev: number; ino: number };
+const asyncEvidence = createRequire(import.meta.url)("../scripts/async-evidence.cjs") as {
+	createScratch(): AsyncScratch;
+	cleanupScratch(scratch: AsyncScratch): string | undefined;
+};
+
 // ------------------------------------------------- async run tracking --
 
 /**
@@ -116,9 +124,12 @@ export interface RunMeta {
 	/** Whether this run effectively requested Nono. */
 	nonoRequested?: boolean;
 	nativeAuditRequested?: boolean;
+	effectiveProviderTimeout?: EffectiveProviderTimeout;
 }
 
 interface AsyncRunEntry {
+	/** Live cleanup lease only; never persisted or accepted from control callers. */
+	scratch?: AsyncScratch;
 	meta: RunMeta;
 	proc: ChildProcess;
 	exited: boolean;
@@ -521,7 +532,9 @@ function readSafeRegularText(
 	if (typeof fs.constants.O_NOFOLLOW !== "number") return undefined;
 	let fd: number | undefined;
 	try {
-		const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+		// O_NONBLOCK: opening a FIFO read-only would otherwise block the event
+		// loop until a writer connects, before fstat can reject it.
+		const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | (fs.constants.O_NONBLOCK ?? 0);
 		fd = fs.openSync(filePath, flags);
 		const stat = fs.fstatSync(fd);
 		if (!stat.isFile() || stat.nlink !== 1 || stat.size <= 0 || stat.size > maxBytes) {
@@ -1022,11 +1035,74 @@ export function resolveSwivalChildEnv(
 				nextEnv.PYTHONPATH = reordered.join(path.delimiter);
 				changed = true;
 			}
+			if (baseEnv.PYTHONDONTWRITEBYTECODE !== "1") {
+				nextEnv.PYTHONDONTWRITEBYTECODE = "1";
+				changed = true;
+			}
+			if (baseEnv.LITELLM_LOCAL_MODEL_COST_MAP !== "True") {
+				nextEnv.LITELLM_LOCAL_MODEL_COST_MAP = "True";
+				changed = true;
+			}
 		}
 		return changed ? nextEnv : undefined;
 	}
 
 	return undefined;
+}
+
+/** Only AgentFS needs an OS write grant for host-exported evidence. */
+export function resolveSwivalEvidenceEnv(
+	args: readonly string[], evidenceDir: string, baseEnv: NodeJS.ProcessEnv,
+	homeDir: string, runCwd: string,
+): NodeJS.ProcessEnv | undefined {
+	let sandbox = lastCliOptionValue(args, "--sandbox"), network = lastCliOptionValue(args, "--network");
+	const baseDir = path.resolve(runCwd, lastCliOptionValue(args, "--base-dir") ?? runCwd);
+	const configDir = baseEnv.XDG_CONFIG_HOME || path.join(homeDir, ".config");
+	for (const file of [path.join(baseDir, "swival.toml"), path.join(configDir, "swival", "config.toml")]) {
+		if (sandbox !== undefined && network !== undefined) break;
+		let raw: string | undefined;
+		try {
+			const resolved = fs.realpathSync(file), stat = fs.lstatSync(resolved);
+			raw = stat.isFile() && stat.size === 0 ? "" : readSafeRegularText(resolved, 128 * 1024, false);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			return undefined;
+		}
+		if (raw === undefined) return undefined;
+		const root = raw.split(/(?:^|\n)\s*\[/, 1)[0];
+		const configuredSandbox = sandbox === undefined ? parseUniqueTomlString(root, "sandbox") : sandbox;
+		const configuredNetwork = network === undefined ? parseUniqueTomlString(root, "network") : network;
+		if (configuredSandbox === null || configuredNetwork === null) return undefined;
+		sandbox = configuredSandbox;
+		network = configuredNetwork;
+	}
+	if (sandbox !== "agentfs" || network === "none") return undefined;
+	const entries = (baseEnv.PYTHONPATH ?? "").split(path.delimiter).filter((entry) => entry && entry !== ANTHROPIC_OAUTH_SHIM_DIR);
+	return { ...baseEnv, PI_SWIVAL_EVIDENCE_DIR: evidenceDir, PYTHONDONTWRITEBYTECODE: "1",
+		PYTHONPATH: [ANTHROPIC_OAUTH_SHIM_DIR, ...entries].join(path.delimiter) };
+}
+
+/** Swival 1.9.3 does not pass add-dir-ro to the nono re-exec read grants.
+ * Require explicit safe sandbox intent rather than silently overriding config.
+ * With an explicit sandbox, inherited network=none is rejected upstream before
+ * re-exec; explicit network=none is rejected here as well. */
+function assertSwivalReviewCompatibility(args: readonly string[], disabled: boolean): void {
+	if (!disabled || hasCliFlag(args, "--self-review")) return;
+	const sandbox = lastCliOptionValue(args, "--sandbox");
+	if ((sandbox !== "builtin" && sandbox !== "agentfs") || lastCliOptionValue(args, "--network") === "none") {
+		throw new SwivalArgumentError("Explicit selfReview false requires an explicit sandbox builtin or agentfs and is incompatible with network none. Nono and inherited/unspecified sandbox selection are unsupported; addDirRo cannot grant nono startup-shim access. No silent fallback.");
+	}
+}
+
+/** Swival 1.9.3 has no negative self-review CLI flag. Suppress inherited
+ * self-review only for an explicit false; preserve external reviewer gates. */
+export function resolveSwivalReviewEnv(args: readonly string[], disabled: boolean, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv | undefined {
+	assertSwivalReviewCompatibility(args, disabled);
+	if (!disabled || hasCliFlag(args, "--self-review")) return undefined;
+	const entries = (baseEnv.PYTHONPATH ?? "").split(path.delimiter).filter((entry) => entry && entry !== ANTHROPIC_OAUTH_SHIM_DIR);
+	return { ...baseEnv, PYTHONPATH: [ANTHROPIC_OAUTH_SHIM_DIR, ...entries].join(path.delimiter),
+		PYTHONDONTWRITEBYTECODE: "1", LITELLM_LOCAL_MODEL_COST_MAP: "True",
+		PI_SWIVAL_SHIM_REQUIRED: "1", PI_SWIVAL_NO_SELF_REVIEW: "1" };
 }
 
 /**
@@ -1067,8 +1143,9 @@ export const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
 export function isMutatingCwdAgent(
 	agent: SwivalAgentConfig,
 	overrides: SwivalOverrides = {},
+	runCwd?: string,
 ): boolean {
-	const args = buildSwivalArgs(agent, "", undefined, overrides);
+	const args = buildSwivalArgs(agent, "", runCwd, overrides);
 	const files = lastCliOptionValue(args, "--files");
 	const commands = lastCliOptionValue(args, "--commands");
 	const fileWritesDisabled = files === "none";
@@ -1136,11 +1213,12 @@ class SwivalArgumentError extends Error {
 export function checkRequiresReviewer(
 	agent: SwivalAgentConfig,
 	overrides: SwivalOverrides,
+	runCwd?: string,
 ): string | undefined {
 	if (!agent.requiresReviewer) return undefined;
 	let args: string[];
 	try {
-		args = buildSwivalArgs(agent, "", undefined, overrides);
+		args = buildSwivalArgs(agent, "", runCwd, overrides);
 	} catch (err) {
 		if (err instanceof SwivalArgumentError) return err.message;
 		throw err;
@@ -1192,6 +1270,8 @@ export interface SwivalOverrides {
 	a2aConfig?: string;
 	providerTimeout?: number;
 	initialToolChoice?: "auto" | "required";
+	addDir?: string[];
+	addDirRo?: string[];
 	installedSwivalVersion?: string;
 }
 
@@ -1350,8 +1430,66 @@ export function buildSwivalArgs(
 	}
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);
-	for (const d of agent.addDir ?? []) args.push("--add-dir", d);
-	for (const d of agent.addDirRo ?? []) args.push("--add-dir-ro", d);
+	if (agent.source === "project" && (overrides.addDir !== undefined || overrides.addDirRo !== undefined)) {
+		throw new SwivalArgumentError(
+			`Project-scope agent "${agent.name}" cannot use addDirOverride or addDirRoOverride.`,
+		);
+	}
+	const effectiveAddDir = overrides.addDir ?? agent.addDir ?? [];
+	const effectiveAddDirRo = overrides.addDirRo ?? agent.addDirRo ?? [];
+	// Frontmatter entries are emitted verbatim; override entries are emitted as
+	// the canonical path that passed the protected-root check, so Swival cannot
+	// resolve the grant differently than it was validated.
+	const validateAddDirEntries = (entries: readonly string[], flagName: string, checkProtectedRoots: boolean): string[] => {
+		const homeDir = os.homedir();
+		const realHome = fs.existsSync(homeDir) ? fs.realpathSync.native(homeDir) : path.resolve(homeDir);
+		// Protect each home entry under both its own spelling and its resolved
+		// target, so a symlinked or dangling ~/.aws is refused either way.
+		const protectedHomeSubs = [".ssh", ".gnupg", ".aws", ".config", ".pi", ".agentfs"].flatMap((sub) => {
+			const lexical = path.join(realHome, sub);
+			try { return [lexical, walkCanonicalPathSync(lexical)]; } catch { return [lexical]; }
+		});
+		const baseCwd = cwd === undefined ? process.cwd() : path.isAbsolute(cwd) ? cwd : `${process.cwd()}${path.sep}${cwd}`;
+		// Default filesystems on these platforms are case-insensitive.
+		const fold = (p: string) => (process.platform === "darwin" || process.platform === "win32" ? p.toLowerCase() : p);
+		const emitted: string[] = [];
+		for (const entry of entries) {
+			if (typeof entry !== "string" || entry.trim() === "" || /[\x00-\x1f\x7f]/.test(entry) || entry.trim().startsWith("-")) {
+				throw new SwivalArgumentError(`Invalid ${flagName} path "${entry}".`);
+			}
+			if (!checkProtectedRoots) {
+				emitted.push(entry);
+				continue;
+			}
+			// Join without normalizing so symlinks resolve before any `..` applies.
+			const expanded = expandTildePath(entry, homeDir);
+			let canonical: string;
+			try {
+				canonical = walkCanonicalPathSync(path.isAbsolute(expanded) ? expanded : `${baseCwd}${path.sep}${expanded}`);
+			} catch (error) {
+				throw new SwivalArgumentError(`Cannot resolve ${flagName} path "${entry}": ${(error as Error).message}`);
+			}
+			const folded = fold(canonical);
+			if (canonical === path.parse(canonical).root || folded === fold(realHome)) {
+				throw new SwivalArgumentError(`Refusing ${flagName} grant to protected root "${entry}".`);
+			}
+			for (const protectedRoot of protectedHomeSubs.map(fold)) {
+				if (
+					folded === protectedRoot ||
+					folded.startsWith(protectedRoot + path.sep) ||
+					protectedRoot.startsWith(folded + path.sep)
+				) {
+					throw new SwivalArgumentError(`Refusing ${flagName} grant overlapping protected directory "${entry}".`);
+				}
+			}
+			emitted.push(canonical);
+		}
+		return emitted;
+	};
+	const emittedAddDir = validateAddDirEntries(effectiveAddDir, "--add-dir", overrides.addDir !== undefined);
+	const emittedAddDirRo = validateAddDirEntries(effectiveAddDirRo, "--add-dir-ro", overrides.addDirRo !== undefined);
+	for (const d of emittedAddDir) args.push("--add-dir", d);
+	for (const d of emittedAddDirRo) args.push("--add-dir-ro", d);
 	const effectiveFilesMode = lastCliOptionValue(agent.extraArgs ?? [], "--files") ?? agent.files;
 	if (agent.source !== "project" && effectiveFilesMode !== "none") {
 		const configuredBaseDir = lastCliOptionValue(agent.extraArgs ?? [], "--base-dir") ?? agent.baseDir ?? cwd;
@@ -1362,14 +1500,14 @@ export function buildSwivalArgs(
 		if (linkedCommonGitDir) {
 			const extraAddDirs = allCliOptionValues(agent.extraArgs ?? [], "--add-dir");
 			const extraAddDirsRo = allCliOptionValues(agent.extraArgs ?? [], "--add-dir-ro");
-			const hasCliAddDirRo = (agent.addDirRo?.length ?? 0) > 0 || extraAddDirsRo.length > 0;
+			const hasCliAddDirRo = effectiveAddDirRo.length > 0 || extraAddDirsRo.length > 0;
 			const inheritedConfigRo = hasCliAddDirRo
 				? []
 				: readConfiguredAllowedDirsRo(baseDirCandidate);
 			const existingCanonical = [
-				...(agent.addDir ?? []),
+				...emittedAddDir,
 				...extraAddDirs,
-				...(agent.addDirRo ?? []),
+				...emittedAddDirRo,
 				...extraAddDirsRo,
 				...inheritedConfigRo,
 			].map((d) => canonicalPathOrResolved(d, cwd));
@@ -1432,6 +1570,8 @@ export function buildSwivalArgs(
 	if (hasCliFlag(args, "--self-review") && lastCliOptionValue(args, "--reviewer")?.trim()) {
 		throw new SwivalArgumentError("--self-review and --reviewer are mutually exclusive.");
 	}
+	// All dispatch modes preflight this builder before allocating run resources.
+	assertSwivalReviewCompatibility(args, selfReview === false);
 	return args;
 }
 
@@ -1863,6 +2003,125 @@ async function readReport(reportPath: string): Promise<ReportSummary | undefined
 
 // ---------------------------------------------------- error classify --
 
+export interface EffectiveProviderTimeout {
+	seconds: number | null;
+	source: string;
+}
+
+function parseUniqueTomlPositiveInt(sectionText: string, key: string): number | null | undefined {
+	if (/^\s*["']/m.test(sectionText)) return null;
+	const anyKeyRe = new RegExp(`^\\s*${key}\\s*=`, "gm");
+	const matches = sectionText.match(anyKeyRe);
+	if (!matches || matches.length === 0) return undefined;
+	if (matches.length > 1) return null;
+	const strictRe = new RegExp(`^\\s*${key}\\s*=\\s*([0-9]+)\\s*(?:#.*)?$`, "m");
+	const m = strictRe.exec(sectionText);
+	if (!m) return null;
+	const n = Number(m[1]);
+	return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+export function resolveEffectiveProviderTimeout(options: {
+	agent?: Pick<SwivalAgentConfig, "providerTimeout" | "baseDir" | "extraArgs" | "profile">;
+	overrides?: Pick<SwivalOverrides, "providerTimeout" | "profile">;
+	args?: readonly string[];
+	runCwd?: string;
+	homeDir?: string;
+	env?: NodeJS.ProcessEnv;
+	report?: Pick<ReportSummary, "providerTimeout">;
+} = {}): EffectiveProviderTimeout {
+	const { agent, overrides, args, runCwd, homeDir = os.homedir(), env = process.env, report } = options;
+	const extraVal = lastCliOptionValue(agent?.extraArgs ?? [], "--provider-timeout");
+	if (extraVal !== undefined) {
+		const n = Number(extraVal);
+		if (Number.isFinite(n) && n > 0) return { seconds: n, source: "agent extraArgs" };
+	}
+	if (typeof overrides?.providerTimeout === "number" && Number.isFinite(overrides.providerTimeout) && overrides.providerTimeout > 0) {
+		return { seconds: overrides.providerTimeout, source: "providerTimeoutOverride" };
+	}
+	if (typeof agent?.providerTimeout === "number" && Number.isFinite(agent.providerTimeout) && agent.providerTimeout > 0) {
+		return { seconds: agent.providerTimeout, source: "agent frontmatter" };
+	}
+	if (args) {
+		const cliVal = lastCliOptionValue(args, "--provider-timeout");
+		if (cliVal !== undefined) {
+			const n = Number(cliVal);
+			if (Number.isFinite(n) && n > 0) return { seconds: n, source: "cli" };
+		}
+	}
+	if (typeof report?.providerTimeout === "number" && Number.isFinite(report.providerTimeout) && report.providerTimeout > 0) {
+		return { seconds: report.providerTimeout, source: "report.settings" };
+	}
+	const configuredBaseDir = (args ? lastCliOptionValue(args, "--base-dir") : undefined) ?? agent?.baseDir ?? runCwd;
+	const effectiveBaseDir = configuredBaseDir
+		? (runCwd ? path.resolve(runCwd, configuredBaseDir) : path.resolve(configuredBaseDir))
+		: undefined;
+	// Diagnostics only: recognize the same conservative TOML subset as the
+	// credential bridge. Never claim a default for a file we cannot interpret.
+	const unknown = { seconds: null, source: "unresolved configuration" };
+	const xdg = env.XDG_CONFIG_HOME?.trim();
+	const globalDir = xdg ? path.join(xdg, "swival") : path.join(homeDir, ".config", "swival");
+	const files = [
+		{ file: path.join(globalDir, "config.toml"), source: "config.toml" },
+		...(effectiveBaseDir ? [{ file: path.join(effectiveBaseDir, "swival.toml"), source: "swival.toml" }] : []),
+	];
+	let timeout: EffectiveProviderTimeout = { seconds: 900, source: "default" };
+	let selectedProfile = (args ? lastCliOptionValue(args, "--profile") : undefined) ?? overrides?.profile ?? agent?.profile;
+	const sections: { raw: string; source: string }[] = [];
+	for (const { file, source } of files) {
+		if (!fs.existsSync(file)) continue;
+		const raw = readSafeRegularText(file, 128 * 1024, false);
+		if (raw === undefined) return unknown;
+		const firstTable = /(?:^|\n)\s*\[/.exec(raw);
+		const root = firstTable ? raw.slice(0, firstTable.index) : raw;
+		const value = parseUniqueTomlPositiveInt(root, "provider_timeout");
+		const active = parseUniqueTomlString(root, "active_profile");
+		if (value === null || active === null) return unknown;
+		if (value !== undefined) timeout = { seconds: value, source };
+		if (!(args ? lastCliOptionValue(args, "--profile") : undefined) && !overrides?.profile && !agent?.profile && active) selectedProfile = active;
+		sections.push({ raw, source });
+	}
+	if (selectedProfile) {
+		let found = false;
+		for (const { raw, source } of sections) {
+			const section = extractTomlProfileSection(raw, selectedProfile);
+			if (section === undefined) continue;
+			if (!section) return unknown;
+			found = true;
+			const value = parseUniqueTomlPositiveInt(section, "provider_timeout");
+			if (value === null) return unknown;
+			if (value !== undefined) timeout = { seconds: value, source: `${source} selected profile` };
+		}
+		if (!found) return unknown;
+	}
+	return timeout;
+}
+
+export function parseEffectiveProviderTimeout(value: unknown): EffectiveProviderTimeout | undefined {
+	const sources = new Set(["agent extraArgs", "providerTimeoutOverride", "agent frontmatter", "cli", "report.settings",
+		"swival.toml", "config.toml", "swival.toml selected profile", "config.toml selected profile", "default", "unresolved configuration"]);
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const v = value as Record<string, unknown>;
+	if (Object.keys(v).length !== 2 || typeof v.source !== "string" || !sources.has(v.source) ||
+		!(v.seconds === null || typeof v.seconds === "number" && Number.isFinite(v.seconds) && v.seconds > 0)) return undefined;
+	return { seconds: v.seconds as number | null, source: v.source };
+}
+
+function terminalProviderTimeout(report?: ReportSummary, hint?: EffectiveProviderTimeout): EffectiveProviderTimeout {
+	const parsed = parseEffectiveProviderTimeout(hint);
+	if (typeof report?.providerTimeout === "number" && Number.isFinite(report.providerTimeout) && report.providerTimeout > 0) {
+		return parsed?.seconds === report.providerTimeout ? parsed : { seconds: report.providerTimeout, source: "report.settings" };
+	}
+	return parsed ?? { seconds: null, source: "unresolved configuration" };
+}
+
+function appendProviderTimeoutHint(message: string, timeoutHint: EffectiveProviderTimeout): string {
+	const value = timeoutHint.seconds === null ? "unresolved" : `${timeoutHint.seconds}s`;
+	const remedy = timeoutHint.source === "agent extraArgs" ? "raise the agent extraArgs --provider-timeout (it outranks providerTimeoutOverride)" : "raise `providerTimeoutOverride`";
+	const suffix = `(effective provider timeout ${value} (${timeoutHint.source}); ${remedy})`;
+	return message.includes("effective provider timeout") ? message : `${message} ${suffix}`;
+}
+
 /**
  * Map a noisy stderr tail (plus the report summary, if any) onto a short,
  * human-friendly error headline. Pi surfaces `errorMessage` in the failure
@@ -1889,6 +2148,7 @@ async function readReport(reportPath: string): Promise<ReportSummary | undefined
 export function classifyFailure(
 	stderrLines: readonly string[],
 	report?: ReportSummary,
+	timeoutHint?: EffectiveProviderTimeout,
 ): FailureReason | undefined {
 	if (report?.outcome === "exhausted") {
 		return {
@@ -1920,6 +2180,10 @@ export function classifyFailure(
 	// back to the raw message when we don't have a specific pattern.
 	const reportMsg = report?.errorMessage?.trim();
 	if (reportMsg) {
+		if (/\blitellm\.Timeout\b|\bAPITimeoutError\b|Connection timed out after/i.test(reportMsg)) {
+			const eff = terminalProviderTimeout(report, timeoutHint);
+			return { code: "unknown", text: appendProviderTimeoutHint(reportMsg, eff) };
+		}
 		if (/context window exceeded|contextoverflow/i.test(reportMsg))
 			return { code: "context_overflow", text: `Context window exceeded — ${reportMsg}` };
 		if (/instruction.*(?:too large|fit this setup|read limit)|instructionloaderror/i.test(reportMsg))
@@ -1937,6 +2201,11 @@ export function classifyFailure(
 
 	const tail = stderrLines.slice(-50).join("\n");
 	const L = tail.toLowerCase();
+	const lastStderrLine = tail.split("\n").map((l) => l.trim()).filter(Boolean).slice(-1)[0] ?? "";
+	if (/\blitellm\.Timeout\b|\bAPITimeoutError\b|Connection timed out after/i.test(lastStderrLine)) {
+		const eff = terminalProviderTimeout(report, timeoutHint);
+		return { code: "unknown", text: appendProviderTimeoutHint(lastStderrLine, eff) };
+	}
 
 	if (/interrupted\.|keyboardinterrupt/i.test(tail))
 		return { code: "non_zero_exit", text: "Swival execution was interrupted (SIGINT / exit 130)." };
@@ -2022,6 +2291,7 @@ export function terminalFailureReason(
 	report: ReportSummary | undefined,
 	stderrLines: readonly string[],
 	existingReason?: FailureReason,
+	timeoutHint?: EffectiveProviderTimeout,
 ): FailureReason | undefined {
 	if (!isRunFailure({ exitCode, report })) return undefined;
 	if (existingReason) return existingReason;
@@ -2031,7 +2301,7 @@ export function terminalFailureReason(
 			text: "Swival execution was interrupted (exit 130).",
 		};
 	}
-	const classified = classifyFailure(stderrLines, report);
+	const classified = classifyFailure(stderrLines, report, timeoutHint);
 	if (classified) return classified;
 	if (!report || report.outcome === "unknown") {
 		return {
@@ -2673,6 +2943,7 @@ export async function findRunMeta(runId: string, artifactRoot: string = ARTIFACT
 				!(parsed.pid == null || typeof parsed.pid === "number") ||
 				("agentFsRequested" in parsed && typeof parsed.agentFsRequested !== "boolean") ||
 				("nonoRequested" in parsed && typeof parsed.nonoRequested !== "boolean") ||
+				("effectiveProviderTimeout" in parsed && !parseEffectiveProviderTimeout(parsed.effectiveProviderTimeout)) ||
 				!validPersistedAsyncOwner(parsed)
 			) continue;
 
@@ -2746,11 +3017,10 @@ async function loadRunState(
 	const meta = await findRunMeta(runId, artifactRoot);
 	if (!meta || meta.nativeAuditRequested || await isNativeArtifact(meta.artifactDir)) return undefined;
 
-	let completed: CompletedMarker | undefined;
-	try {
-		const txt = await fs.promises.readFile(path.join(meta.artifactDir, "completed.json"), "utf-8");
-		completed = JSON.parse(txt) as CompletedMarker;
-	} catch { /* not yet written or missing */ }
+	// Only a valid terminal marker proves exit; a missing or malformed marker
+	// leaves the recovered run `unknown` (same rule as observeAsyncRun).
+	const marker = parseCompletedMarker(meta, await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024));
+	const completed: CompletedMarker | undefined = marker ? { exitCode: marker.exitCode, exitedAt: marker.exitedAt } : undefined;
 
 	let spawnError: string | undefined;
 	try {
@@ -2780,6 +3050,7 @@ async function inspectCompletedAsyncRun(state: RunStateInfo): Promise<CompletedA
 		effectiveReport,
 		stderrLines,
 		effectiveBootstrapReason,
+		state.meta.effectiveProviderTimeout,
 	);
 	return { report: effectiveReport, reason };
 }
@@ -2848,6 +3119,30 @@ function asyncObservationIdentity(meta: RunMeta) {
 	};
 }
 
+/**
+ * Validate a `completed.json` marker written by the async runner. Shared by
+ * observation and disk recovery so neither treats arbitrary JSON as proof of
+ * exit: the timestamp must be canonical ISO 8601 at or after launch, the file
+ * must postdate launch, and the exit code must be null or a non-negative int32.
+ */
+function parseCompletedMarker(
+	meta: RunMeta,
+	marker: { value: Record<string, unknown>; mtimeMs: number } | undefined,
+): { exitCode: number | null; exitedAt: string; endedAt: number } | undefined {
+	if (!marker) return undefined;
+	const exitedAt = marker.value.exitedAt;
+	const endedAt = typeof exitedAt === "string" &&
+		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(exitedAt)
+		? Date.parse(exitedAt) : NaN;
+	if (!Number.isFinite(endedAt)) return undefined;
+	const canonicalDate = new Date(endedAt).toISOString();
+	if (canonicalDate !== exitedAt && canonicalDate.replace(".000Z", "Z") !== exitedAt) return undefined;
+	if (endedAt < meta.startedAt || marker.mtimeMs < meta.startedAt) return undefined;
+	const code = marker.value.exitCode;
+	if (!(code === null || (typeof code === "number" && Number.isSafeInteger(code) && code >= 0 && code <= 2147483647))) return undefined;
+	return { exitCode: code, exitedAt: exitedAt as string, endedAt };
+}
+
 async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry, budget?: ObservationReadBudget): Promise<AsyncRunObservation> {
 	const base = asyncObservationIdentity(meta);
 	if (entry && !entry.exited) return Object.freeze({ ...base, state: "running" });
@@ -2856,18 +3151,7 @@ async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry, budget?: Ob
 		fs.promises.lstat(meta.artifactDir).catch(() => undefined),
 	]);
 	if (!rootStat?.isDirectory() || !artifactStat?.isDirectory()) return Object.freeze({ ...base, state: "unknown" });
-	const marker = await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024, budget);
-	const exitedAt = marker?.value.exitedAt;
-	const endedAt = typeof exitedAt === "string" &&
-		/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(exitedAt)
-		? Date.parse(exitedAt) : NaN;
-	const code = marker?.value.exitCode;
-	const canonicalDate = Number.isFinite(endedAt)
-		? new Date(endedAt).toISOString() : undefined;
-	const validMarker = marker && canonicalDate !== undefined
-		&& (canonicalDate === exitedAt || canonicalDate.replace(".000Z", "Z") === exitedAt)
-		&& endedAt >= meta.startedAt && marker.mtimeMs >= meta.startedAt && (code === null ||
-			(typeof code === "number" && Number.isSafeInteger(code) && code >= 0 && code <= 2147483647));
+	const validMarker = parseCompletedMarker(meta, await readObservationJson(path.join(meta.artifactDir, "completed.json"), 1024, budget));
 	if (!entry && !validMarker) return Object.freeze({ ...base, state: "unknown" });
 	const raw = await readObservationJson(path.join(meta.artifactDir, "report.json"), 1024 * 1024, budget);
 	let report: ReportSummary | undefined;
@@ -2876,13 +3160,13 @@ async function observeAsyncRun(meta: RunMeta, entry?: AsyncRunEntry, budget?: Ob
 	} catch { /* Malformed reports fail closed under the normal result policy. */ }
 	const bootstrap = enforceCompletedAsyncAgentFs(meta, report);
 	const nono = enforceCompletedAsyncNono(meta, bootstrap.report);
-	const exitCode = entry ? entry.exitCode : validMarker ? code as number | null : null;
+	const exitCode = entry ? entry.exitCode : validMarker ? validMarker.exitCode : null;
 	const spawnFailed = await fs.promises.lstat(path.join(meta.artifactDir, "spawn-error.txt"))
 		.then(() => true, (error: NodeJS.ErrnoException) => error.code !== "ENOENT");
 	return Object.freeze({ ...base,
 		state: spawnFailed || isRunFailure({ exitCode: exitCode ?? 1, report: nono.report })
 			? "failed" : "completed",
-		...(validMarker ? { endedAt } : {}),
+		...(validMarker ? { endedAt: validMarker.endedAt } : {}),
 	});
 }
 
@@ -3034,6 +3318,7 @@ function asyncRecoverySource(
 						if (!eligibleAsyncObservationMeta(meta, ownerSessionId, root)) return undefined;
 						if (("agentFsRequested" in meta && typeof meta.agentFsRequested !== "boolean")
 							|| ("nonoRequested" in meta && typeof meta.nonoRequested !== "boolean")) return undefined;
+						if ("effectiveProviderTimeout" in meta && !parseEffectiveProviderTimeout(meta.effectiveProviderTimeout)) return undefined;
 						return observeAsyncRun(meta, undefined, budget);
 					} };
 				},
@@ -3102,11 +3387,11 @@ export async function runSingleSwivalAsync(
 	if (!agent) {
 		throw new Error(unknownAgentMessage(agentName, agents));
 	}
-	const reviewerError = checkRequiresReviewer(agent, overrides);
+	const runCwd = cwd ?? defaultCwd;
+	const reviewerError = checkRequiresReviewer(agent, overrides, runCwd);
 	if (reviewerError) {
 		throw new Error(reviewerError);
 	}
-	const runCwd = cwd ?? defaultCwd;
 	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
 	if (argumentError) throw new SwivalArgumentError(argumentError);
 
@@ -3118,54 +3403,56 @@ export async function runSingleSwivalAsync(
 	// Fix 2: use mintArtifactDir so runId includes the suffix (preventing
 	// millisecond collisions) and the directory format matches persistArtifacts.
 	const { artifactDir, ts, runId } = mintArtifactDir(agentName, artifactRoot);
-	const traceDir = path.join(artifactDir, "trace");
-	await fs.promises.mkdir(traceDir, { recursive: true, mode: 0o700 });
-
-	const reportPath = path.join(artifactDir, "report.json");
+	const scratch = asyncEvidence.createScratch();
 	const stdoutFile = path.join(artifactDir, "stdout.txt");
 	const stderrFile = path.join(artifactDir, "stderr.txt");
-	const effectiveOverrides: SwivalOverrides = {
-		...overrides,
-		traceDir,
-		installedSwivalVersion: overrides.installedSwivalVersion ?? versionCheck.installedVersion,
-	};
-	const args = buildSwivalArgs(agent, reportPath, runCwd, effectiveOverrides);
-	const agentFsRequested = isAgentFsRequested(args);
-	const nonoRequested = isNonoRequested(args);
-	const isReexec = isReexecSandboxRequested(args);
-	if (isReexec) {
-		args.push("--", plainTextTask(task));
-	} else {
-		const taskFile = path.join(artifactDir, "task.txt");
-		await fs.promises.writeFile(taskFile, plainTextTask(task), { encoding: "utf-8", mode: 0o600 });
-		args.push("--");
-	}
-
-	// Fix 1: open fds for redirection safely. Open stdoutFd first; if
-	// opening stderrFd throws, close stdoutFd before propagating. Both are
-	// closed in the spawn try/finally so we never hold references that keep
-	// the event loop alive.
-	const stdoutFd = fs.openSync(stdoutFile, "w");
-	let stderrFd: number;
-	try {
-		stderrFd = fs.openSync(stderrFile, "w");
-	} catch (err) {
-		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
-		throw err;
-	}
-	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
+	let agentFsRequested: boolean;
+	let nonoRequested: boolean;
+	let effectiveProviderTimeout: RunMeta["effectiveProviderTimeout"];
 	let proc: ChildProcess;
 	try {
-		proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, artifactDir, ...args], {
-			cwd: runCwd,
-			...(childEnv ? { env: childEnv } : {}),
-			shell: false,
-			stdio: ["ignore", stdoutFd, stderrFd],
-			detached: true,
-		});
-	} finally {
-		try { fs.closeSync(stdoutFd); } catch { /* ignore */ }
-		try { fs.closeSync(stderrFd!); } catch { /* ignore */ }
+		await fs.promises.mkdir(artifactDir, { recursive: true, mode: 0o700 });
+		const traceDir = path.join(scratch.path, "trace");
+		await fs.promises.mkdir(traceDir, { mode: 0o700 });
+		const effectiveOverrides: SwivalOverrides = {
+			...overrides,
+			// Explicit trace destinations remain caller-owned, not exported here.
+			traceDir: overrides.traceDir ?? traceDir,
+			installedSwivalVersion: overrides.installedSwivalVersion ?? versionCheck.installedVersion,
+		};
+		const args = buildSwivalArgs(agent, path.join(scratch.path, "report.json"), runCwd, effectiveOverrides);
+		agentFsRequested = isAgentFsRequested(args);
+		nonoRequested = isNonoRequested(args);
+		if (isReexecSandboxRequested(args)) {
+			args.push("--", plainTextTask(task));
+		} else {
+			await fs.promises.writeFile(path.join(artifactDir, "task.txt"), plainTextTask(task), { encoding: "utf-8", mode: 0o600 });
+			args.push("--");
+		}
+		const bridgedEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
+		const reviewEnv = resolveSwivalReviewEnv(args, (effectiveOverrides.selfReview ?? agent.selfReview) === false, bridgedEnv ?? process.env) ?? bridgedEnv;
+		const childEnv = resolveSwivalEvidenceEnv(args, scratch.path, reviewEnv ?? process.env, os.homedir(), runCwd) ?? reviewEnv;
+		effectiveProviderTimeout = resolveEffectiveProviderTimeout({ agent, overrides: effectiveOverrides, args, runCwd });
+		let stdoutFd: number | undefined;
+		let stderrFd: number | undefined;
+		try {
+			stdoutFd = fs.openSync(stdoutFile, "w");
+			stderrFd = fs.openSync(stderrFile, "w");
+			proc = spawn(process.execPath, [ASYNC_RUNNER_PATH, "--scratch-dir", scratch.path, artifactDir, ...args], {
+				cwd: runCwd,
+				...(childEnv ? { env: childEnv } : {}),
+				shell: false,
+				stdio: ["ignore", stdoutFd, stderrFd],
+				detached: true,
+			});
+		} finally {
+			try { if (stdoutFd !== undefined) fs.closeSync(stdoutFd); } catch { /* Best-effort descriptor cleanup. */ }
+			try { if (stderrFd !== undefined) fs.closeSync(stderrFd); } catch { /* Runner owns scratch after spawn. */ }
+		}
+	} catch (error) {
+		// No runner was launched: the parent still owns temporary storage.
+		asyncEvidence.cleanupScratch(scratch);
+		throw error;
 	}
 
 	const meta: RunMeta = {
@@ -3180,8 +3467,9 @@ export async function runSingleSwivalAsync(
 		stderrFile,
 		agentFsRequested,
 		nonoRequested,
+		effectiveProviderTimeout,
 	};
-	const entry: AsyncRunEntry = { meta, proc, exited: false, exitCode: null };
+	const entry: AsyncRunEntry = { meta, proc, scratch, exited: false, exitCode: null };
 	asyncRuns.set(runId, entry);
 	indexAsyncRun(entry);
 
@@ -3199,6 +3487,9 @@ export async function runSingleSwivalAsync(
 		}, ASYNC_RUN_TTL_MS).unref?.();
 	};
 	proc.once("close", (code) => {
+		// The host runner normally exported and removed scratch before close.
+		// After a crash/SIGKILL, reclaim only our original directory identity.
+		asyncEvidence.cleanupScratch(scratch);
 		const current = asyncRuns.get(runId);
 		if (!current || current.exited) return;
 		current.exited = true;
@@ -3208,6 +3499,7 @@ export async function runSingleSwivalAsync(
 		asyncRunChanged();
 	});
 	proc.once("error", (err) => {
+		if (proc.pid === undefined) asyncEvidence.cleanupScratch(scratch);
 		const current = asyncRuns.get(runId);
 		if (!current || current.exited) return;
 		current.exited = true;
@@ -3239,6 +3531,7 @@ export async function runSingleSwivalAsync(
 			? await terminateProcessGroup(proc, proc.pid)
 			: false;
 		if (terminated) {
+			asyncEvidence.cleanupScratch(scratch);
 			asyncRuns.delete(runId);
 			unindexAsyncRun(entry);
 			asyncRunChanged();
@@ -3285,7 +3578,8 @@ async function runSingleSwival(
 			reason: { code: "config_error", text: message },
 		};
 	}
-	const reviewerError = checkRequiresReviewer(agent, overrides);
+	const runCwd = cwd ?? defaultCwd;
+	const reviewerError = checkRequiresReviewer(agent, overrides, runCwd);
 	if (reviewerError) {
 		return {
 			agent: agent.name,
@@ -3299,7 +3593,6 @@ async function runSingleSwival(
 			reason: { code: "config_error", text: reviewerError },
 		};
 	}
-	const runCwd = cwd ?? defaultCwd;
 	const argumentError = getSwivalArgumentError(agent, runCwd, overrides);
 	if (argumentError) {
 		return {
@@ -3422,7 +3715,10 @@ async function runSingleSwival(
 		args.push("--");
 	}
 
-	const childEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
+	const bridgedEnv = resolveSwivalChildEnv(args, process.env, os.homedir(), runCwd);
+	const reviewEnv = resolveSwivalReviewEnv(args, (effectiveOverrides.selfReview ?? agent.selfReview) === false, bridgedEnv ?? process.env) ?? bridgedEnv;
+	const childEnv = resolveSwivalEvidenceEnv(args, tmpDir, reviewEnv ?? process.env, os.homedir(), runCwd) ?? reviewEnv;
+	const effectiveProviderTimeout = resolveEffectiveProviderTimeout({ agent, overrides: effectiveOverrides, args, runCwd });
 	try {
 		const exitCode = await new Promise<number>((resolve) => {
 			const proc = spawn("swival", args, {
@@ -3582,6 +3878,7 @@ async function runSingleSwival(
 			current.report,
 			stderrLines,
 			current.reason,
+			effectiveProviderTimeout,
 		);
 		if (terminalReason) {
 			current.reason = terminalReason;
@@ -3807,6 +4104,16 @@ const SwivalParams = Type.Object({
 	skillsDirOverride: Type.Optional(
 		Type.Array(Type.String(), { description: "Additional directories to scan for Swival skills." }),
 	),
+	addDirOverride: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Single mode only: additional read-write directories to grant via --add-dir for this call (outranks agent addDir).",
+		}),
+	),
+	addDirRoOverride: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Additional read-only directories to grant via --add-dir-ro for this call (outranks agent addDirRo).",
+		}),
+	),
 	shareSkills: Type.Optional(
 		Type.Boolean({ description: "Share ambient Pi skills directories with child Swival processes." }),
 	),
@@ -3952,6 +4259,8 @@ function buildOverridesFromParams(params: Record<string, unknown>): SwivalOverri
 		maxOutputKb: g<number>("maxOutputKbOverride"),
 		maxOutputLines: g<number>("maxOutputLinesOverride"),
 		skillsDir: g<string[]>("skillsDirOverride"),
+		addDir: g<string[]>("addDirOverride"),
+		addDirRo: g<string[]>("addDirRoOverride"),
 		shareSkills: g<boolean>("shareSkills"),
 		subagents: g<boolean>("subagentsOverride"),
 		cache: g<boolean>("cacheOverride"),
@@ -4424,6 +4733,16 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 				};
 			}
 
+			// Reject addDirOverride in multi-agent modes (parallel/chain) to prevent
+			// concurrent tasks from racing on a shared writable directory outside cwd.
+			if (params.addDirOverride && ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0)) {
+				return {
+					content: [{ type: "text", text: "`addDirOverride` is only supported in single mode (agent + task). Use `addDirRoOverride` for read-only access or configure `addDir` in agent frontmatter." }],
+					details: makeDetails("single")([]),
+					isError: true,
+				};
+			}
+
 			// Fix 7b: action is mutually exclusive with run-dispatch fields.
 			if (params.action) {
 				const conflicting = (["agent", "task", "tasks", "chain", "async"] as const)
@@ -4466,17 +4785,27 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (!state.exited) {
-						return {
-							content: [{ type: "text", text: `Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"}).\nArtifact dir: ${state.meta.artifactDir}` }],
-							details: makeDetails("single")([]),
-						};
-					}
+					// A recorded startup failure is terminal even when the runner never
+					// managed to write completed.json.
 					if (state.spawnError) {
 						return {
 							content: [{ type: "text", text: `Run ${runId} failed to start: ${state.spawnError}\nArtifact dir: ${state.meta.artifactDir}` }],
 							details: makeDetails("single")([]),
 							isError: true,
+						};
+					}
+					if (!state.exited) {
+						// Only a live owned handle proves the run is still executing. A
+						// disk-recovered PID is never probed or signalled.
+						if (!state.entry) {
+							return {
+								content: [{ type: "text", text: `Run ${runId} status is unknown (recovered from disk without a valid completed.json; process liveness cannot be verified).\nArtifact dir: ${state.meta.artifactDir}` }],
+								details: makeDetails("single")([]),
+							};
+						}
+						return {
+							content: [{ type: "text", text: `Run ${runId} is still running (pid: ${state.meta.pid ?? "unknown"}).\nArtifact dir: ${state.meta.artifactDir}` }],
+							details: makeDetails("single")([]),
 						};
 					}
 					const inspection = await inspectCompletedAsyncRun(state);
@@ -4554,16 +4883,24 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (!state.exited) {
+					if (state.spawnError) {
 						return {
-							content: [{ type: "text", text: `Run ${runId} is still in progress (pid: ${state.meta.pid ?? "unknown"}). Wait for it to complete, or interrupt it first.` }],
+							content: [{ type: "text", text: `Run ${runId} failed to start: ${state.spawnError}\nArtifact dir: ${state.meta.artifactDir}` }],
 							details: makeDetails("single")([]),
 							isError: true,
 						};
 					}
-					if (state.spawnError) {
+					if (!state.exited) {
+						if (!state.entry) {
+							// No verified completion marker: never read stdout.txt as a result.
+							return {
+								content: [{ type: "text", text: `Run ${runId} completion is unknown (recovered from disk without a valid completed.json; process liveness cannot be verified). Output is unavailable until a verified completion marker exists.\nArtifact dir: ${state.meta.artifactDir}` }],
+								details: makeDetails("single")([]),
+								isError: true,
+							};
+						}
 						return {
-							content: [{ type: "text", text: `Run ${runId} failed to start: ${state.spawnError}\nArtifact dir: ${state.meta.artifactDir}` }],
+							content: [{ type: "text", text: `Run ${runId} is still in progress (pid: ${state.meta.pid ?? "unknown"}). Wait for it to complete, or interrupt it first.` }],
 							details: makeDetails("single")([]),
 							isError: true,
 						};
@@ -4782,7 +5119,7 @@ export default function (pi: ExtensionAPI, options: SwivalExtensionOptions = {})
 							isError: true,
 						};
 					}
-					if (!isMutatingCwdAgent(agent, perTaskOverrides)) continue;
+					if (!isMutatingCwdAgent(agent, perTaskOverrides, runCwd)) continue;
 					const resolvedBaseDir = resolveAgentBaseDir(agent, runCwd, perTaskOverrides);
 					const existing = cwdGroups.get(resolvedBaseDir) ?? [];
 					existing.push(i);

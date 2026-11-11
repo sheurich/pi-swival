@@ -17,7 +17,9 @@ vi.mocked(spawn).mockImplementation(((executable: string, args: string[]) => {
 		if (args.includes("--version")) proc.stdout.write("1.9.3");
 		else {
 			const positional = args[args.indexOf("--") + 1];
-			const artifactDir = executable === process.execPath ? args[1] : undefined;
+			// Async wrapper argv: [async-runner.cjs, "--scratch-dir", <scratch>, <artifactDir>, ...swivalArgs].
+			const wrapperBody = executable === process.execPath ? args.slice(1) : undefined;
+			const artifactDir = wrapperBody ? (wrapperBody[0] === "--scratch-dir" ? wrapperBody[2] : wrapperBody[0]) : undefined;
 			deliveries.push(positional ?? (artifactDir ? fs.readFileSync(path.join(artifactDir, "task.txt"), "utf8") : stdin));
 			const report = args[args.indexOf("--report") + 1];
 			fs.writeFileSync(report, JSON.stringify({ result: { outcome: "success", answer: "literal $100 $& $' $`" }, sandbox: { mode: "agentfs", agentfs_version: "0.6.4" } }));

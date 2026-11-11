@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import registerExtension from "../extensions/index.js";
+import registerExtension, { ANTHROPIC_OAUTH_SHIM_DIR } from "../extensions/index.js";
 
 describe("argument-validation dispatch boundary", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -47,6 +47,7 @@ describe("argument-validation dispatch boundary", () => {
 				"---",
 				"name: override-agent",
 				"description: agent whose reviewer conflict is disabled by an override",
+				"sandbox: builtin",
 				"selfReview: true",
 				"reviewer: /bin/true",
 				"---",
@@ -97,6 +98,30 @@ describe("argument-validation dispatch boundary", () => {
 		expect(result.content[0].text).toMatch(/option terminator/i);
 		expect(fs.readdirSync(artifactRoot)).toEqual([]);
 		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
+	});
+
+	it.each(["single", "chain", "parallel", "async"])("rejects unsupported self-review suppression before resources for %s", async (mode) => {
+		const cases = [
+			"", // An inherited sandbox may be nono. Never override it silently.
+			"sandbox: nono",
+			`sandbox: nono\naddDirRo: [${JSON.stringify(ANTHROPIC_OAUTH_SHIM_DIR)}]`,
+			"sandbox: agentfs\nextraArgs: [--sandbox=nono]",
+			"sandbox: builtin\nnetwork: none",
+			"network: none",
+		];
+		for (const configuration of cases) {
+			fs.writeFileSync(path.join(process.env.PI_CODING_AGENT_DIR!, "swival-agents", "incompatible.md"),
+				`---\nname: incompatible\ndescription: shim refusal fixture\ncommands: none\nfiles: none\n${configuration}\n---\nReview only.\n`);
+			const item = { agent: "incompatible", task: "task" };
+			const params = mode === "parallel" ? { tasks: [{ agent: "sandboxed-reviewer", task: "must not start" }, item] }
+				: mode === "chain" ? { chain: [item] } : { ...item, async: mode === "async" };
+			const result = await tool.execute("shim-refusal", { agentScope: "user", selfReviewOverride: false, ...params },
+				undefined, undefined, { cwd: root, hasUI: false });
+			expect(result.isError).toBe(true);
+			expect(result.content[0].text).toMatch(/explicit sandbox builtin or agentfs/);
+			expect(fs.readdirSync(artifactRoot)).toEqual([]);
+			expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
+		}
 	});
 
 	it("uses effective overrides in parallel safety guards", async () => {

@@ -27,7 +27,8 @@ Bundled definitions live at `../../agents/<name>.md` relative to this skill, so 
 |-------|----------|
 | `self-review-worker` | Implementation, file edits, or artifacts that should pass through `--self-review`; not for review-only tasks |
 | `test-runner` | Task has a runnable test command as acceptance criterion (pass `reviewerOverride`) |
-| `sandboxed-explorer` | Exploration in a disposable cwd; its fresh AgentFS session does not prevent host writes |
+| `sandboxed-reviewer` | Read-only review (`selfReview: false`, `commands: none`, `noSkills: true`, `network: provider-only`); requires nono/profile pack. Read-only is prompt-level: base-dir writes are write-through. Explicit false suppresses inherited self-review using the required Swival-only shim. It requires an explicit `sandbox: agentfs` or `sandbox: builtin`; nono, inherited/unspecified sandbox selection, and explicit `network: none` are refused before allocation. Inherited `network = "none"` is rejected by Swival before re-exec. `addDirRo` cannot grant nono startup-shim access. |
+| `sandboxed-explorer` | Exploration in a disposable cwd; its fresh AgentFS session does not prevent host writes. Use `sandboxed-reviewer` for read-only reviews |
 | `swival` | Simple delegation, no review needed (also the default when agent is omitted) |
 | `a2a-coordinator` | Delegate part of a task to a remote A2A agent named in an `a2aConfig` TOML file; requires `network: full` |
 
@@ -118,7 +119,7 @@ Run a long task in the background and return immediately:
 swival-subagent with agent: "self-review-worker", task: "Refactor the auth module", async: true
 ```
 
-The tool returns a `runId` containing a timestamp and random suffix. `async: true` is only supported in single-agent mode, not chain/parallel.
+The tool returns a `runId` containing a timestamp and random suffix. `async: true` is only supported in single-agent mode, not chain/parallel. Reports/default traces use private system temporary scratch; the host runner exports them before `completed.json`, with no artifact-directory sandbox grant. Limits: 16 MiB/report, 4 MiB/trace, 16 trace-directory entries scanned (including rejected names), 64 MiB total; only owned single-link regular files and safe trace basenames are accepted. `transfer-error.txt` records value-free rejection codes; worker exit codes stay unchanged and invalid/missing sandbox reports still fail closed. Default evidence is available only after worker exit; forced kills can discard unexported evidence and oversized traces are dropped, not truncated. Explicit trace destinations remain caller-owned. The runner owns scratch cleanup after launch, with parent cleanup after confirmed termination; abrupt SIGKILL can leave `pi-swival-async-*` directories or incomplete `.tmp` files. There is no scavenger or notification promise. If the runner cannot write a valid terminal marker, a run recovered from disk after a Pi restart reports `unknown` status (and `resume` fails) because liveness is never probed. The real AgentFS gate checks the actual temporary-directory family; macOS evidence is not Linux proof.
 
 Once started, manage it using `action` and `id`:
 
@@ -172,6 +173,8 @@ These top-level parameters override agent frontmatter. Parallel tasks and chain 
 | `commandMiddlewareOverride` | Command run before each tool command |
 | `maxOutputKbOverride` | Size cap in KB for tool output |
 | `maxOutputLinesOverride` | Line cap for file reads |
+| `addDirOverride` | Extra read-write directories (`--add-dir`, single mode only; `[]` clears frontmatter) |
+| `addDirRoOverride` | Extra read-only directories (`--add-dir-ro`; replaces configured `allowed_dirs_ro`) |
 | `skillsDirOverride` | Additional directories to scan for skills |
 | `shareSkills` | Share ambient Pi skills with Swival |
 | `subagentsOverride` | Allow Swival to spawn native subagents |
@@ -244,7 +247,7 @@ Each agent's frontmatter is independent. There is no base agent, no `extends:` f
 - Project-scope agents cannot preserve the full frontmatter set. For security, `pi-swival` strips execution and sandbox override fields from project-local agents. Stripped fields include `yolo`, `extraArgs`, `profile`, `reviewer`, `verify`, `commandMiddleware`, `nonoProfile`, and `skillsDir`. The sanitizer also strips `provider`, `model`, `baseUrl`, `baseDir`, `addDir`, and `addDirRo`. It removes `a2aConfig` and `allowA2a`, and forces `noA2a: true` and `noWebSearch: true`. It narrows `network` to `none` only. It forces `sandbox: agentfs`, even if frontmatter requests `sandbox: nono`. Fork agents that need these capabilities into user scope (`~/.pi/agent/swival-agents/`).
 - Project definitions cannot remove a shadowed bundled or user agent's `requiresReviewer: true`. The dispatcher preserves that requirement, preventing project-local impersonation from dropping the reviewer gate.
 
-When overriding a bundled name in user scope, compare its frontmatter with the bundled definition. Preserve the flags your task needs.
+When overriding a bundled name in user scope, compare its frontmatter with the bundled definition. Preserve the flags your task needs. A user-scope file in `~/.pi/agent/swival-agents/` shadows the bundled profile of the same name, so an outdated `sandboxed-reviewer` override silently drops later bundled requirements (such as the SecretShield verification rule) unless you keep it aligned.
 
 ## Capabilities Reference
 
@@ -257,7 +260,7 @@ Automated review loop that evaluates task output after each answer and retries u
 - `--verify FILE`: feeds acceptance criteria to the reviewer
 - Default budget: 15 rounds (`maxReviewRounds` overrides)
 
-Self-review and `--reviewer` are mutually exclusive.
+Self-review and `--reviewer` are mutually exclusive. A `sandboxed-reviewer` dispatch reports claims, not verified facts: before acting on a token-shaped finding (see Secret encryption), confirm the cited `file:line` on the host.
 
 ### Filesystem sandbox and network isolation
 
@@ -293,7 +296,7 @@ Swival receives the task on standard input when the agent explicitly sets `sandb
 
 ### Secret encryption
 
-Secret encryption replaces detected credentials before model requests and restores values locally. Enable it through `encryptSecrets: true` or `encryptSecretsOverride: true`. Detection does not prove that all secrets are covered. Ordinary delegation provides no host-read confidentiality guarantee.
+Secret encryption replaces detected credentials before model requests and restores values locally. Enable it through `encryptSecrets: true` or `encryptSecretsOverride: true`. Detection does not prove that all secrets are covered. Ordinary delegation provides no host-read confidentiality guarantee. When it is active, SecretShield also rewrites ordinary token-shaped or high-entropy identifiers in the source the model reads, so a reviewer may see format-preserving ciphertext instead of the real text. Treat any token-shaped finding (committed secret, malformed identifier, corrupted constant) from model tool output as unverified: require a `file:line` citation, check that location on the host against the original unencrypted source yourself, and never paste the inspected value into a prompt, report, or follow-up task.
 
 ### Agent Client Protocol (ACP)
 
@@ -478,12 +481,7 @@ command -v swival >/dev/null 2>&1 || { echo "swival not found"; exit 1; }
 command -v agentfs >/dev/null 2>&1 || { echo "agentfs optional: required for sandbox: agentfs"; }
 ```
 
-Upgrade Swival to the latest release:
-
-```bash
-uv tool upgrade swival
-# or: pipx upgrade swival
-```
+Upgrade to the latest release with `uv tool upgrade swival` (or `pipx upgrade swival`).
 
 ### Version preflight
 

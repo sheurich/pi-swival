@@ -94,6 +94,8 @@ describe("durable async runner", () => {
 		fs.writeFileSync(fakeSwival, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"1.0.45\"; exit 0; fi\ntrap '' TERM\nwhile :; do sleep 1; done\n", { mode: 0o755 });
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${bin}:${originalPath ?? ""}`;
+		const originalTmp = process.env.TMPDIR;
+		process.env.TMPDIR = fs.realpathSync(root);
 		let wrapperPid: number | undefined;
 		const writeFile = fs.promises.writeFile.bind(fs.promises);
 		const writeSpy = vi.spyOn(fs.promises, "writeFile").mockImplementation(async (file, data, ...rest) => {
@@ -116,9 +118,12 @@ describe("durable async runner", () => {
 			).rejects.toThrow(/injected metadata failure/);
 			expect(wrapperPid).toBeTypeOf("number");
 			expect(() => process.kill(-wrapperPid!, 0)).toThrow();
+			expect(fs.readdirSync(root).filter((name) => name.startsWith("pi-swival-async-"))).toEqual([]);
 		} finally {
 			writeSpy.mockRestore();
 			process.env.PATH = originalPath;
+			if (originalTmp === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmp;
 		}
 	}, 10000);
 

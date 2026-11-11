@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import { nativeTestPython } from "./nativePython.js";
 import { buildNativeAgentfsArgs, captureNativeRuntime, prepareNativeAudit, inspectNativeAudit } from "../extensions/native-audit.js";
 import { fixtureRepository, fixtureSearchPath, nativeScratch } from "./nativeFixtures.js";
+import { resolveSwivalReviewEnv } from "../extensions/index.js";
 
 // Probe the production external-AgentFS boundary and host-visible snapshot collection.
 // AgentFS overlays a separate empty cwd; only the snapshot receives a write-through grant.
@@ -45,7 +46,7 @@ describe("native upstream AgentFS mechanism", () => {
 		fs.writeFileSync(path.join(source, "sentinel"), "original-source");
 		fs.mkdirSync(path.join(source, ".git"));
 		fs.writeFileSync(path.join(source, ".git", "HEAD"), "original-git");
-		fs.writeFileSync(path.join(snapshot, "swival.toml"), "# Inert fixture configuration.\n");
+		fs.writeFileSync(path.join(snapshot, "swival.toml"), 'self_review = true\nreviewer = "external.sh"\n');
 		const env: NodeJS.ProcessEnv = {
 			PATH: search.join(path.delimiter), HOME: home, TMPDIR: path.join(root, "tmp"),
 			XDG_CONFIG_HOME: path.join(home, ".config"), XDG_CACHE_HOME: path.join(home, ".cache"),
@@ -65,8 +66,20 @@ sys.dont_write_bytecode = True
 with patch.object(socket, "socket", side_effect=AssertionError("network forbidden")), \\
      patch.object(socket, "create_connection", side_effect=AssertionError("network forbidden")), \\
      patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS forbidden")):
-    from swival import agent, sandbox_agentfs
+    from swival import agent, config, sandbox_agentfs
+    assert getattr(config.apply_config_to_args, "_pi_swival_no_self_review", False)
+    original_apply = config.apply_config_to_args
+    applied = False
+    def checked_apply(args, values):
+        global applied
+        result = original_apply(args, values)
+        assert args.self_review is False, "inherited self-review was re-enabled"
+        assert args.reviewer == "external.sh", "external reviewer gate was lost"
+        applied = True
+        return result
+    config.apply_config_to_args = checked_apply
     def stop_before_provider(**_kwargs):
+        assert applied, "real main did not apply the shim in the final process"
         assert sandbox_agentfs.is_inside_agentfs(), "real AgentFS boundary did not engage"
         assert os.environ.get("AGENTFS") == "1"
         assert not os.environ.get("SWIVAL_AGENTFS_ACTIVE"), "must not re-exec inside the snapshot"
@@ -89,6 +102,7 @@ with patch.object(socket, "socket", side_effect=AssertionError("network forbidde
 			"--no-sandbox-auto-session", "--no-instructions", "--no-skills", "--no-metaskills", "--no-mcp",
 			"--no-a2a", "--no-subagents", "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
 			"--provider", "chatgpt", "--model", "offline-fixture", "--", "/audit --all --workers 1"];
+		Object.assign(env, resolveSwivalReviewEnv(args, true, env));
 		const proc = spawn(agentfs, buildNativeAgentfsArgs(entry, snapshot, undefined, session, args), {
 			cwd: sandboxCwd, env, shell: false, detached: true,
 			stdio: ["ignore", "pipe", "pipe"] });

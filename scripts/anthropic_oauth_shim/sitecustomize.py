@@ -1,19 +1,33 @@
-"""Startup compatibility shim for Anthropic OAuth tokens in Swival/LiteLLM.
+"""Startup compatibility shim for Anthropic OAuth and Vertex bearer tokens in Swival/LiteLLM.
 
-Loaded via PYTHONPATH when Swival runs with provider="anthropic".
-1. Disables dynamic /v1/models lookup on AnthropicModelInfo and Swival's
+Loaded via PYTHONPATH when Swival runs with provider in ("anthropic", "bedrock", "geap").
+1. Forces LITELLM_LOCAL_MODEL_COST_MAP=True before importing LiteLLM so startup
+   never fetches the remote model cost map over the network.
+2. Disables dynamic /v1/models lookup on AnthropicModelInfo and Swival's
    _list_server_models so NotFoundError cannot trigger singleton model
    replacement.
-2. Injects the required Claude Code OAuth headers and leading system block
+3. Injects the required Claude Code OAuth headers and leading system block
    when an Anthropic OAuth token (sk-ant-oat...) is used.
-3. Backfills LiteLLM model-map entries for Anthropic models newer than the
+4. Bridges a host-minted short-lived GOOGLE_OAUTH_ACCESS_TOKEN into LiteLLM's
+   VertexBase.load_auth without reading ~/.config/gcloud or ADC files.
+5. Backfills LiteLLM model-map entries for Anthropic models newer than the
    pinned LiteLLM release, so reasoning effort is sent instead of dropped.
 """
+from __future__ import annotations
+
 # pylint: disable=import-outside-toplevel,broad-exception-caught,protected-access
+import importlib.util
+import os
+from pathlib import Path
+import sys
+import time
+
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
 CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.290"
 REQUIRED_OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
+CREDENTIAL_EXPIRED_SENTINEL = "PI_SWIVAL_CREDENTIAL_EXPIRED"
 
 # model -> (sibling entry to clone, base rates in USD per token).
 # LiteLLM drops `output_config.effort` for a model missing from its map.
@@ -29,6 +43,35 @@ MODEL_MAP_BACKFILL = {
         },
     ),
 }
+
+
+def _emit_credential_expired():
+    try:
+        sys.stderr.write(f"\n{CREDENTIAL_EXPIRED_SENTINEL}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+class _StaticVertexBearerCredentials:
+    """In-memory bearer token credential for Vertex AI without disk/ADC refresh."""
+
+    def __init__(self, token: str, project_id: str | None, not_after: float | None):
+        self.token = token
+        self.project_id = project_id
+        self.quota_project_id = project_id
+        self._not_after = not_after
+        self.valid = True
+
+    @property
+    def expired(self) -> bool:
+        return self._not_after is not None and time.time() >= self._not_after
+
+    def refresh(self, _request=None):
+        _emit_credential_expired()
+        raise RuntimeError(
+            f"{CREDENTIAL_EXPIRED_SENTINEL}: host-injected GOOGLE_OAUTH_ACCESS_TOKEN expired"
+        )
 
 
 def _backfill_model_map(litellm):
@@ -49,12 +92,113 @@ def _backfill_model_map(litellm):
             pass
 
 
+def _install_vertex_bearer_shim():
+    from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+
+    orig_load_auth = VertexBase.load_auth
+    if getattr(orig_load_auth, "_pi_swival_vertex_bearer", False) is True:
+        return
+
+    def _wrapped_load_auth(self, credentials, project_id):
+        token = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip()
+        if credentials is None and token:
+            not_after_raw = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER", "").strip()
+            not_after = float(not_after_raw) if not_after_raw else None
+            if not_after is not None and time.time() >= not_after:
+                _emit_credential_expired()
+                raise RuntimeError(
+                    f"{CREDENTIAL_EXPIRED_SENTINEL}: host-injected GOOGLE_OAUTH_ACCESS_TOKEN expired"
+                )
+            resolved_project = (
+                project_id
+                or os.environ.get("GOOGLE_CLOUD_PROJECT")
+                or os.environ.get("VERTEXAI_PROJECT")
+            )
+            if not resolved_project or not isinstance(resolved_project, str):
+                raise ValueError("Could not resolve project_id")
+            return (
+                _StaticVertexBearerCredentials(token, resolved_project, not_after),
+                resolved_project,
+            )
+        return orig_load_auth(self, credentials, project_id)
+
+    _wrapped_load_auth._pi_swival_vertex_bearer = True
+    VertexBase.load_auth = _wrapped_load_auth
+
+
+def _install_agentfs_evidence_grant():
+    """Grant scratch writes at the OS boundary, not in Swival's tool roots."""
+    raw = os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip()
+    if not raw:
+        return
+    if Path(raw).is_symlink() or not Path(raw).is_dir():
+        raise RuntimeError("Invalid AgentFS evidence directory")
+    from swival import sandbox_agentfs
+    original = sandbox_agentfs.build_agentfs_argv
+    if not callable(original):
+        raise RuntimeError("AgentFS argv builder is unavailable")
+    if getattr(original, "_pi_swival_evidence_grant", False):
+        return
+    evidence_dir = str(Path(raw).resolve())
+
+    def _with_evidence_grant(**kwargs):
+        argv = original(**kwargs)
+        boundary = argv.index("--")
+        if not any(argv[i:i + 2] == ["--allow", evidence_dir] for i in range(boundary - 1)):
+            argv[boundary:boundary] = ["--allow", evidence_dir]
+        return argv
+
+    _with_evidence_grant._pi_swival_evidence_grant = True
+    sandbox_agentfs.build_agentfs_argv = _with_evidence_grant
+
+
 def _install_anthropic_shim():
+    # Tool/reviewer children inherit PYTHONPATH but may use a different Python.
+    # This hook is required only in a Swival interpreter, not arbitrary children.
+    if importlib.util.find_spec("swival") is None:
+        return
+    shim_required = (
+        os.environ.get("PI_SWIVAL_SHIM_REQUIRED") == "1"
+        or os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1"
+        or bool(os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip())
+    )
+    if os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip():
+        try:
+            _install_agentfs_evidence_grant()
+        except Exception as exc:
+            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
+        if not (shim_required or os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-oat")
+                or os.environ.get("ANTHROPIC_OAUTH_TOKEN", "").strip()):
+            return
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
     try:
         import litellm
         from litellm.llms.anthropic.common_utils import AnthropicModelInfo
-    except Exception:
+        _install_vertex_bearer_shim()
+    except Exception as exc:
+        if shim_required:
+            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
         return
+
+    if os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1":
+        try:
+            from swival import config as swival_config
+            original_apply = swival_config.apply_config_to_args
+            if not callable(original_apply):
+                raise RuntimeError("unsupported configuration interface")
+            if not getattr(original_apply, "_pi_swival_no_self_review", False):
+                def _apply_without_self_review(args, config):
+                    # Preserve an explicit CLI choice, including argparse
+                    # abbreviations and Swival invoked by a reviewer child.
+                    explicit_self_review = getattr(args, "self_review", None) is True
+                    result = original_apply(args, config)
+                    if not explicit_self_review:
+                        args.self_review = False
+                    return result
+                _apply_without_self_review._pi_swival_no_self_review = True
+                swival_config.apply_config_to_args = _apply_without_self_review
+        except Exception as exc:
+            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
 
     _backfill_model_map(litellm)
 
@@ -70,14 +214,15 @@ def _install_anthropic_shim():
             orig_list_models, "_pi_swival_anthropic_guarded", False
         ):
             def _guarded_list_server_models(litellm_provider, *args, **kwargs):
-                if litellm_provider == "anthropic":
+                if litellm_provider in ("anthropic", "bedrock", "vertex_ai"):
                     return []
                 return orig_list_models(litellm_provider, *args, **kwargs)
 
             _guarded_list_server_models._pi_swival_anthropic_guarded = True
             swival_agent._list_server_models = _guarded_list_server_models
-    except Exception:
-        pass
+    except Exception as exc:
+        if shim_required:
+            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
 
     orig_completion = litellm.completion
     if getattr(orig_completion, "_pi_swival_anthropic_oauth", False) is True:
@@ -149,7 +294,16 @@ def _install_anthropic_shim():
                         ]
                 orig_msgs[0] = sys_msg
             kwargs["messages"] = orig_msgs
-        return orig_completion(*args, **kwargs)
+        try:
+            return orig_completion(*args, **kwargs)
+        except litellm.AuthenticationError:
+            if (
+                isinstance(model, str)
+                and model.startswith("vertex_ai/")
+                and os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip()
+            ):
+                _emit_credential_expired()
+            raise
 
     _wrapped_completion._pi_swival_anthropic_oauth = True
     litellm.completion = _wrapped_completion
