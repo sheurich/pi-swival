@@ -15,7 +15,7 @@ const BRIEFS_SKILL_DIR = join(SKILLS_DIR, "swival-worker-briefs");
 const BRIEFS_SKILL = join(BRIEFS_SKILL_DIR, "SKILL.md");
 const AGENTS_DIR = join(PACKAGE_ROOT, "agents");
 
-const SWIVAL_VERSION = "1.0.45";
+const SWIVAL_VERSION = "1.9.3";
 
 function read(file: string): string {
 	return readFileSync(file, "utf8");
@@ -125,7 +125,7 @@ describe("swival SKILL.md preserves package mechanics", () => {
 	const skill = () => read(SWIVAL_SKILL);
 
 	it(`tracks Swival ${SWIVAL_VERSION}`, () => {
-		expect(skill()).toContain(`Tracked against Swival ${SWIVAL_VERSION}.`);
+		expect(skill()).toContain(`Tracked against Swival ${SWIVAL_VERSION}, LiteLLM 1.106.6`);
 	});
 
 	it("documents the bundled agent path relative to the loaded skill", () => {

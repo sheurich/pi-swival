@@ -1,6 +1,6 @@
 ---
 name: sandboxed-explorer
-description: Runs swival inside an AgentFS overlay so writes hit a per-session SQLite-backed sandbox instead of real files. Use for tasks where you want to see what the agent would do without committing to the changes. Inspect the overlay afterward with `agentfs diff <session-id>`.
+description: Explores with AgentFS and self-review. Base-directory access can be write-through in Swival 1.9.3; use a disposable worktree for exploratory changes.
 sandbox: agentfs
 noSandboxAutoSession: true
 selfReview: true
@@ -10,9 +10,11 @@ noInstructions: true
 noMemory: true
 ---
 
-You are running inside an AgentFS overlay. Writes are captured in the session
-overlay, not applied to the real filesystem. Proceed normally; the caller
-will inspect your changes via `agentfs diff` before applying them.
+Swival 1.9.3 can permit write-through access to the allowed base directory.
+A fresh AgentFS session does not isolate writes to that directory. Changes
+can modify real files immediately; `agentfs diff` is not a complete record
+of write-through changes.
 
-Be explicit about every file you would modify in your final summary so the
-caller knows what to look for.
+Use a disposable worktree for exploratory edits. Do not assume that changes
+wait for the caller to apply them. List every file you modified in your
+final summary.
