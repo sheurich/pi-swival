@@ -12,6 +12,12 @@ Loaded via PYTHONPATH when Swival runs with provider in ("anthropic", "bedrock",
    VertexBase.load_auth without reading ~/.config/gcloud or ADC files.
 5. Backfills LiteLLM model-map entries for Anthropic models newer than the
    pinned LiteLLM release, so reasoning effort is sent instead of dropped.
+
+Hooks 2-4 (and the self-review suppression requested by PI_SWIVAL_NO_SELF_REVIEW)
+are required route-identity guards: ``install_required_shim(require_hooks=True)``
+verifies every upstream target is present and callable before patching and
+records the outcome in ``SHIM_ATTESTATION``. Hook 5 is optional pricing
+metadata and never blocks startup.
 """
 from __future__ import annotations
 
@@ -28,6 +34,15 @@ CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for C
 CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.290"
 REQUIRED_OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
 CREDENTIAL_EXPIRED_SENTINEL = "PI_SWIVAL_CREDENTIAL_EXPIRED"
+SHIM_INSTALL_FAILED_SENTINEL = "PI_SWIVAL_SHIM_INSTALL_FAILED"
+
+# Required hook names -> installed. Updated only by install_required_shim.
+SHIM_ATTESTATION: dict[str, bool] = {
+    "model_discovery_disabled": False,
+    "oauth_headers": False,
+    "vertex_bearer": False,
+    "self_review_suppressed": False,
+}
 
 # model -> (sibling entry to clone, base rates in USD per token).
 # LiteLLM drops `output_config.effort` for a model missing from its map.
@@ -75,27 +90,33 @@ class _StaticVertexBearerCredentials:
 
 
 def _backfill_model_map(litellm):
+    """Optional pricing/effort metadata; failures never block a route-identity hook."""
     for model, (sibling, rates) in MODEL_MAP_BACKFILL.items():
-        if model in litellm.model_cost or sibling not in litellm.model_cost:
-            continue
-        # Only the base rates are known for the new model; drop the sibling's
-        # batch and long-cache rates rather than report them as its own.
-        entry = {
-            key: value
-            for key, value in litellm.model_cost[sibling].items()
-            if not key.endswith(("_batches", "_above_1hr"))
-        }
-        entry.update(rates)
         try:
+            if model in litellm.model_cost or sibling not in litellm.model_cost:
+                continue
+            # Only the base rates are known for the new model; drop the sibling's
+            # batch and long-cache rates rather than report them as its own.
+            entry = {
+                key: value
+                for key, value in litellm.model_cost[sibling].items()
+                if not key.endswith(("_batches", "_above_1hr"))
+            }
+            entry.update(rates)
             litellm.register_model({model: entry})
         except Exception:
             pass
 
 
-def _install_vertex_bearer_shim():
-    from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+def _required_callable(owner, name):
+    target = getattr(owner, name, None)
+    if not callable(target):
+        raise RuntimeError(f"{SHIM_INSTALL_FAILED_SENTINEL}: {name} is unavailable")
+    return target
 
-    orig_load_auth = VertexBase.load_auth
+
+def _install_vertex_bearer_shim(vertex_base):
+    orig_load_auth = _required_callable(vertex_base, "load_auth")
     if getattr(orig_load_auth, "_pi_swival_vertex_bearer", False) is True:
         return
 
@@ -123,108 +144,52 @@ def _install_vertex_bearer_shim():
         return orig_load_auth(self, credentials, project_id)
 
     _wrapped_load_auth._pi_swival_vertex_bearer = True
-    VertexBase.load_auth = _wrapped_load_auth
+    vertex_base.load_auth = _wrapped_load_auth
 
 
-def _install_agentfs_evidence_grant():
-    """Grant scratch writes at the OS boundary, not in Swival's tool roots."""
-    raw = os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip()
-    if not raw:
-        return
-    if Path(raw).is_symlink() or not Path(raw).is_dir():
-        raise RuntimeError("Invalid AgentFS evidence directory")
-    from swival import sandbox_agentfs
-    original = sandbox_agentfs.build_agentfs_argv
-    if not callable(original):
-        raise RuntimeError("AgentFS argv builder is unavailable")
-    if getattr(original, "_pi_swival_evidence_grant", False):
-        return
-    evidence_dir = str(Path(raw).resolve())
-
-    def _with_evidence_grant(**kwargs):
-        argv = original(**kwargs)
-        boundary = argv.index("--")
-        if not any(argv[i:i + 2] == ["--allow", evidence_dir] for i in range(boundary - 1)):
-            argv[boundary:boundary] = ["--allow", evidence_dir]
-        return argv
-
-    _with_evidence_grant._pi_swival_evidence_grant = True
-    sandbox_agentfs.build_agentfs_argv = _with_evidence_grant
-
-
-def _install_anthropic_shim():
-    # Tool/reviewer children inherit PYTHONPATH but may use a different Python.
-    # This hook is required only in a Swival interpreter, not arbitrary children.
-    if importlib.util.find_spec("swival") is None:
-        return
-    shim_required = (
-        os.environ.get("PI_SWIVAL_SHIM_REQUIRED") == "1"
-        or os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1"
-        or bool(os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip())
-    )
-    if os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip():
-        try:
-            _install_agentfs_evidence_grant()
-        except Exception as exc:
-            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
-        if not (shim_required or os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-oat")
-                or os.environ.get("ANTHROPIC_OAUTH_TOKEN", "").strip()):
-            return
-    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-    try:
-        import litellm
-        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
-        _install_vertex_bearer_shim()
-    except Exception as exc:
-        if shim_required:
-            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
+def _install_self_review_suppression(swival_config):
+    original_apply = _required_callable(swival_config, "apply_config_to_args")
+    if getattr(original_apply, "_pi_swival_no_self_review", False):
         return
 
-    if os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1":
-        try:
-            from swival import config as swival_config
-            original_apply = swival_config.apply_config_to_args
-            if not callable(original_apply):
-                raise RuntimeError("unsupported configuration interface")
-            if not getattr(original_apply, "_pi_swival_no_self_review", False):
-                def _apply_without_self_review(args, config):
-                    # Preserve an explicit CLI choice, including argparse
-                    # abbreviations and Swival invoked by a reviewer child.
-                    explicit_self_review = getattr(args, "self_review", None) is True
-                    result = original_apply(args, config)
-                    if not explicit_self_review:
-                        args.self_review = False
-                    return result
-                _apply_without_self_review._pi_swival_no_self_review = True
-                swival_config.apply_config_to_args = _apply_without_self_review
-        except Exception as exc:
-            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
+    def _apply_without_self_review(args, config):
+        # Preserve an explicit CLI choice, including argparse abbreviations
+        # and Swival invoked by a reviewer child.
+        explicit_self_review = getattr(args, "self_review", None) is True
+        result = original_apply(args, config)
+        if not explicit_self_review:
+            args.self_review = False
+        return result
 
-    _backfill_model_map(litellm)
+    _apply_without_self_review._pi_swival_no_self_review = True
+    swival_config.apply_config_to_args = _apply_without_self_review
 
-    empty_models = lambda self, *args, **kwargs: []
-    AnthropicModelInfo.get_models = empty_models
-    AnthropicModelInfo.discover_models = empty_models
-    AnthropicModelInfo._list_models = empty_models
 
-    try:
-        from swival import agent as swival_agent
-        orig_list_models = getattr(swival_agent, "_list_server_models", None)
-        if callable(orig_list_models) and not getattr(
-            orig_list_models, "_pi_swival_anthropic_guarded", False
-        ):
-            def _guarded_list_server_models(litellm_provider, *args, **kwargs):
-                if litellm_provider in ("anthropic", "bedrock", "vertex_ai"):
-                    return []
-                return orig_list_models(litellm_provider, *args, **kwargs)
+def _install_model_discovery_guard(anthropic_model_info, swival_agent):
+    for name in ("get_models", "discover_models", "_list_models"):
+        _required_callable(anthropic_model_info, name)
+    orig_list_models = _required_callable(swival_agent, "_list_server_models")
 
-            _guarded_list_server_models._pi_swival_anthropic_guarded = True
-            swival_agent._list_server_models = _guarded_list_server_models
-    except Exception as exc:
-        if shim_required:
-            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
+    def _empty_models(self, *args, **kwargs):
+        return []
 
-    orig_completion = litellm.completion
+    anthropic_model_info.get_models = _empty_models
+    anthropic_model_info.discover_models = _empty_models
+    anthropic_model_info._list_models = _empty_models
+    if not getattr(orig_list_models, "_pi_swival_anthropic_guarded", False):
+        def _guarded_list_server_models(litellm_provider, *args, **kwargs):
+            if litellm_provider in ("anthropic", "bedrock", "vertex_ai"):
+                return []
+            return orig_list_models(litellm_provider, *args, **kwargs)
+
+        _guarded_list_server_models._pi_swival_anthropic_guarded = True
+        swival_agent._list_server_models = _guarded_list_server_models
+    if swival_agent._list_server_models("anthropic", None, None) != []:
+        raise RuntimeError(f"{SHIM_INSTALL_FAILED_SENTINEL}: model discovery remains active")
+
+
+def _install_oauth_completion_shim(litellm):
+    orig_completion = _required_callable(litellm, "completion")
     if getattr(orig_completion, "_pi_swival_anthropic_oauth", False) is True:
         return
 
@@ -307,6 +272,100 @@ def _install_anthropic_shim():
 
     _wrapped_completion._pi_swival_anthropic_oauth = True
     litellm.completion = _wrapped_completion
+
+
+def install_required_shim(*, require_hooks: bool = False) -> dict[str, bool]:
+    """Install the route-identity hooks and return their attestation.
+
+    Every required upstream target must exist and be callable before it is
+    wrapped. With ``require_hooks`` any missing target (or a non-Swival
+    interpreter) raises ``RuntimeError``; otherwise failures stay silent.
+    Installation is idempotent.
+    """
+    attestation = dict.fromkeys(SHIM_ATTESTATION, False)
+    SHIM_ATTESTATION.update(attestation)
+    if importlib.util.find_spec("swival") is None:
+        if require_hooks:
+            raise RuntimeError(f"{SHIM_INSTALL_FAILED_SENTINEL}: swival is not importable")
+        return attestation
+    suppress_self_review = os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1"
+    os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+    try:
+        import litellm
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+        from swival import agent as swival_agent
+        if suppress_self_review:
+            from swival import config as swival_config
+            _install_self_review_suppression(swival_config)
+            attestation["self_review_suppressed"] = True
+        _install_vertex_bearer_shim(VertexBase)
+        attestation["vertex_bearer"] = True
+        _install_model_discovery_guard(AnthropicModelInfo, swival_agent)
+        attestation["model_discovery_disabled"] = True
+        _install_oauth_completion_shim(litellm)
+        attestation["oauth_headers"] = True
+    except Exception as exc:
+        SHIM_ATTESTATION.update(dict.fromkeys(SHIM_ATTESTATION, False))
+        if require_hooks:
+            raise RuntimeError(SHIM_INSTALL_FAILED_SENTINEL) from exc
+        return dict.fromkeys(SHIM_ATTESTATION, False)
+    _backfill_model_map(litellm)
+    SHIM_ATTESTATION.update(attestation)
+    return attestation
+
+
+def _install_agentfs_evidence_grant():
+    """Grant scratch writes at the OS boundary, not in Swival's tool roots."""
+    raw = os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip()
+    if not raw:
+        return
+    if Path(raw).is_symlink() or not Path(raw).is_dir():
+        raise RuntimeError("Invalid AgentFS evidence directory")
+    from swival import sandbox_agentfs
+    original = sandbox_agentfs.build_agentfs_argv
+    if not callable(original):
+        raise RuntimeError("AgentFS argv builder is unavailable")
+    if getattr(original, "_pi_swival_evidence_grant", False):
+        return
+    evidence_dir = str(Path(raw).resolve())
+
+    def _with_evidence_grant(**kwargs):
+        argv = original(**kwargs)
+        boundary = argv.index("--")
+        if not any(argv[i:i + 2] == ["--allow", evidence_dir] for i in range(boundary - 1)):
+            argv[boundary:boundary] = ["--allow", evidence_dir]
+        return argv
+
+    _with_evidence_grant._pi_swival_evidence_grant = True
+    sandbox_agentfs.build_agentfs_argv = _with_evidence_grant
+
+
+def _install_anthropic_shim():
+    """Interpreter-startup entry: mandatory in native and OAuth-bridged Swival children.
+
+    Tool/reviewer children inherit PYTHONPATH but may use a different Python;
+    an interpreter without Swival installs nothing and stays silent.
+    """
+    if importlib.util.find_spec("swival") is None:
+        return
+    shim_required = (
+        os.environ.get("PI_SWIVAL_SHIM_REQUIRED") == "1"
+        or os.environ.get("PI_SWIVAL_NO_SELF_REVIEW") == "1"
+        or bool(os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip())
+    )
+    if os.environ.get("PI_SWIVAL_EVIDENCE_DIR", "").strip():
+        try:
+            _install_agentfs_evidence_grant()
+        except Exception as exc:
+            raise SystemExit("PI_SWIVAL_SHIM_INSTALL_FAILED") from exc
+        if not (shim_required or os.environ.get("ANTHROPIC_API_KEY", "").startswith("sk-ant-oat")
+                or os.environ.get("ANTHROPIC_OAUTH_TOKEN", "").strip()):
+            return
+    try:
+        install_required_shim(require_hooks=shim_required)
+    except Exception as exc:
+        raise SystemExit(SHIM_INSTALL_FAILED_SENTINEL) from exc
 
 
 _install_anthropic_shim()

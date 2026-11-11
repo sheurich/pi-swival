@@ -443,4 +443,180 @@ describe("independent committed snapshot", () => {
 		await expect(createCommittedSnapshot(source, destination)).rejects.toThrow(/unsupported|path/i);
 		expect(fs.existsSync(destination)).toBe(false);
 	});
+	it("completes whole-tree scope verification when HEAD contains an accepted 120000 directory symlink", async () => {
+		const { createCommittedSnapshot, inspectNativeAudit } = await import("../extensions/native-audit.js");
+		const source = repository();
+		fs.mkdirSync(path.join(source, ".agents", "skills"), { recursive: true });
+		fs.mkdirSync(path.join(source, ".claude"));
+		fs.writeFileSync(path.join(source, ".agents", "skills", "SKILL.md"), "# skill\n");
+		fs.symlinkSync("../.agents/skills", path.join(source, ".claude", "skills"));
+		git(source, "add", "."); git(source, "commit", "-m", "directory alias scope fixture");
+
+		const runDir = scratch();
+		const snapshotDir = path.join(runDir, "snapshot");
+		const manifest = await createCommittedSnapshot(source, snapshotDir);
+		expect(manifest.committedEntries).toContain(".claude/skills");
+		expect(manifest.materializedFiles).not.toContain(".claude/skills");
+		expect(manifest.materializedFiles).toEqual(expect.arrayContaining(["src/code.py", ".agents/skills/SKILL.md"]));
+
+		const home = scratch();
+		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+		fs.writeFileSync(path.join(home, ".config", "swival", "config.toml"),
+			'provider = "chatgpt"\nmodel = "gpt-offline"\n');
+		const { execFile } = await import("node:child_process");
+		const preflight = await new Promise<{ code: number; output: string }>((resolve) => {
+			const child = execFile(python, ["-I", path.join(ROOT, "scripts", "native_audit.py"), "--preflight"], {
+				cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"),
+					LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
+				timeout: PREFLIGHT_PROCESS_TIMEOUT_MS, maxBuffer: 64 * 1024,
+			}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+			child.stdin!.end(JSON.stringify({ source: snapshotDir, snapshot: snapshotDir, audit: { all: true }, routing: {} }));
+		});
+		expect(preflight.code, preflight.output).toBe(0);
+		const preflightParsed = JSON.parse(preflight.output);
+		const scope = preflightParsed.scope;
+		expect(scope.tracked_files).toContain(".claude/skills");
+		expect(scope.mandatory_files).toContain("src/code.py");
+		expect(scope.mandatory_files).not.toContain(".claude/skills");
+
+		const prepared = completeNativeFixture(runDir);
+		prepared.write("manifest.json", {
+			...manifest,
+			sandbox: "agentfs",
+			session: prepared.session,
+			scope,
+			route: preflightParsed.version ? { ...prepared.route, runtime: preflightParsed.runtime } : prepared.route,
+			audit: { all: true },
+			command: prepared.command,
+		});
+		prepared.write("evidence/native-state/abc12345/state.json", {
+			...prepared.state,
+			scope,
+			reviewed_files: scope.mandatory_files,
+			candidate_files: scope.mandatory_files,
+			deep_reviewed_files: scope.mandatory_files,
+		});
+		fs.rmSync(snapshotDir, { recursive: true, force: true });
+
+		const completed = await inspectNativeAudit(runDir, 0);
+		expect(completed.status, completed.error).toBe("completed");
+		expect(completed.answer).toBe("Native source-only result");
+
+		// Tampering mandatory_files to name the unmaterialized directory alias must still fail closed.
+		const tamperedScope = { ...scope, mandatory_files: [...scope.mandatory_files, ".claude/skills"] };
+		prepared.write("manifest.json", {
+			...manifest, sandbox: "agentfs", session: prepared.session, scope: tamperedScope,
+			route: prepared.route, audit: { all: true }, command: prepared.command,
+		});
+		prepared.write("evidence/native-state/abc12345/state.json", {
+			...prepared.state, scope: tamperedScope, reviewed_files: tamperedScope.mandatory_files,
+			candidate_files: tamperedScope.mandatory_files, deep_reviewed_files: tamperedScope.mandatory_files,
+		});
+		expect((await inspectNativeAudit(runDir, 0)).status).toBe("failed");
+	}, 25000);
+	it("imports binary blobs with NULs/newlines, duplicate OIDs, and SHA-256 object format, while rejecting corrupted streams", async () => {
+		const { createCommittedSnapshot } = await import("../extensions/native-audit.js");
+		const { parseCatFileBatch, resolveTrustedGit } = await import("../extensions/native-boundary.js");
+		const { NATIVE_COMPATIBILITY_MANIFEST, NATIVE_FILE_LIMIT } = await import("../extensions/contracts.js");
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+
+		// 1. Binary NUL/newline/fake-header payload + duplicate blob OID across two tracked paths.
+		const source = repository();
+		const binaryPayload = Buffer.concat([
+			Buffer.from([0x00, 0xff, 0x0a, 0x0d, 0x00]),
+			Buffer.from(`${"0".repeat(40)} blob 4\nfake\n`, "latin1"),
+			Buffer.from([0x00, 0xfe, 0x0a]),
+		]);
+		fs.writeFileSync(path.join(source, "src", "first.bin"), binaryPayload);
+		fs.writeFileSync(path.join(source, "src", "duplicate.bin"), binaryPayload);
+		git(source, "add", "."); git(source, "commit", "-m", "binary and duplicate oid fixture");
+		const dest = path.join(scratch(), "snapshot-bin");
+		const manifest = await createCommittedSnapshot(source, dest);
+		expect(fs.readFileSync(path.join(dest, "src", "first.bin")).equals(binaryPayload)).toBe(true);
+		expect(fs.readFileSync(path.join(dest, "src", "duplicate.bin")).equals(binaryPayload)).toBe(true);
+		expect(git(dest, "rev-parse", "HEAD^{tree}").trim()).toBe(manifest.sourceTree);
+
+		// 2. SHA-256 repository import when supported by the host git installation.
+		const sha256Repo = scratch();
+		let sha256Supported = false;
+		try {
+			git(sha256Repo, "init", "--template=", "--object-format=sha256");
+			sha256Supported = true;
+		} catch { /* older git without sha256 */ }
+		if (sha256Supported) {
+			git(sha256Repo, "config", "user.name", "Test");
+			git(sha256Repo, "config", "user.email", "test@example.invalid");
+			fs.writeFileSync(path.join(sha256Repo, "code.py"), "x = 1\n");
+			git(sha256Repo, "add", "."); git(sha256Repo, "commit", "-m", "sha256 fixture");
+			const sha256Dest = path.join(scratch(), "snapshot-sha256");
+			const sha256Manifest = await createCommittedSnapshot(sha256Repo, sha256Dest);
+			expect(sha256Manifest.sourceTree).toHaveLength(64);
+			expect(git(sha256Dest, "rev-parse", "HEAD^{tree}").trim()).toBe(sha256Manifest.sourceTree);
+		}
+
+		// 3. Direct parseCatFileBatch malformed / truncated / reordered / oversize stream checks.
+		const oidA = "a".repeat(40);
+		const oidB = "b".repeat(40);
+		const validSingle = Buffer.concat([Buffer.from(`${oidA} blob 5\n`, "latin1"), Buffer.from("hello\n", "latin1")]);
+		expect(parseCatFileBatch(validSingle, [{ oid: oidA, type: "blob" }]).get(oidA)?.toString()).toBe("hello");
+		// Truncated payload
+		expect(() => parseCatFileBatch(validSingle.subarray(0, validSingle.length - 2), [{ oid: oidA, type: "blob" }]))
+			.toThrow(/malformed/i);
+		// Missing terminating newline (non-LF byte at end)
+		expect(() => parseCatFileBatch(Buffer.from(`${oidA} blob 5\nhelloX`, "latin1"), [{ oid: oidA, type: "blob" }]))
+			.toThrow(/malformed/i);
+		// Missing second requested object
+		expect(() => parseCatFileBatch(validSingle, [{ oid: oidA, type: "blob" }, { oid: oidB, type: "blob" }]))
+			.toThrow(/malformed/i);
+		// Extra trailing bytes after complete stream
+		expect(() => parseCatFileBatch(Buffer.concat([validSingle, Buffer.from("\n")]), [{ oid: oidA, type: "blob" }]))
+			.toThrow(/malformed/i);
+		// Substituted / reordered OID or mismatched object type
+		expect(() => parseCatFileBatch(validSingle, [{ oid: oidB, type: "blob" }])).toThrow(/identity changed/i);
+		expect(() => parseCatFileBatch(validSingle, [{ oid: oidA, type: "tree" }])).toThrow(/identity changed/i);
+		// Oversize header (> NATIVE_FILE_LIMIT)
+		expect(() => parseCatFileBatch(Buffer.from(`${oidA} blob ${NATIVE_FILE_LIMIT + 1}\n`, "latin1"), [{ oid: oidA, type: "blob" }]))
+			.toThrow(/resource limits/i);
+
+		// 4. Loose-object SHA mismatch during createCommittedSnapshot fails closed before commit-tree.
+		const trusted = await resolveTrustedGit(source, { python, git: execFileSync("which", ["git"]).toString().trim(), searchPath: process.env.PATH ?? "" });
+		const wrapperDir = scratch();
+		const fakeGit = path.join(wrapperDir, "git");
+		fs.writeFileSync(fakeGit, [
+			`#!${python}`,
+			"import os, subprocess, sys",
+			`real = ${JSON.stringify(trusted.executable)}`,
+			"if 'cat-file' in sys.argv and '--batch' in sys.argv:",
+			"    proc = subprocess.run([real, *sys.argv[1:]], input=sys.stdin.buffer.read(), capture_output=True)",
+			"    data = bytearray(proc.stdout)",
+			"    nl = data.index(b'\\n')",
+			"    data[nl + 1] ^= 0xff  # flip first content byte while keeping exact header/length",
+			"    sys.stdout.buffer.write(bytes(data))",
+			"    raise SystemExit(proc.returncode)",
+			"os.execv(real, [real, *sys.argv[1:]])",
+		].join("\n") + "\n", { mode: 0o755 });
+		await expect(createCommittedSnapshot(source, path.join(scratch(), "snapshot-corrupt"), { ...trusted, executable: fakeGit }))
+			.rejects.toThrow(/object identity changed/i);
+
+		// 5. Unsupported recorded runtime version in manifest.json fails closed during inspectNativeAudit.
+		for (const mutatedRuntime of [
+			{ ...NATIVE_COMPATIBILITY_MANIFEST, swival: "99.0.0" },
+			{ ...NATIVE_COMPATIBILITY_MANIFEST, litellm: "99.0.0" },
+		]) {
+			const runDir = scratch();
+			const prepared = completeNativeFixture(runDir);
+			prepared.write("manifest.json", {
+				snapshotCommit: prepared.scope.commit,
+				files: prepared.scope.tracked_files,
+				sandbox: "agentfs",
+				session: prepared.session,
+				scope: prepared.scope,
+				route: { ...prepared.route, runtime: mutatedRuntime },
+				audit: { all: true },
+				command: prepared.command,
+			});
+			const res = await inspectNativeAudit(runDir, 0);
+			expect(res.status).toBe("failed");
+		}
+	});
 });

@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFile, spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureNativeRuntime, prepareNativeAudit, type NativeRuntime } from "../extensions/native-audit.js";
 import { fixtureGit, fixtureRepository, nativeScratch } from "./nativeFixtures.js";
+import { nativeTestPython } from "./nativePython.js";
 
 // Permit real, fixed Git plumbing only. Stop before Python/configuration imports,
 // AgentFS availability checks, or a worker can run; never call a provider.
@@ -340,6 +342,104 @@ describe("native runtime configuration roots", () => {
 		expect(f.started).toEqual([f.runtime.python]);
 		expect(f.environment()).toMatchObject({ HOME: f.root, OPENROUTER_API_KEY: "present" });
 		if (kind !== "unset") expect(f.environment()!.XDG_CONFIG_HOME).toBe(kind === "aliased" ? path.join(config, "future") : config);
+		expect(spawn).not.toHaveBeenCalled();
+		expect(fs.existsSync(f.artifacts)).toBe(false);
+	});
+});
+
+describe("native shim trust boundary before preflight", { timeout: 25_000 }, () => {
+	async function isolatedShimFixture() {
+		const f = await fixture();
+		const actualCp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+		vi.mocked(execFile).mockClear().mockImplementation(actualCp.execFile);
+
+		const pinnedPython = path.join(fs.realpathSync(path.dirname(nativeTestPython)), path.basename(nativeTestPython));
+		fs.writeFileSync(f.runtime.cli!, `#!${pinnedPython}\n`, { mode: 0o700 });
+		for (const tool of [f.runtime.agentfs!, f.runtime.nono!]) {
+			fs.writeFileSync(tool, "#!/bin/sh\nexit 1\n", { mode: 0o700 });
+		}
+		f.runtime.python = nativeTestPython;
+		const home = f.runtime.environment!.HOME!;
+		fs.mkdirSync(path.join(home, ".config", "swival"), { recursive: true });
+		fs.writeFileSync(
+			path.join(home, ".config", "swival", "config.toml"),
+			'provider = "anthropic"\nmodel = "claude-mythos-5-2"\nmax_context_tokens = 1000000\n',
+		);
+		f.runtime.environment = { HOME: home, ANTHROPIC_API_KEY: "sk-ant-oat01-synthetic" };
+
+		const installRoot = path.join(f.root, "installed-package");
+		fs.cpSync(fileURLToPath(new URL("../extensions", import.meta.url)), path.join(installRoot, "extensions"), { recursive: true });
+		fs.cpSync(fileURLToPath(new URL("../scripts", import.meta.url)), path.join(installRoot, "scripts"), { recursive: true });
+
+		return { ...f, installRoot, pinnedPython };
+	}
+
+	it.each((["shim-dir", "shim-file", "chained-shim-dir"] as const).flatMap((shimKind) =>
+		(["source", "commonGit", "worktreeGit"] as const).map((rootKind) => [shimKind, rootKind] as const)))(
+		"rejects %s aliased into %s before preflight executes shim code or writes a sentinel", async (shimKind, rootKind) => {
+			const f = await isolatedShimFixture();
+			const sentinel = path.join(f.root, "shim-executed.sentinel");
+			const poisonDir = path.join(f[rootKind], "aliased-shim");
+			fs.mkdirSync(poisonDir, { recursive: true });
+			const poisonFile = path.join(poisonDir, "sitecustomize.py");
+			fs.writeFileSync(poisonFile, `from pathlib import Path\nPath(${JSON.stringify(sentinel)}).write_text("executed")\n`);
+
+			const installedShimDir = path.join(f.installRoot, "scripts", "anthropic_oauth_shim");
+			if (shimKind === "shim-dir") {
+				fs.rmSync(installedShimDir, { recursive: true, force: true });
+				fs.symlinkSync(poisonDir, installedShimDir);
+			} else if (shimKind === "chained-shim-dir") {
+				const intermediate = path.join(f.root, "external-shim-hop");
+				fs.symlinkSync(poisonDir, intermediate);
+				fs.rmSync(installedShimDir, { recursive: true, force: true });
+				fs.symlinkSync(intermediate, installedShimDir);
+			} else {
+				const installedShimFile = path.join(installedShimDir, "sitecustomize.py");
+				fs.unlinkSync(installedShimFile);
+				fs.symlinkSync(poisonFile, installedShimFile);
+			}
+
+			const isolatedNative = await import(pathToFileURL(path.join(f.installRoot, "extensions", "native-audit.ts")).href);
+			await expect(
+				isolatedNative.prepareNativeAudit(
+					f.source, { audit: {} }, { paths: [], all: true, workers: 1, patchMaxTurns: 5 },
+					f.runtime, f.artifacts, "shim-trust", 10_000,
+				),
+			).rejects.toThrow(/refuses repository-owned runtime paths/);
+
+			expect(fs.existsSync(sentinel), "shim code must never execute").toBe(false);
+			expect(
+				vi.mocked(execFile).mock.calls.some(([exe]) => exe === f.pinnedPython || exe === nativeTestPython),
+				"Python preflight must not start before shim validation",
+			).toBe(false);
+			expect(spawn).not.toHaveBeenCalled();
+			expect(fs.existsSync(f.artifacts)).toBe(false);
+		});
+
+	it("attests the exact validated canonical shim file rather than an unvalidated launcher sibling", async () => {
+		const f = await isolatedShimFixture();
+		const sentinel = path.join(f.root, "unvalidated-sibling.sentinel");
+		const externalLauncherDir = path.join(f.root, "external-launcher");
+		fs.mkdirSync(path.join(externalLauncherDir, "anthropic_oauth_shim"), { recursive: true });
+		const installedLauncher = path.join(f.installRoot, "scripts", "native_audit.py");
+		const externalLauncher = path.join(externalLauncherDir, "native_audit.py");
+		fs.renameSync(installedLauncher, externalLauncher);
+		fs.symlinkSync(externalLauncher, installedLauncher);
+		fs.writeFileSync(
+			path.join(externalLauncherDir, "anthropic_oauth_shim", "sitecustomize.py"),
+			`from pathlib import Path\nPath(${JSON.stringify(sentinel)}).write_text("sibling-executed")\n`,
+		);
+
+		const isolatedNative = await import(pathToFileURL(path.join(f.installRoot, "extensions", "native-audit.ts")).href);
+		await expect(
+			isolatedNative.prepareNativeAudit(
+				f.source, { audit: {} }, { paths: [], all: true, workers: 1, patchMaxTurns: 5 },
+				f.runtime, f.artifacts, "shim-canonical", 10_000,
+			),
+		).rejects.toThrow(/local agentfs check failed/);
+
+		expect(vi.mocked(execFile).mock.calls.some(([exe]) => exe === f.pinnedPython)).toBe(true);
+		expect(fs.existsSync(sentinel), "unvalidated launcher sibling shim must never execute").toBe(false);
 		expect(spawn).not.toHaveBeenCalled();
 		expect(fs.existsSync(f.artifacts)).toBe(false);
 	});

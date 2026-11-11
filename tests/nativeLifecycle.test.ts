@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import registerExtension from "../extensions/index.js";
 import { prepareNativeAudit, captureNativeRuntime, type NativeAuditLaunch } from "../extensions/native-audit.js";
 import { nativeTestPython as python } from "./nativePython.js";
-import { fixtureGit, fixtureRepository, nativeScratch, worktree } from "./nativeFixtures.js";
+import { completeNativeFixture, fixtureGit, fixtureRepository, nativeScratch, worktree } from "./nativeFixtures.js";
 const roots: string[] = [];
 const runs: NativeAuditLaunch[] = [];
 const children: ChildProcess[] = [];
@@ -40,6 +40,8 @@ manifest = json.loads((root / 'manifest.json').read_text())
 state = {'scope':manifest['scope'],'reviewed_files':manifest['scope']['mandatory_files'],
  'candidate_files':manifest['scope']['mandatory_files'],'deep_reviewed_files':manifest['scope']['mandatory_files'],
  'phase':'done','artifact_state':{},'verification_state':{},'verified_findings':[],'proposed_findings':[],'metrics':{},'truncated_files':{}}
+if ${JSON.stringify(mode)} == 'reviewer-transient-recovered': state['metrics'] = {'phase45_lens_retries': 1, 'repair_failures': 0}
+if ${JSON.stringify(mode)} == 'evidence-error': state['metrics'] = {'pi_swival_adjudication_errors': 1}
 state_dir = snapshot / '.swival' / 'audit' / 'abc12345'
 state_dir.mkdir(parents=True)
 (state_dir / 'state.json').write_text(json.dumps(state))
@@ -52,7 +54,7 @@ if ${JSON.stringify(mode)} == 'auth-error': report['result'] = {'outcome':'error
 print('synthetic CLI diagnostics', flush=True)
 if ${JSON.stringify(diagnosticReplay)}:
  output = ${JSON.stringify(diagnosticReplay)}
- stream = sys.stdout if ${JSON.stringify(mode)} in ('reviewer-error', 'malformed-reviewers', 'repaired-reviewers', 'reviewer-retry-recovered') else sys.stderr
+ stream = sys.stdout if ${JSON.stringify(mode)} in ('reviewer-error', 'malformed-reviewers', 'repaired-reviewers', 'reviewer-retry-recovered', 'reviewer-transient-recovered') else sys.stderr
  split = output.index('error:') + 3 if 'error:' in output else min(64, len(output))
  stream.write(output[:split]); stream.flush(); time.sleep(.05)
  stream.write(output[split:]); stream.flush()
@@ -289,6 +291,40 @@ describe("synchronous native CLI lifecycle", () => {
 			expect(JSON.parse(diagnostics)).toMatchObject({ closed: true,
 				adjudicationFailure: false, adjudicationRepairFailure: exhausted });
 		}, 45_000);
+	it.each([["reviewer-transient-recovered", "completed"], ["evidence-error", "partial"]])(
+		"reconciles released %s adjudication evidence against recorded Phase 4.5 metrics as %s", async (mode, expected) => {
+			const exported = nativeScratch("released-adjudication-metrics-"); roots.push(exported);
+			const produced = await new Promise<{ code: number; output: string }>((resolve) => {
+				execFile(python, ["-I", "-B", path.join(import.meta.dirname, "native_audit_test.py"), "--export-finding", exported, mode], {
+					timeout: 30_000, maxBuffer: 64 * 1024, env: { ...process.env, LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
+				}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
+			});
+			expect(produced.code, produced.output).toBe(0);
+			const raw = fs.readFileSync(path.join(exported, "released-diagnostics.txt"), "utf8");
+			const states = fs.readdirSync(path.join(exported, "evidence/native-state"));
+			const state = JSON.parse(fs.readFileSync(path.join(exported, "evidence/native-state", states[0], "state.json"), "utf8"));
+			if (mode === "reviewer-transient-recovered") {
+				expect(raw.match(/reviewer\s+error:/g)).toHaveLength(1); expect(raw).not.toContain("repair failed");
+				expect(state.metrics).toMatchObject({ phase45_lens_retries: 1, repair_failures: 0 });
+			} else {
+				expect(raw).toContain("PI_SWIVAL_ADJUDICATION_ERROR"); expect(raw).not.toContain("value-never-export");
+				expect(state.metrics.pi_swival_adjudication_errors).toBe(1);
+			}
+			// Replay the released diagnostics through the production collector; its state carries the same metrics.
+			const f = fixture(mode, raw); const run = await f.start(); const term = await run.completion;
+			expect(term).toMatchObject({ exitCode: 0, shutdown: "verified" }); expect(term.stopped).toBeUndefined();
+			const diagnostics = JSON.parse(fs.readFileSync(path.join(f.artifactDir, "diagnostics.json"), "utf8"));
+			fs.writeFileSync(path.join(exported, "diagnostics.json"), JSON.stringify(diagnostics));
+			const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+			for (const artifactDir of [exported, f.artifactDir]) {
+				const result = await inspectNativeAudit(artifactDir, 0);
+				expect(result.status, result.error).toBe(expected);
+				if (expected === "partial") { expect(result.error).toContain("adjudication"); expect(result.answer).toBeUndefined(); }
+			}
+			expect(diagnostics).toMatchObject(mode === "reviewer-transient-recovered"
+				? { adjudicationFailure: false, adjudicationRepairFailure: false, reviewerErrors: 1, recoveredReviewerErrors: 1 }
+				: { adjudicationFailure: true, adjudicationRepairFailure: false, adjudicationSentinelErrors: 1 });
+		}, 45_000);
 	it.each(["reviewer", "consolidate"])("detects an unterminated wrapped %s marker across writes", async (kind) => {
 		const f = fixture("complete", `  adjudicate [synthetic]: ${kind} \nerror: synthetic-value-never-export`);
 		const run = await f.start(); const term = await run.completion;
@@ -420,4 +456,45 @@ process.send({pid:run.proc.pid}); await run.completion; })().catch(()=>process.e
 		expect(fs.existsSync(path.join(f.artifactDir, "evidence/native-state"))).toBe(false);
 		expect(fs.existsSync(path.join(f.artifactDir, "snapshot"))).toBe(true);
 	}, 25_000);
+
+	it("fails closed as partial when report.result.answer begins with 'Audit incomplete:' or state records adjudication errors", async () => {
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		for (const answer of ["Audit incomplete: stopped early", "  \nAudit incomplete: phase budget exhausted"]) {
+			const runDir = nativeScratch("native-incomplete-answer-"); roots.push(runDir);
+			const prepared = completeNativeFixture(runDir);
+			prepared.write("evidence/native-cli-report.json", {
+				version: 1, task: prepared.command, provider: prepared.route.provider, model: prepared.route.model,
+				settings: { commands: "none", files: "some", instructions_status: "disabled", skills_discovered: [] },
+				network: "provider-only", sandbox: { mode: "builtin" },
+				result: { outcome: "success", exit_code: 0, answer },
+			});
+			const result = await inspectNativeAudit(runDir, 0);
+			expect(result).toEqual({ status: "partial", error: "Native audit reported incomplete execution." });
+		}
+
+		// Recorded state.metrics.pi_swival_adjudication_errors independently fails closed even if stderr missed the sentinel.
+		for (const badCount of [1, -1, "1"]) {
+			const runDir = nativeScratch("native-state-adj-err-"); roots.push(runDir);
+			completeNativeFixture(runDir, { metrics: { pi_swival_adjudication_errors: badCount } });
+			const result = await inspectNativeAudit(runDir, 0);
+			expect(result.status).toBe("partial");
+			expect(result.error).toContain("adjudication");
+			expect(result.answer).toBeUndefined();
+		}
+	});
+
+	it("cancels live execution fail-closed when sitecustomize emits PI_SWIVAL_SHIM_INSTALL_FAILED", async () => {
+		const f = fixture("complete", "PI_SWIVAL_SHIM_INSTALL_FAILED\n");
+		const run = await f.start();
+		const term = await run.completion;
+		expect(term).toMatchObject({
+			exitCode: 1,
+			shutdown: "verified",
+			stopped: "Native compatibility shim installation failed; refusing unverified route execution.",
+		});
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		const result = await inspectNativeAudit(f.artifactDir, term.exitCode);
+		expect(result.status).toBe("failed");
+		expect(result.answer).toBeUndefined();
+	}, 20_000);
 });

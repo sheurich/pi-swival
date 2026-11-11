@@ -46,7 +46,7 @@ describe("discoverSwivalAgents definition isolation", () => {
 		expect(captured.warningEvents).toEqual([]);
 		expect(captured.result.agents.some((a) => a.name === "valid")).toBe(true);
 		expect(captured.result.diagnostics).toEqual([{ code: "invalid_yaml", source: "user" }]);
-		expect(captured.result.dispatchBlocked).toBe(true);
+		expect("dispatchBlocked" in captured.result).toBe(false);
 		expect(JSON.stringify(captured.result.diagnostics)).not.toMatch(/C1_|private|unrecognized/);
 	});
 
@@ -67,12 +67,12 @@ describe("discoverSwivalAgents definition isolation", () => {
 		expect(process.stderr.write).toBe(originalWrite);
 	});
 
-	it("bounds warning diagnostics while retaining the fail-closed identity state", async () => {
+	it("bounds warning diagnostics without blocking valid siblings", async () => {
 		for (let i = 0; i < 20; i++) write(userDir, `${i}.md`, yamlWarningFixtures[0].frontmatter);
 		const captured = await captureAgentYamlWarnings(() => discoverSwivalAgents(root, "user"));
 		expect(captured.emitted.length + captured.stderr.length).toBe(0);
 		expect(captured.result).toMatchObject({
-			diagnosticsTotal: 20, diagnosticsOmitted: 8, dispatchBlocked: true,
+			diagnosticsTotal: 20, diagnosticsOmitted: 8,
 		});
 		expect(captured.result.diagnostics).toEqual(
 			Array.from({ length: 12 }, () => ({ code: "invalid_yaml", source: "user" })),
@@ -88,7 +88,6 @@ describe("discoverSwivalAgents definition isolation", () => {
 		expect(result.agents.filter((a) => a.source === "project").map((a) => a.name))
 			.toEqual(["first", "second"]);
 		expect(result.diagnostics).toEqual([{ code: "invalid_yaml", source: "project" }]);
-		expect(result.dispatchBlocked).toBe(true);
 		expect(JSON.stringify(result.diagnostics)).not.toMatch(/PRIVATE|unclosed|\.md|\//);
 	});
 
@@ -99,7 +98,6 @@ describe("discoverSwivalAgents definition isolation", () => {
 			const result = discoverSwivalAgents(root, "user");
 			expect(result.agents.some((a) => a.name === "valid")).toBe(true);
 			expect(result.diagnostics).toEqual([{ code: "invalid_frontmatter", source: "user" }]);
-			expect(result.dispatchBlocked).toBe(true);
 		},
 	);
 
@@ -112,19 +110,17 @@ describe("discoverSwivalAgents definition isolation", () => {
 		const result = discoverSwivalAgents(root, "user");
 		expect(result.agents.some((a) => a.name === "swival")).toBe(false);
 		expect(result.invalidAgentNames).toContain("swival");
-		expect(result.dispatchBlocked).toBe(false);
 		expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
 	});
 
 	it("does not use a filename as a malformed definition's identity", () => {
 		write(userDir, "swival.md", "description: missing name");
 		const result = discoverSwivalAgents(root, "user");
-		expect(result.dispatchBlocked).toBe(true);
 		expect(result.invalidAgentNames).toEqual([]);
 		expect(result.agents.some((a) => a.name === "swival")).toBe(true);
 	});
 
-	it("bounds diagnostics without losing unresolved identity state", () => {
+	it("bounds diagnostics without losing named invalid tombstones", () => {
 		for (let i = 0; i < 30; i++) {
 			write(userDir, `${String(i).padStart(2, "0")}.md`, `name: invalid-${i}`);
 		}
@@ -134,7 +130,6 @@ describe("discoverSwivalAgents definition isolation", () => {
 		expect(result.diagnosticsTotal).toBe(31);
 		expect(result.diagnosticsOmitted).toBe(19);
 		expect(result.invalidAgentNames).toHaveLength(30);
-		expect(result.dispatchBlocked).toBe(true);
 	});
 });
 
@@ -160,7 +155,6 @@ describe("discoverSwivalAgents exact catalogue identities", () => {
 		const result = discoverSwivalAgents(root, "user");
 		expect(result.agents.some((a) => a.name === name)).toBe(false);
 		expect(result.invalidAgentNames).toEqual([name]);
-		expect(result.dispatchBlocked).toBe(false);
 		expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
 	});
 
@@ -184,11 +178,10 @@ describe("discoverSwivalAgents exact catalogue identities", () => {
 		["boolean", "name: false"],
 		["array", "name: []"],
 		["object", "name: {}"],
-	])("fails closed for an unresolved %s name", (_label, field) => {
+	])("emits bounded warning diagnostic without blocking siblings for %s name", (_label, field) => {
 		write(userDir, "identity.md", `${field}\ndescription: PRIVATE_DESCRIPTION`);
 		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
 		const result = discoverSwivalAgents(root, "user");
-		expect(result.dispatchBlocked).toBe(true);
 		expect(result.invalidAgentNames).toEqual([]);
 		expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
 		expect(result.agents.some((a) => a.name === "valid")).toBe(true);
@@ -201,7 +194,6 @@ describe("discoverSwivalAgents exact catalogue identities", () => {
 		const result = discoverSwivalAgents(root, "both");
 		expect(result.agents.some((a) => a.name === " leading")).toBe(false);
 		expect(result.invalidAgentNames).toEqual([" leading"]);
-		expect(result.dispatchBlocked).toBe(false);
 	});
 });
 
@@ -214,7 +206,6 @@ describe("discoverSwivalAgents frontmatter compatibility", () => {
 			const result = discoverSwivalAgents(root, "user");
 			expect(result.agents.some((a) => a.name === "invalid")).toBe(false);
 			expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
-			expect(result.dispatchBlocked).toBe(true);
 		},
 	);
 
@@ -226,7 +217,6 @@ describe("discoverSwivalAgents frontmatter compatibility", () => {
 			const result = discoverSwivalAgents(root, "user");
 			expect(result.agents.some((a) => a.name === "invalid")).toBe(false);
 			expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
-			expect(result.dispatchBlocked).toBe(true);
 		},
 	);
 
@@ -277,7 +267,6 @@ describe("discoverSwivalAgents frontmatter compatibility", () => {
 			fs.writeFileSync(path.join(userDir, "plain.md"), content);
 			const result = discoverSwivalAgents(root, "user");
 			expect(result.diagnostics).toEqual([{ code: "invalid_definition", source: "user" }]);
-			expect(result.dispatchBlocked).toBe(true);
 		},
 	);
 
@@ -288,12 +277,11 @@ describe("discoverSwivalAgents frontmatter compatibility", () => {
 		["excessive aliases", "name: swival\ndescription: rejected\nseed: &seed [x]\n" +
 			`first: &first [${Array(10).fill("*seed").join(", ")}]\n` +
 			`second: [${Array(11).fill("*first").join(", ")}]`],
-	])("fails closed for %s", (_label, frontmatter) => {
+	])("records invalid_yaml without blocking valid siblings for %s", (_label, frontmatter) => {
 		write(userDir, "invalid.md", frontmatter);
 		write(userDir, "valid.md", "name: valid\ndescription: visible sibling");
 		const result = discoverSwivalAgents(root, "user");
 		expect(result.diagnostics).toEqual([{ code: "invalid_yaml", source: "user" }]);
-		expect(result.dispatchBlocked).toBe(true);
 		expect(result.agents.some((a) => a.name === "valid")).toBe(true);
 	});
 });
@@ -338,7 +326,6 @@ describe("discoverSwivalAgents precedence and containment", () => {
 		const reads = vi.mocked(fs.readFileSync).mockClear();
 		const result = discoverSwivalAgents(root, "user");
 		expect(result.diagnostics).toEqual([{ code: "outside_directory", source: "user" }]);
-		expect(result.dispatchBlocked).toBe(false);
 		expect(result.agents.find((a) => a.name === "swival")?.source).toBe("bundled");
 		expect(reads).toHaveBeenCalled();
 		expect(reads.mock.calls.some(([file]) => file === outside)).toBe(false);
@@ -357,6 +344,5 @@ describe("discoverSwivalAgents precedence and containment", () => {
 			{ code: "unreadable_definition", source: "user" },
 			{ code: "outside_directory", source: "user" },
 		]);
-		expect(result.dispatchBlocked).toBe(true);
 	});
 });

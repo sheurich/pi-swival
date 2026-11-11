@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import registerExtension, {
 	checkRequiresReviewer,
 	isMutatingCwdAgent,
-	READ_ONLY_AUDIT_COMMANDS,
 	resolveAgentBaseDir,
 	resolveDispatchCwd,
 	unknownAgentMessage,
@@ -10,6 +9,9 @@ import registerExtension, {
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 import { discoverSwivalAgents } from "../extensions/agents.js";
 import * as fs from "node:fs";
+
+/** A read-only command allowlist is still a command grant: only files: none plus commands: none is non-mutating. */
+const READ_ONLY_AUDIT_COMMANDS = "git,ls,find,rg,grep,head,tail,wc,pwd";
 import * as os from "node:os";
 import * as path from "node:path";
 

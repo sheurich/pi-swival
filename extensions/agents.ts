@@ -14,6 +14,7 @@ import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { parseDocument } from "yaml";
+import { coerceFrontmatterOptions } from "./args.js";
 
 export type AgentScope = "user" | "project" | "both";
 export type AgentSource = "bundled" | "user" | "project";
@@ -134,7 +135,6 @@ export interface SwivalAgentDiscoveryResult {
 	diagnosticsOmitted: number;
 	/** Internal dispatch guards; never expose names from invalid definitions in the catalogue. */
 	invalidAgentNames: string[];
-	dispatchBlocked: boolean;
 }
 
 const MAX_DISCOVERY_DIAGNOSTICS = 12;
@@ -148,7 +148,7 @@ export function isCatalogueAgentName(name: string | undefined): name is string {
 }
 
 type RawFrontmatter = Record<string, unknown>;
-type Diagnose = (code: AgentDiscoveryCode, source: AgentSource, name?: string) => void;
+type Diagnose = (code: AgentDiscoveryCode, source: AgentSource) => void;
 
 function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; body: string } {
 	// Normalize Pi's BOM/newline forms, but require whole-line frontmatter delimiters.
@@ -166,54 +166,11 @@ function parseAgentFrontmatter(content: string): { frontmatter: RawFrontmatter; 
 	return { frontmatter: document.toJS({ maxAliasCount: 100 }) ?? {}, body };
 }
 
-function asString(v: unknown): string | undefined {
-	if (v === undefined || typeof v === "string") return v;
-	throw new Error("invalid_definition");
-}
-
-function asBool(v: unknown): boolean | undefined {
-	if (v === undefined || typeof v === "boolean") return v;
-	if (typeof v === "string") {
-		const s = v.trim().toLowerCase();
-		if (["true", "yes", "1", "on"].includes(s)) return true;
-		if (["false", "no", "0", "off"].includes(s)) return false;
-	}
-	throw new Error("invalid_definition");
-}
-
-function asStringArray(v: unknown): string[] | undefined {
-	if (v === undefined) return undefined;
-	if (Array.isArray(v) && v.every((x) => typeof x === "string")) return v.filter(Boolean);
-	if (typeof v === "string") {
-		return v
-			.split(",")
-			.map((s) => s.trim())
-			.filter(Boolean);
-	}
-	throw new Error("invalid_definition");
-}
-
-function asEnum<T extends string>(v: unknown, allowed: readonly T[]): T | undefined {
-	if (v === undefined) return undefined;
-	if (typeof v === "string" && allowed.includes(v.trim() as T)) return v.trim() as T;
-	throw new Error("invalid_definition");
-}
-
-function asNumber(v: unknown): number | undefined {
-	if (v === undefined) return undefined;
-	if (typeof v === "number" && Number.isFinite(v)) return v;
-	if (typeof v === "string") {
-		const n = Number(v);
-		if (Number.isFinite(n)) return n;
-	}
-	throw new Error("invalid_definition");
-}
-
 function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose) {
 	const agents: SwivalAgentConfig[] = [];
 	const invalidAgentNames = new Set<string>();
 	const reject = (code: AgentDiscoveryCode, name?: string) => {
-		diagnose(code, source, name);
+		diagnose(code, source);
 		if (name !== undefined) invalidAgentNames.add(name);
 	};
 
@@ -271,82 +228,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource, diagnose: Diagnose)
 
 		let agentConfig: SwivalAgentConfig;
 		try {
-			agentConfig = {
-				name,
-				description,
-				systemPrompt: body,
-				source,
-				filePath,
-
-				provider: asString(fm.provider),
-				profile: asString(fm.profile),
-				model: asString(fm.model),
-				baseUrl: asString(fm.baseUrl),
-				temperature: asNumber(fm.temperature),
-				topP: asNumber(fm.topP),
-				seed: asNumber(fm.seed),
-				reasoningEffort: asString(fm.reasoningEffort),
-				maxOutputTokens: asNumber(fm.maxOutputTokens),
-				maxTurns: asNumber(fm.maxTurns),
-				providerTimeout: asNumber(fm.providerTimeout),
-				initialToolChoice: asEnum(fm.initialToolChoice, ["auto", "required"] as const),
-
-				selfReview: asBool(fm.selfReview),
-				reviewer: asString(fm.reviewer),
-				reviewPrompt: asString(fm.reviewPrompt),
-				verify: asString(fm.verify),
-				maxReviewRounds: asNumber(fm.maxReviewRounds),
-				requiresReviewer: asBool(fm.requiresReviewer),
-
-				sandbox: asEnum(fm.sandbox, ["builtin", "agentfs", "nono"] as const),
-				sandboxSession: asString(fm.sandboxSession),
-				sandboxStrictRead: asBool(fm.sandboxStrictRead),
-				noSandboxAutoSession: asBool(fm.noSandboxAutoSession),
-				nonoProfile: asString(fm.nonoProfile),
-				nonoRollback: asBool(fm.nonoRollback),
-				nonoBlockNet: asBool(fm.nonoBlockNet),
-				nonoAllowDomain: asStringArray(fm.nonoAllowDomain),
-				network: asEnum(fm.network, ["full", "provider-only", "none"] as const),
-				files: asEnum(fm.files, ["none", "some", "all"] as const),
-				commands: asString(fm.commands),
-				commandMiddleware: asString(fm.commandMiddleware),
-				baseDir: asString(fm.baseDir),
-				addDir: asStringArray(fm.addDir),
-				addDirRo: asStringArray(fm.addDirRo),
-				encryptSecrets: asBool(fm.encryptSecrets),
-				noReadGuard: asBool(fm.noReadGuard),
-				yolo: asBool(fm.yolo),
-
-				instructionsFull: asBool(fm.instructionsFull),
-				noInstructions: asBool(fm.noInstructions),
-				noMemory: asBool(fm.noMemory),
-				noSkills: asBool(fm.noSkills),
-				skillsDir: asStringArray(fm.skillsDir),
-
-				maxOutputKb: asNumber(fm.maxOutputKb),
-				maxOutputLines: asNumber(fm.maxOutputLines),
-
-				noLifecycle: asBool(fm.noLifecycle),
-				noMcp: asBool(fm.noMcp),
-				noA2a: asBool(fm.noA2a),
-				noWebSearch: asBool(fm.noWebSearch),
-				noHistory: asBool(fm.noHistory),
-				noContinue: asBool(fm.noContinue),
-				noSubagents: asBool(fm.noSubagents),
-				subagents: asBool(fm.subagents),
-
-				a2aConfig: asString(fm.a2aConfig),
-				allowA2a: asBool(fm.allowA2a),
-
-				quiet: asBool(fm.quiet),
-				extraArgs: asStringArray(fm.extraArgs),
-
-				cache: asBool(fm.cache),
-				cacheDir: asString(fm.cacheDir),
-
-				proactiveSummaries: asBool(fm.proactiveSummaries),
-				retries: asNumber(fm.retries),
-			};
+			agentConfig = { name, description, systemPrompt: body, source, filePath, ...coerceFrontmatterOptions(fm) };
 		} catch {
 			reject("invalid_definition", name);
 			continue;
@@ -441,13 +323,12 @@ export function discoverSwivalAgents(cwd: string, scope: AgentScope): SwivalAgen
 
 	const diagnostics: AgentDiscoveryDiagnostic[] = [];
 	let diagnosticsTotal = 0;
-	let dispatchBlocked = false;
-	const diagnose: Diagnose = (code, source, name) => {
+	// A malformed file without an identity is reported, never allowed to veto
+	// unrelated valid agents. Only an identifiable invalid definition blocks a
+	// requested name (see invalidAgentNames below).
+	const diagnose: Diagnose = (code, source) => {
 		diagnosticsTotal++;
 		if (diagnostics.length < MAX_DISCOVERY_DIAGNOSTICS) diagnostics.push({ code, source });
-		// An excluded symlink is not an admitted definition and cannot veto
-		// valid agents. Its target remains unread; in-scope failures fail closed.
-		if (name === undefined && code !== "outside_directory") dispatchBlocked = true;
 	};
 
 	// Invalid identities remain tombstones so a broken override cannot select
@@ -481,6 +362,5 @@ export function discoverSwivalAgents(cwd: string, scope: AgentScope): SwivalAgen
 		diagnosticsTotal,
 		diagnosticsOmitted: diagnosticsTotal - diagnostics.length,
 		invalidAgentNames: Array.from(invalidAgentNames).sort(),
-		dispatchBlocked,
 	};
 }

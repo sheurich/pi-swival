@@ -1,21 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createRequire } from "node:module";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { completeNativeFixture, nativeScratch } from "./nativeFixtures.js";
-import { inspectNativeAudit } from "../extensions/native-audit.js";
+import { finalizeNativeAudit, inspectNativeAudit, readNativeTerminal } from "../extensions/native-audit.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { pruneOldArtifacts } from "../extensions/index.js";
 
 const require = createRequire(import.meta.url);
-const library = path.resolve(import.meta.dirname, "../scripts/native-audit-lifecycle.cjs");
 const roots: string[] = [];
 const children: ChildProcess[] = [];
+// The finalizer reads node:fs through its ESM facade; spies on the CJS exports must be synced into it.
 const actualFs = require("node:fs") as typeof fs;
-function lifecycle(): any {
-	expect(fs.existsSync(library), "The native callers need one shared lifecycle library").toBe(true);
-	return require(library);
-}
 function fixture() {
 	const runDir = nativeScratch("native-finalization-");
 	roots.push(runDir);
@@ -32,16 +28,16 @@ function fixture() {
 }
 const absent = { verify: async () => true, signal: () => { throw Object.assign(new Error("absent"), { code: "ESRCH" }); } };
 afterEach(() => {
-	vi.restoreAllMocks();
+	vi.restoreAllMocks(); syncBuiltinESMExports();
 	for (const child of children.splice(0)) if (child.pid) {
 		try { process.kill(-child.pid, "SIGKILL"); } catch { /* live test handle already exited */ }
 	}
 	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
-describe("native-audit-lifecycle shared finalization", () => {
+describe("native-audit shared finalization", () => {
 	it("retains AgentFS resources when group ESRCH lacks live AgentFS session teardown proof", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		fs.writeFileSync(path.join(f.runDir, "request.json"), JSON.stringify({ sandbox: "agentfs" }));
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: { signal: absent.signal } }, { exitCode: 0 });
 		expect(term.shutdown).toBe("unverified"); expect(term.exitCode).toBe(1);
@@ -50,7 +46,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("exports AgentFS evidence only after live AgentFS session teardown proof", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		fs.writeFileSync(path.join(f.runDir, "request.json"), JSON.stringify({ sandbox: "agentfs" }));
 		let checked = false;
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: { ...absent,
@@ -65,7 +61,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 		["string", "0", "partial"], ["null", null, "partial"], ["boolean", false, "partial"],
 		["object", {}, "partial"], ["array", [], "partial"], ["unsafe", 2 ** 53, "partial"],
 	] as const)("preserves and checks %s truncated_calls after finalization", async (_name, count, status) => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const metrics = count === undefined ? {} : { truncated_calls: count };
 		const prepared = completeNativeFixture(f.runDir, { metrics });
 		fs.writeFileSync(path.join(f.state, "state.json"), JSON.stringify(prepared.state));
@@ -84,7 +80,6 @@ describe("native-audit-lifecycle shared finalization", () => {
 
 	it("preserves byte-identical stopped evidence before removing all owned temporary resources", async () => {
 		const f = fixture();
-		const { finalizeNativeAudit, readNativeTerminal } = lifecycle();
 		const direct = fs.readFileSync(path.join(f.runDir, "evidence", "native-result.json"));
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
 		expect(term.shutdown).toBe("verified"); expect(term.exitCode).toBe(0);
@@ -99,7 +94,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("escalates a TERM-ignoring live group and requires ESRCH before evidence export", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); process.send('ready'); setInterval(()=>{},1000)"],
 			{ detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] }); children.push(child);
 		await new Promise<void>((resolve) => child.once("message", () => resolve()));
@@ -113,7 +108,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	}, 5000);
 
 	it("does not copy or delete mutable sources when group absence remains unverified", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: { signal: () => {
 			throw Object.assign(new Error("denied"), { code: "EPERM" });
 		} } }, { exitCode: 0 });
@@ -125,16 +120,17 @@ describe("native-audit-lifecycle shared finalization", () => {
 	}, 5000);
 
 	it("retries interrupted export only for matching regular evidence destinations", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const link = actualFs.linkSync; let publications = 0;
 		const fault = vi.spyOn(actualFs, "linkSync").mockImplementation((from, to) => {
 			if (String(to).includes(`${path.sep}evidence${path.sep}`) && ++publications === 2) throw new Error("test interrupted export");
 			return link(from, to);
 		});
+		syncBuiltinESMExports();
 		const failed = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
 		expect(failed.preservationFailure).toBeTruthy();
 		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(true);
-		fault.mockRestore(); fs.rmSync(path.join(f.runDir, "completed.json"));
+		fault.mockRestore(); syncBuiltinESMExports(); fs.rmSync(path.join(f.runDir, "completed.json"));
 		const retried = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 1 });
 		expect(retried.preservationFailure).toBeUndefined();
 		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
@@ -142,7 +138,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 
 	it.each(["symlink-state", "symlink-parent", "symlink-destination", "conflict", "nonregular", "oversize", "entries", "total"])(
 		"retains source diagnosis and refuses unsafe or excessive %s evidence", async (kind) => {
-			const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+			const f = fixture();
 			if (kind === "symlink-state") {
 				fs.rmSync(path.join(f.state, "state.json")); fs.symlinkSync(path.join(f.runDir, "request.json"), path.join(f.state, "state.json"));
 			}
@@ -171,7 +167,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	it.each(["native-state", "audit-findings"].flatMap((namespace) =>
 		["oversize", "total", "entries", "symlink", "directory-symlink", "nonregular"].map((kind) => [namespace, kind] as const)))
 		("rejects unmatched retained %s/%s evidence before snapshot cleanup", async (namespace, kind) => {
-			const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+			const f = fixture();
 			const retained = path.join(f.runDir, "evidence", namespace, "extra");
 			fs.mkdirSync(retained, { recursive: true });
 			const file = path.join(retained, "unmatched.bin");
@@ -193,7 +189,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 		}, 10000);
 
 	it("limits the union of unmatched retained bytes and newly published bytes", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const retained = path.join(f.runDir, "evidence", "audit-findings"); fs.mkdirSync(retained);
 		for (let i = 0; i < 9; i++) {
 			const file = path.join(i < 4 ? retained : f.findings, `${i}.patch`);
@@ -205,7 +201,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("does not double-charge byte-identical retry destinations near the combined limit", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const retained = path.join(f.runDir, "evidence", "audit-findings"); fs.mkdirSync(retained);
 		for (let i = 0; i < 7; i++) {
 			const file = path.join(retained, `${i}.bin`); fs.writeFileSync(file, ""); fs.truncateSync(file, 8 * 1024 * 1024);
@@ -219,13 +215,14 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("keeps preservation and cleanup diagnostics distinct", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		fs.truncateSync(path.join(f.state, "state.json"), 8 * 1024 * 1024 + 1);
 		const rm = actualFs.rmSync;
 		vi.spyOn(actualFs, "rmSync").mockImplementation((file, options) => {
 			if (String(file).endsWith("runtime-bin")) throw new Error("test cleanup EIO");
 			return rm(file, options);
 		});
+		syncBuiltinESMExports();
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent,
 			closeLogs: () => { throw new Error("test log drain EIO"); } }, { exitCode: 0, stopped: "Native audit timed out." });
 		expect(term.stopped).toBe("Native audit timed out.");
@@ -234,7 +231,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("writes atomic fallback failure when only completion persistence fails", async () => {
-		const f = fixture(); const { finalizeNativeAudit, readNativeTerminal } = lifecycle();
+		const f = fixture();
 		fs.mkdirSync(path.join(f.runDir, "completed.json"));
 		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
 		expect(term.exitCode).toBe(1); expect(term.persistenceFailure).toMatch(/completion/i);
@@ -243,7 +240,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("explicitly fails both persistence paths without inventing disk terminal evidence", async () => {
-		const f = fixture(); const { finalizeNativeAudit, readNativeTerminal } = lifecycle();
+		const f = fixture();
 		for (const name of ["completed.json", "spawn-error.txt"]) fs.mkdirSync(path.join(f.runDir, name));
 		await expect(finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 1 }))
 			.rejects.toThrow(/terminal.*could not be persisted/i);
@@ -251,7 +248,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("does not re-signal or rewrite valid terminal evidence", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		await finalizeNativeAudit({ runDir: f.runDir, ownership: absent }, { exitCode: 0 });
 		const original = fs.readFileSync(path.join(f.runDir, "completed.json"));
 		const signal = vi.fn();
@@ -260,7 +257,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("repairs explicitly unverified shutdown only with retained live ownership", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		fs.writeFileSync(path.join(f.runDir, "completed.json"), JSON.stringify({ exitCode: 1,
 			exitedAt: new Date().toISOString(), shutdown: "unverified", stopped: "interrupted",
 			shutdownFailure: "Native process-group cleanup could not be verified." }));
@@ -270,7 +267,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("never deletes a legacy AgentFS session from native finalization options", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const sessionDir = path.join(f.runDir, "legacy-session"); fs.mkdirSync(sessionDir);
 		fs.writeFileSync(path.join(sessionDir, "keep"), "unchanged");
 		await finalizeNativeAudit({ runDir: f.runDir, ownership: absent, sessionDir, sessionOwned: true }, { exitCode: 1 });
@@ -278,7 +275,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("preserves pre-existing sessions rather than claiming cleanup ownership", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const sessionDir = path.join(f.runDir, "existing-session"); fs.mkdirSync(sessionDir);
 		fs.writeFileSync(path.join(sessionDir, "keep"), "existing");
 		const term = await finalizeNativeAudit({ runDir: f.runDir, sessionDir, sessionOwned: false },
@@ -287,7 +284,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("does not traverse unsafe session ancestors during owned-resource cleanup", async () => {
-		const f = fixture(); const { finalizeNativeAudit } = lifecycle();
+		const f = fixture();
 		const external = path.join(f.runDir, "external"); const actualSession = path.join(external, "fresh-session");
 		fs.mkdirSync(actualSession, { recursive: true }); fs.writeFileSync(path.join(actualSession, "keep"), "unchanged");
 		const link = path.join(f.runDir, "linked-session-root"); fs.symlinkSync(external, link);
@@ -300,7 +297,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 
 	it.each(["string-code", "missing-shutdown", "success-fallback", "malformed", "symlink", "oversize"])(
 		"rejects %s native terminal records instead of laundering their status", (kind) => {
-			const f = fixture(); const { readNativeTerminal } = lifecycle();
+			const f = fixture();
 			const target = path.join(f.runDir, kind === "success-fallback" ? "spawn-error.txt" : "completed.json");
 			fs.writeFileSync(target, kind === "malformed" ? "{" : JSON.stringify({ exitCode: kind === "string-code" ? "0" : 0,
 				exitedAt: new Date().toISOString(), ...(kind !== "missing-shutdown" ? { shutdown: "verified" } : {}) }));
@@ -321,7 +318,7 @@ describe("native-audit-lifecycle shared finalization", () => {
 	});
 
 	it("accepts bounded legacy fallback text only as unverified failure evidence", () => {
-		const f = fixture(); const { readNativeTerminal } = lifecycle();
+		const f = fixture();
 		fs.writeFileSync(path.join(f.runDir, "spawn-error.txt"), "Legacy native launch failed.");
 		const term = readNativeTerminal(f.runDir);
 		expect(term.exitCode).toBe(1); expect(term.shutdown).toBe("unverified"); expect(term.stopped).toContain("Legacy");

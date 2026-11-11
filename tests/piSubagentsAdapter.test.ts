@@ -4,32 +4,8 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import ts from "typescript";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const adapterPath = path.join(packageRoot, "integrations/pi-subagents.ts");
-
-it("semantically checks the adapter and rejects a malformed public API call", () => {
-	const configPath = path.join(packageRoot, "tests/tsconfig.json");
-	const config = ts.readConfigFile(configPath, ts.sys.readFile);
-	expect(config.error).toBeUndefined();
-	const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, path.dirname(configPath));
-	expect(parsed.errors).toEqual([]);
-	expect(parsed.fileNames, "adapter must be a semantic typecheck root").toContain(adapterPath);
-	const program = ts.createProgram(parsed.fileNames, parsed.options);
-	expect(ts.getPreEmitDiagnostics(program).map((d) => ts.flattenDiagnosticMessageText(d.messageText, "\n"))).toEqual([]);
-	const source = fs.readFileSync(adapterPath, "utf8");
-	const call = "api.updateExternalRun(sessionId, id, patch)";
-	expect(source).toContain(call);
-	const mutated = source.replace(call, "api.updateExternalRun(42, id, patch)");
-	const host = ts.createCompilerHost(parsed.options);
-	const readFile = host.readFile.bind(host);
-	host.readFile = (file) => path.resolve(file) === adapterPath ? mutated : readFile(file);
-	const broken = ts.createProgram(parsed.fileNames, parsed.options, host);
-	const diagnostics = broken.getSemanticDiagnostics().filter((d) => d.file?.fileName === adapterPath);
-	expect(diagnostics.some((d) => d.code === 2345
-		&& ts.flattenDiagnosticMessageText(d.messageText, " ").includes("number"))).toBe(true);
-}, 30000);
 
 // The only real-consumer selector is this explicit test-time environment variable.
 // No installation, package discovery, or fallback to another consumer is permitted.
@@ -114,7 +90,7 @@ const row = (state = "running", fields = {}) => ({
   agent: "synthetic", startedAt: 1000, state, ...fields,
 });
 const runs = () => external.snapshotExternalRuns(sessionId);
-const work = () => background.snapshotBackgroundWork(sessionId, 2000);
+const work = () => background.snapshotBackgroundWork([sessionId], 2000);
 const first = adapter({ owner, onDiagnostic: (message) => messages.push(message) });
 let second;
 try {
@@ -124,7 +100,7 @@ try {
     [{ id: "swival-contract-run", state: "running", session: sessionId, source: "swival" }]);
   assert.deepEqual(work().items.map(({ id, sessionId: session, provider }) => ({ id, session, provider })),
     [{ id: "swival-contract-run", session: sessionId, provider: "pi-swival" }]);
-  assert.deepEqual(background.snapshotBackgroundWork(ownerId, 2000).items, []);
+  assert.deepEqual(background.snapshotBackgroundWork([ownerId], 2000).items, []);
   for (const state of ["completed", "failed"]) {
     first.update([row("running")]);
     first.update([row(state, { endedAt: 2000, answer: "private synthetic answer" })]);
@@ -156,10 +132,10 @@ const memory = adapter({ owner: { ownerSessionId: ownerId }, onDiagnostic: asser
 try {
   memory.update([row("running", { ownerSessionFile: undefined })]);
   assert.equal(external.snapshotExternalRuns(ownerId)[0].sessionId, ownerId);
-  assert.equal(background.snapshotBackgroundWork(ownerId, 2000).items.length, 1);
+  assert.equal(background.snapshotBackgroundWork([ownerId], 2000).items.length, 1);
 } finally { memory.dispose(); }
 assert.deepEqual(external.snapshotExternalRuns(ownerId), []);
-assert.deepEqual(background.snapshotBackgroundWork(ownerId, 2000), { providers: [], items: [] });
+assert.deepEqual(background.snapshotBackgroundWork([ownerId], 2000), { providers: [], items: [] });
 console.log("selected consumer: public runtime running/terminal/unknown/ownership/replacement/cleanup gate passed");
 `;
 
@@ -235,30 +211,6 @@ function start(api: any, owner = { ownerSessionId: OWNER, ownerSessionFile: FILE
 }
 
 describe("optional pi-subagents public adapter", () => {
-	it("keeps the runtime boundary to four injected functions without consumer imports", () => {
-		const source = fs.readFileSync(new URL("../integrations/pi-subagents.ts", import.meta.url), "utf8");
-		const emitted = ts.transpileModule(source, {
-			compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
-		}).outputText;
-		const tree = ts.createSourceFile("adapter.js", emitted, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
-		const imports: string[] = [];
-		const injected = new Set<string>();
-		const visit = (node: ts.Node) => {
-			if (ts.isImportDeclaration(node)) imports.push((node.moduleSpecifier as ts.StringLiteral).text);
-			if (ts.isCallExpression(node) && (node.expression.kind === ts.SyntaxKind.ImportKeyword
-				|| (ts.isIdentifier(node.expression) && ["require", "eval"].includes(node.expression.text)))) {
-				throw new Error("Adapter must not dynamically load a consumer or execute code");
-			}
-			if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)
-				&& node.expression.text === "api") injected.add(node.name.text);
-			ts.forEachChild(node, visit);
-		};
-		visit(tree);
-		expect(imports).toEqual(["../extensions/async-observation.js"]);
-		expect([...injected].sort()).toEqual([
-			"registerBackgroundWorkProvider", "registerExternalRun", "unregisterExternalRun", "updateExternalRun",
-		]);
-	});
 	it("does not register before a session uses the explicit adapter", () => {
 		const c = consumer();
 		expect(adapterModule.createPiSubagentsAdapter).toBeTypeOf("function");

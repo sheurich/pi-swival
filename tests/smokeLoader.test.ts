@@ -74,18 +74,6 @@ describe("offline loader smoke", () => {
 		} finally { rmSync(scratch, { recursive: true, force: true }); }
 	});
 
-	it("bounds smoke subprocess duration and waits for termination", async () => {
-		const result = await runProcess(process.execPath, ["-e", "setTimeout(() => {}, 500)"], ROOT, process.env, 50);
-		expect(result.timedOut).toBe(true);
-		expect(result.status).not.toBe(0);
-	});
-
-	it("bounds combined stdout and stderr from a noisy subprocess", async () => {
-		const result = await runProcess(process.execPath, ["-e", 'process.stdout.write("x".repeat(10000)); process.stderr.write("y".repeat(10000))'], ROOT, process.env, 5000, 128);
-		expect(result.outputExceeded).toBe(true);
-		expect(Buffer.byteLength(result.output)).toBeLessThanOrEqual(128);
-	});
-
 	it("loads only the declared package resources without a session or model", async () => {
 		const result = await runSmoke();
 

@@ -2,7 +2,8 @@ import { expect, it } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ANTHROPIC_OAUTH_SHIM_DIR, resolveSwivalEvidenceEnv } from "../extensions/index.js";
+import { ANTHROPIC_OAUTH_SHIM_DIR } from "../extensions/contracts.js";
+import { resolveSwivalEvidenceEnv } from "../extensions/child-env.js";
 
 it.each([
 	{ args: ["--sandbox", "agentfs"], project: "", global: "", granted: true },

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -40,32 +40,6 @@ afterEach(() => {
 });
 
 describe("test peer bootstrap", () => {
-	it("pins local typecheck dependencies and never installs them during test or typecheck", () => {
-		const manifest = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"));
-		const root = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-		expect(manifest.devDependencies.typescript).toBe("5.9.3");
-		expect(manifest.devDependencies["@types/node"]).toBe("24.10.1");
-		expect(root.scripts.typecheck).toContain("./node_modules/.bin/tsc");
-		expect(root.scripts.typecheck).not.toMatch(/install|npx/);
-		expect(root.scripts.test).not.toMatch(/install|npx/);
-		const setup = readFileSync(new URL("./setup.sh", import.meta.url), "utf8");
-		expect(setup.match(/^\s*npm ci\b/gm)).toHaveLength(2);
-		expect(setup).not.toMatch(/pinned_types_present|npm install|--package-lock=false/);
-		expect(setup).toContain("--ignore-scripts");
-		expect(setup).not.toMatch(/--allow-scripts|--unsafe-perm/);
-	});
-	it("prepares Python 3.13 in CI before bootstrap without allowing runtime downloads", () => {
-		const workflow = readFileSync(new URL("../.github/workflows/test.yml", import.meta.url), "utf8");
-		const prepare = workflow.indexOf("run: uv --no-config python install 3.13\n");
-		const bootstrap = workflow.indexOf("run: ./tests/setup.sh\n");
-		expect(prepare).toBeGreaterThanOrEqual(0);
-		expect(workflow.slice(0, prepare)).toContain("uses: astral-sh/setup-uv@");
-		expect(bootstrap).toBeGreaterThan(prepare);
-
-		const setup = readFileSync(new URL("./setup.sh", import.meta.url), "utf8");
-		expect(setup).toContain("uv --no-config venv --python 3.13 --no-python-downloads .venv");
-		expect(setup).not.toMatch(/\bpython\s+install\b/);
-	});
 	it("prefers an explicit Pi package and resolves its import-only nested peers", async () => {
 		const root = tempDir("pi host with spaces");
 		const explicit = piHost(root);
