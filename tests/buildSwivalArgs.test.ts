@@ -897,80 +897,90 @@ describe("buildSwivalArgs", () => {
 });
 
 describe("resolveSwivalChildEnv", () => {
-	it("bridges fastly-arc key when effective provider is generic and base_url is arc.fastly.app", () => {
+	const GATEWAY_PROVIDER = "acme-gateway";
+	const GATEWAY_BASE_URL = "https://gateway.example.com/v1";
+	const GATEWAY_KEY = "synthetic-gateway-token";
+
+	function writePiAgentFiles(agentDir: string, options: { models?: unknown; auth?: unknown; modelsMode?: number } = {}): void {
+		fs.mkdirSync(agentDir, { recursive: true });
+		const models = options.models ?? { providers: { [GATEWAY_PROVIDER]: { baseUrl: GATEWAY_BASE_URL, api: "openai-completions", models: [] } } };
+		const auth = options.auth ?? { [GATEWAY_PROVIDER]: { type: "api_key", key: GATEWAY_KEY } };
+		fs.writeFileSync(path.join(agentDir, "models.json"), typeof models === "string" ? models : JSON.stringify(models), { mode: options.modelsMode ?? 0o644 });
+		fs.writeFileSync(path.join(agentDir, "auth.json"), JSON.stringify(auth), { mode: 0o600 });
+	}
+
+	it("bridges the matching Pi custom-provider key when effective provider is generic and base_url serves its models.json baseUrl", () => {
 		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
 		try {
 			const agentDir = path.join(tmpHome, ".pi", "agent");
 			const cfgDir = path.join(tmpHome, ".config", "swival");
 			const xdgDir = path.join(tmpHome, "xdg", "swival");
-			fs.mkdirSync(agentDir, { recursive: true });
 			fs.mkdirSync(cfgDir, { recursive: true });
 			fs.mkdirSync(xdgDir, { recursive: true });
-			fs.writeFileSync(
-				path.join(agentDir, "auth.json"),
-				JSON.stringify({ "fastly-arc": { type: "api_key", key: "synthetic-arc-token" } }),
-				{ mode: 0o600 },
-			);
+			writePiAgentFiles(agentDir);
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
 				[
 					'active_profile = "vertex-gemini-flash"',
 					"[profiles.vertex-gemini-flash]",
 					'provider = "geap"',
-					"[profiles.arc-gpt-sol]",
+					"[profiles.gw-gpt-sol]",
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
+					`base_url = "${GATEWAY_BASE_URL}"`,
 				].join("\n"),
 			);
-			// 1. Explicit --profile resolving to generic + https://arc.fastly.app/v1 in config.toml
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
+			// 1. Explicit --profile resolving to generic + the gateway base_url in config.toml
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], { PATH: "/usr/bin" }, tmpHome, tmpHome)).toEqual({
 				PATH: "/usr/bin",
-				OPENAI_API_KEY: "synthetic-arc-token",
+				OPENAI_API_KEY: GATEWAY_KEY,
 			});
-			// 2. Explicit CLI --provider generic + --base-url https://arc.fastly.app/v1 without config.toml profile
+			// 2. Explicit CLI --provider generic + --base-url without config.toml profile
 			expect(
 				resolveSwivalChildEnv(
-					["--provider", "generic", "--base-url", "https://arc.fastly.app/v1", "--"],
+					["--provider", "generic", "--base-url", GATEWAY_BASE_URL, "--"],
 					{ PATH: "/usr/bin" },
 					tmpHome,
 					tmpHome,
 				),
 			).toEqual({
 				PATH: "/usr/bin",
-				OPENAI_API_KEY: "synthetic-arc-token",
+				OPENAI_API_KEY: GATEWAY_KEY,
 			});
 			// 3. active_profile in XDG_CONFIG_HOME/swival/config.toml
 			fs.writeFileSync(
 				path.join(xdgDir, "config.toml"),
-				['active_profile = "arc-gpt-sol"', "[profiles.arc-gpt-sol]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
+				['active_profile = "gw-gpt-sol"', "[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"),
 			);
 			expect(
 				resolveSwivalChildEnv(["--"], { PATH: "/usr/bin", XDG_CONFIG_HOME: path.join(tmpHome, "xdg") }, tmpHome, tmpHome),
 			).toEqual({
 				PATH: "/usr/bin",
 				XDG_CONFIG_HOME: path.join(tmpHome, "xdg"),
-				OPENAI_API_KEY: "synthetic-arc-token",
+				OPENAI_API_KEY: GATEWAY_KEY,
 			});
+			// 4. A provider whose baseUrl is an ancestor path or the bare origin still matches a deeper route
+			for (const ancestor of ["https://gateway.example.com", "https://gateway.example.com/", "https://Gateway.Example.com/v1/"]) {
+				writePiAgentFiles(agentDir, { models: { providers: { [GATEWAY_PROVIDER]: { baseUrl: ancestor } } } });
+				expect(
+					resolveSwivalChildEnv(["--provider", "generic", "--base-url", `${GATEWAY_BASE_URL}/chat`, "--"], {}, tmpHome, tmpHome),
+					ancestor,
+				).toEqual({ OPENAI_API_KEY: GATEWAY_KEY });
+			}
 		} finally {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		}
 	});
 
-	it("fails closed on non-arc routes, reviewer-only strings, misleading profile names, project swival.toml, and unsafe auth.json", () => {
+	it("fails closed on unmatched routes, reviewer-only strings, misleading profile names, project swival.toml, and unsafe auth.json", () => {
 		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
 		try {
 			const agentDir = path.join(tmpHome, ".pi", "agent");
 			const cfgDir = path.join(tmpHome, ".config", "swival");
 			const repoDir = path.join(tmpHome, "repo");
-			fs.mkdirSync(agentDir, { recursive: true });
 			fs.mkdirSync(cfgDir, { recursive: true });
 			fs.mkdirSync(repoDir, { recursive: true });
+			writePiAgentFiles(agentDir);
 			const authFile = path.join(agentDir, "auth.json");
-			fs.writeFileSync(
-				authFile,
-				JSON.stringify({ "fastly-arc": { type: "api_key", key: "synthetic-arc-token" } }),
-				{ mode: 0o600 },
-			);
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
 				[
@@ -978,67 +988,67 @@ describe("resolveSwivalChildEnv", () => {
 					"[profiles.local-qwen]",
 					'provider = "generic"',
 					'base_url = "http://127.0.0.1:8000/v1"',
-					"[profiles.arc-misleading]",
+					"[profiles.gw-misleading]",
 					'provider = "generic"',
 					'base_url = "https://attacker.example/v1"',
-					"[profiles.arc-gpt-sol]",
+					"[profiles.gw-gpt-sol]",
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
+					`base_url = "${GATEWAY_BASE_URL}"`,
 				].join("\n"),
 			);
-			// External --reviewer fails closed even when main profile is arc-gpt-sol
+			// External --reviewer fails closed even when main profile is gw-gpt-sol
 			expect(
 				resolveSwivalChildEnv(
-					["--profile", "arc-gpt-sol", "--reviewer", "swival --profile local-qwen --reviewer-mode", "--"],
+					["--profile", "gw-gpt-sol", "--reviewer", "swival --profile local-qwen --reviewer-mode", "--"],
 					{},
 					tmpHome,
 					repoDir,
 				),
 			).toBeUndefined();
-			// Profile named arc-* but pointing to non-arc base_url in config.toml must NOT bridge
-			expect(resolveSwivalChildEnv(["--profile", "arc-misleading", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			// Profile named gw-* but pointing to an unmatched base_url in config.toml must NOT bridge
+			expect(resolveSwivalChildEnv(["--profile", "gw-misleading", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			// Existing OPENAI_API_KEY is preserved
 			expect(
-				resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], { OPENAI_API_KEY: "existing" }, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], { OPENAI_API_KEY: "existing" }, tmpHome, repoDir),
 			).toBeUndefined();
 			// Non-generic --provider override fails closed
 			expect(
-				resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--provider", "google", "--"], {}, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--provider", "google", "--"], {}, tmpHome, repoDir),
 			).toBeUndefined();
-			// Non-arc --base-url override fails closed
+			// Unmatched --base-url override fails closed
 			expect(
 				resolveSwivalChildEnv(
-					["--profile", "arc-gpt-sol", "--base-url", "https://attacker.example/v1", "--"],
+					["--profile", "gw-gpt-sol", "--base-url", "https://attacker.example/v1", "--"],
 					{},
 					tmpHome,
 					repoDir,
 				),
 			).toBeUndefined();
-			// --system-prompt value containing "--profile=arc-gpt-sol" does not spoof CLI flags
+			// --system-prompt value containing "--profile=gw-gpt-sol" does not spoof CLI flags
 			expect(
-				resolveSwivalChildEnv(["--system-prompt", "--profile=arc-gpt-sol", "--"], {}, tmpHome, repoDir),
+				resolveSwivalChildEnv(["--system-prompt", "--profile=gw-gpt-sol", "--"], {}, tmpHome, repoDir),
 			).toBeUndefined();
 			// Profile with quoted TOML key or omitted base_url must NOT fall back to root base_url
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
 				[
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
-					"[profiles.arc-quoted]",
+					`base_url = "${GATEWAY_BASE_URL}"`,
+					"[profiles.gw-quoted]",
 					'provider = "generic"',
 					'"base_url" = "http://127.0.0.1:8000/v1"',
-					"[profiles.arc-gpt-sol]",
+					"[profiles.gw-gpt-sol]",
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
+					`base_url = "${GATEWAY_BASE_URL}"`,
 				].join("\n"),
 			);
-			expect(resolveSwivalChildEnv(["--profile", "arc-quoted", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "gw-quoted", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			// Escaped quoted key in root or root reviewer = "..." in config.toml fails closed
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
 				[
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
+					`base_url = "${GATEWAY_BASE_URL}"`,
 					'"\\u0061ctive_profile" = "local-qwen"',
 					"[profiles.local-qwen]",
 					'provider = "generic"',
@@ -1050,32 +1060,115 @@ describe("resolveSwivalChildEnv", () => {
 				path.join(cfgDir, "config.toml"),
 				[
 					'reviewer = "swival --profile local-qwen --reviewer-mode"',
-					"[profiles.arc-gpt-sol]",
+					"[profiles.gw-gpt-sol]",
 					'provider = "generic"',
-					'base_url = "https://arc.fastly.app/v1"',
+					`base_url = "${GATEWAY_BASE_URL}"`,
 				].join("\n"),
 			);
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
-				["[profiles.arc-gpt-sol]", 'provider = "generic"', 'base_url = "https://arc.fastly.app/v1"'].join("\n"),
+				["[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"),
 			);
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toEqual({
-				OPENAI_API_KEY: "synthetic-arc-token",
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toEqual({
+				OPENAI_API_KEY: GATEWAY_KEY,
 			});
 			// Project swival.toml in base-dir fails closed
 			fs.writeFileSync(path.join(repoDir, "swival.toml"), 'base_url = "https://attacker.example/v1"\n');
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.unlinkSync(path.join(repoDir, "swival.toml"));
+			// Non-Anthropic oauth entry in auth.json fails closed
+			fs.writeFileSync(authFile, JSON.stringify({ [GATEWAY_PROVIDER]: { type: "oauth", access: GATEWAY_KEY, expires: Date.now() + 3_600_000 } }), { mode: 0o600 });
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			fs.writeFileSync(authFile, JSON.stringify({ [GATEWAY_PROVIDER]: { type: "api_key", key: GATEWAY_KEY } }), { mode: 0o600 });
 			// Group-writable auth.json fails closed
 			fs.chmodSync(authFile, 0o620);
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
 			fs.chmodSync(authFile, 0o600);
 			// Symlinked auth.json fails closed
 			const targetAuth = path.join(tmpHome, "real-auth.json");
 			fs.renameSync(authFile, targetAuth);
 			fs.symlinkSync(targetAuth, authFile);
-			expect(resolveSwivalChildEnv(["--profile", "arc-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+		} finally {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed on unsafe, ambiguous, or non-HTTPS models.json provider correlation", () => {
+		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
+		try {
+			const agentDir = path.join(tmpHome, ".pi", "agent");
+			const repoDir = path.join(tmpHome, "repo");
+			fs.mkdirSync(repoDir, { recursive: true });
+			const modelsFile = path.join(agentDir, "models.json");
+			const route = ["--provider", "generic", "--base-url", GATEWAY_BASE_URL, "--"];
+			const bridged = { OPENAI_API_KEY: GATEWAY_KEY };
+			// 0644 models.json (Pi's default) is accepted
+			writePiAgentFiles(agentDir, { modelsMode: 0o644 });
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toEqual(bridged);
+			// Group-writable models.json fails closed
+			fs.chmodSync(modelsFile, 0o620);
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+			fs.chmodSync(modelsFile, 0o644);
+			// Symlinked models.json fails closed
+			const targetModels = path.join(tmpHome, "real-models.json");
+			fs.renameSync(modelsFile, targetModels);
+			fs.symlinkSync(targetModels, modelsFile);
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+			fs.unlinkSync(modelsFile);
+			// Missing models.json fails closed even though auth.json holds the key
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+			// Malformed models.json and non-object providers fail closed
+			for (const malformed of ["{not json", JSON.stringify({ providers: [] }), JSON.stringify({ providers: { [GATEWAY_PROVIDER]: { baseUrl: ["https://gateway.example.com/v1"] } } })]) {
+				writePiAgentFiles(agentDir, { models: malformed });
+				expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir), malformed).toBeUndefined();
+			}
+			// A non-HTTPS provider never bridges and does not poison a valid HTTPS provider
+			writePiAgentFiles(agentDir, {
+				models: { providers: { "local-llm": { baseUrl: "http://127.0.0.1:8000/v1" }, [GATEWAY_PROVIDER]: { baseUrl: GATEWAY_BASE_URL } } },
+				auth: { "local-llm": { type: "api_key", key: "synthetic-local-token" }, [GATEWAY_PROVIDER]: { type: "api_key", key: GATEWAY_KEY } },
+			});
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toEqual(bridged);
+			expect(resolveSwivalChildEnv(["--provider", "generic", "--base-url", "http://127.0.0.1:8000/v1", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			// Two providers matching the same baseUrl are ambiguous and fail closed
+			writePiAgentFiles(agentDir, {
+				models: { providers: { [GATEWAY_PROVIDER]: { baseUrl: GATEWAY_BASE_URL }, "acme-gateway-alt": { baseUrl: "https://gateway.example.com" } } },
+			});
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+			// An `anthropic` entry in models.json is never used for the generic bridge
+			writePiAgentFiles(agentDir, {
+				models: { providers: { anthropic: { baseUrl: GATEWAY_BASE_URL } } },
+				auth: { anthropic: { type: "api_key", key: "synthetic-anthropic-key" } },
+			});
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+			// Correlated provider present in models.json but missing from auth.json fails closed
+			writePiAgentFiles(agentDir, { auth: {} });
+			expect(resolveSwivalChildEnv(route, {}, tmpHome, repoDir)).toBeUndefined();
+		} finally {
+			fs.rmSync(tmpHome, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		["userinfo", "https://user:pass@gateway.example.com/v1"],
+		["query", "https://gateway.example.com/v1?x=1"],
+		["fragment", "https://gateway.example.com/v1#frag"],
+		["encoded traversal", "https://gateway.example.com/v1/%2e%2e/v1"],
+		["raw traversal", "https://gateway.example.com/v2/../v1"],
+		["encoded slash", "https://gateway.example.com/v1%2fchat"],
+		["backslash", "https://gateway.example.com\\v1"],
+		["sibling path", "https://gateway.example.com/v2"],
+		["path prefix without separator", "https://gateway.example.com/v10"],
+		["host prefix", "https://gateway.example.com.attacker.test/v1"],
+		["host suffix", "https://evil-gateway.example.com/v1"],
+		["http scheme", "http://gateway.example.com/v1"],
+		["surrounding whitespace", " https://gateway.example.com/v1"],
+	])("fails closed on %s base_url edge case", (_label, baseUrl) => {
+		const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-env-"));
+		try {
+			writePiAgentFiles(path.join(tmpHome, ".pi", "agent"));
+			expect(resolveSwivalChildEnv(["--provider", "generic", "--base-url", baseUrl, "--"], {}, tmpHome, tmpHome)).toBeUndefined();
 		} finally {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		}
@@ -1151,6 +1244,16 @@ describe("resolveSwivalChildEnv", () => {
 			expect(
 				resolveSwivalChildEnv(["--profile", "anthropic-claude-mythos", "--"], { PATH: "/usr/bin" }, tmpHome, repoDir),
 			).toBeUndefined();
+			// Canonical host with userinfo, query, or fragment fails closed; the bare canonical endpoint bridges
+			for (const baseUrl of ["https://user@api.anthropic.com", "https://api.anthropic.com/?x=1", "https://api.anthropic.com/#frag", "https://api.anthropic.com.attacker.test"]) {
+				expect(
+					resolveSwivalChildEnv(["--profile", "anthropic-claude-mythos", "--base-url", baseUrl, "--"], { PATH: "/usr/bin" }, tmpHome, repoDir),
+					baseUrl,
+				).toBeUndefined();
+			}
+			expect(
+				resolveSwivalChildEnv(["--profile", "anthropic-claude-mythos", "--base-url", "https://api.anthropic.com", "--"], { PATH: "/usr/bin" }, tmpHome, repoDir)?.ANTHROPIC_API_KEY,
+			).toBe("sk-ant-oat01-synthetic-token");
 		} finally {
 			fs.rmSync(tmpHome, { recursive: true, force: true });
 		}

@@ -7,6 +7,7 @@ import registerExtension, { registerNativeAuditTool } from "../extensions/index.
 import { nativeTestPython as python } from "./nativePython.js";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
+const SHIM_PATH = path.join(ROOT, "scripts", "anthropic_oauth_shim", "sitecustomize.py");
 // Cold pinned-upstream imports need a subprocess budget below the test deadline.
 const PREFLIGHT_PROCESS_TIMEOUT_MS = 15_000;
 const startupPath = process.env.PATH;
@@ -287,7 +288,7 @@ async function runPreflight(source: string, home: string, environment = {}, rout
 			cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config"), LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1", ...environment },
 			timeout: PREFLIGHT_PROCESS_TIMEOUT_MS, maxBuffer: 64 * 1024,
 		}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
-		child.stdin!.end(JSON.stringify({ source, routing }));
+		child.stdin!.end(JSON.stringify({ source, routing, shimPath: SHIM_PATH }));
 	});
 }
 
@@ -470,7 +471,7 @@ describe("independent committed snapshot", () => {
 					LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1" },
 				timeout: PREFLIGHT_PROCESS_TIMEOUT_MS, maxBuffer: 64 * 1024,
 			}, (error, stdout, stderr) => resolve({ code: error ? 1 : 0, output: stdout + stderr }));
-			child.stdin!.end(JSON.stringify({ source: snapshotDir, snapshot: snapshotDir, audit: { all: true }, routing: {} }));
+			child.stdin!.end(JSON.stringify({ source: snapshotDir, snapshot: snapshotDir, audit: { all: true }, routing: {}, shimPath: SHIM_PATH }));
 		});
 		expect(preflight.code, preflight.output).toBe(0);
 		const preflightParsed = JSON.parse(preflight.output);

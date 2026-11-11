@@ -17,7 +17,13 @@ import {
 	hasCliFlag,
 	lastCliOptionValue,
 } from "./contracts.js";
-import { readAnthropicAuthToken, readPiAuthToken, readSafeRegularText } from "./paths.js";
+import {
+	parseCanonicalHttpsEndpoint,
+	readAnthropicAuthToken,
+	readPiAuthToken,
+	readSafeRegularText,
+	resolvePiCustomProviderForBaseUrl,
+} from "./paths.js";
 
 // --------------------------------------------------------- TOML subset --
 
@@ -274,8 +280,9 @@ export function routeFromArgs(args: readonly string[], runCwd: string): RouteSel
 
 /**
  * Resolve optional child-process environment overrides for a Swival launch.
- * - Bridges Pi's `fastly-arc` API key into `OPENAI_API_KEY` when the effective
- *   route resolves to `provider = "generic"` against `https://arc.fastly.app`.
+ * - Bridges the API key of the single Pi custom provider in `~/.pi/agent/models.json`
+ *   whose HTTPS `baseUrl` serves the effective `provider = "generic"` route into
+ *   `OPENAI_API_KEY`, reading the key from `~/.pi/agent/auth.json`.
  * - Bridges Pi's `anthropic` OAuth/API token into `ANTHROPIC_API_KEY` (and
  *   requires the Anthropic OAuth compatibility shim for `sk-ant-oat...` tokens)
  *   when the route resolves to `provider = "anthropic"` on the canonical endpoint.
@@ -295,7 +302,7 @@ export function resolveSwivalChildEnv(
 	if (route.externalReviewer !== undefined) return undefined;
 	const { provider: cliProvider, profile: cliProfile, baseUrl: cliBaseUrl } = route;
 	if (cliProvider !== undefined && cliProvider !== "generic" && cliProvider !== "anthropic") return undefined;
-	if (cliBaseUrl !== undefined && !/^https:\/\/(?:arc\.fastly\.app|api\.anthropic\.com)(?:\/|$)/i.test(cliBaseUrl)) return undefined;
+	if (cliBaseUrl !== undefined && !parseCanonicalHttpsEndpoint(cliBaseUrl)) return undefined;
 	// Fail closed when <base-dir>/swival.toml exists, since Swival merges project
 	// swival.toml with project-wins precedence and could redirect base_url.
 	try {
@@ -350,15 +357,18 @@ export function resolveSwivalChildEnv(
 	const effectiveBaseUrl = cliBaseUrl ?? cfgBaseUrl;
 	if (effectiveProvider === "generic") {
 		if (baseEnv.OPENAI_API_KEY) return undefined;
-		if (typeof effectiveBaseUrl !== "string" || !/^https:\/\/arc\.fastly\.app(?:\/|$)/i.test(effectiveBaseUrl)) return undefined;
-		const key = readPiAuthToken(homeDir, "fastly-arc");
+		if (typeof effectiveBaseUrl !== "string") return undefined;
+		const providerKey = resolvePiCustomProviderForBaseUrl(homeDir, effectiveBaseUrl);
+		if (!providerKey) return undefined;
+		const key = readPiAuthToken(homeDir, providerKey);
 		return key ? { ...baseEnv, OPENAI_API_KEY: key } : undefined;
 	}
 
 	if (effectiveProvider === "anthropic") {
 		if (baseEnv.ANTHROPIC_API_BASE !== undefined || baseEnv.ANTHROPIC_BASE_URL !== undefined) return undefined;
 		const inheritedAnthropicBaseUrl = effectiveBaseUrl ?? cfgRootBaseUrl;
-		if (inheritedAnthropicBaseUrl !== undefined && !/^https:\/\/api\.anthropic\.com(?:\/|$)/i.test(inheritedAnthropicBaseUrl)) return undefined;
+		if (inheritedAnthropicBaseUrl !== undefined &&
+			parseCanonicalHttpsEndpoint(inheritedAnthropicBaseUrl)?.origin !== "https://api.anthropic.com") return undefined;
 		const existingKey = typeof baseEnv.ANTHROPIC_API_KEY === "string" ? baseEnv.ANTHROPIC_API_KEY.trim() : "";
 		const token = existingKey || readAnthropicAuthToken(homeDir);
 		if (!token) return undefined;

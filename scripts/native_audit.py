@@ -44,7 +44,6 @@ class NativeAuditError(Exception):
 
 
 RUNTIME_VERSIONS = {"swival": "1.9.3", "litellm": "1.106.6"}
-SHIM_PATH = Path(__file__).resolve().parent / "anthropic_oauth_shim" / "sitecustomize.py"
 SHIM_PROVIDERS = {"anthropic", "bedrock", "geap"}
 ADJUDICATION_ERROR_SENTINEL = "PI_SWIVAL_ADJUDICATION_ERROR"
 ADJUDICATION_ERROR_METRIC = "pi_swival_adjudication_errors"
@@ -198,13 +197,11 @@ def resolve_native_config(request):
     """Select through released precedence, then admit concrete native capabilities."""
     routing = request.get("routing", {})
     defer_credentials = request.get("deferCredentials") is True and not request.get("snapshot")
+    # The adapter validates and owns the shim location; never infer it from __file__.
     shim_path_raw = request.get("shimPath")
-    if shim_path_raw is not None:
-        if not isinstance(shim_path_raw, str) or not os.path.isabs(shim_path_raw):
-            raise NativeAuditError("CONFIG_INVALID")
-        shim_path = Path(shim_path_raw)
-    else:
-        shim_path = SHIM_PATH
+    if not isinstance(shim_path_raw, str) or not os.path.isabs(shim_path_raw):
+        raise NativeAuditError("CONFIG_INVALID")
+    shim_path = Path(shim_path_raw)
     if not isinstance(routing, dict) or set(routing) - (set(OVERRIDE_KEYS) | {"profile"}):
         raise NativeAuditError("CONFIG_INVALID")
     if (sys.version_info < (3, 13) or any(importlib.metadata.version(name) != version
@@ -309,7 +306,7 @@ def _credential_capability(args, *, defer_credentials=False):
         raise NativeAuditError("CREDENTIAL_UNAVAILABLE")
 
 
-def _admit_route(args, profile, routing, *, defer_credentials=False, shim_path=SHIM_PATH):
+def _admit_route(args, profile, routing, *, shim_path, defer_credentials=False):
     """No provider construction, catalog request, or inference for admission."""
     provider, model = args.provider, args.model
     if not _identifier(provider, 40) or not _identifier(model):
@@ -377,7 +374,7 @@ def _admit_route(args, profile, routing, *, defer_credentials=False, shim_path=S
     return result
 
 
-def _attest_required_shim(shim_path=SHIM_PATH):
+def _attest_required_shim(shim_path):
     """Prove the compatibility shim's required hooks install on the pinned runtime.
 
     These routes depend on the shim to keep model discovery disabled; a missing

@@ -47,6 +47,7 @@ with patch.object(socket, "socket", side_effect=FORBIDDEN), \
     from litellm.llms.chatgpt import authenticator
 
 WORKTREE = Path(__file__).resolve().parents[1]
+SHIM_PATH = str(WORKTREE / "scripts" / "anthropic_oauth_shim" / "sitecustomize.py")
 TEMP = WORKTREE / "tests" / ".scratch" / "tmp"
 TEMP.mkdir(parents=True, exist_ok=True)
 assert TEMP.resolve() == TEMP
@@ -94,7 +95,7 @@ class NativeEntryTests(unittest.TestCase):
                               capture_output=True, check=True, timeout=5).stdout.decode().strip()
 
     def request(self):
-        return {"source": str(self.repo), "routing": dict(self.routing)}
+        return {"source": str(self.repo), "shimPath": SHIM_PATH, "routing": dict(self.routing), "shimPath": SHIM_PATH}
 
     def cli(self, diagnostic_path=None, all_files=True):
         """Real CLI parsing and native phases; synthetic bootstrap/transport only."""
@@ -248,17 +249,17 @@ class NativeEntryTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-key"}), \
              patch.object(agent, "resolve_provider", side_effect=FORBIDDEN), \
              patch.object(authenticator, "Authenticator", side_effect=FORBIDDEN):
-            default = bridge.resolve_native_config({"source": str(self.repo)})
+            default = bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
             self.assertEqual(default["model"], "chatgpt/gpt-active")
             self.assertEqual(default["selection"]["profileSource"], "active")
-            route = bridge.resolve_native_config({"source": str(self.repo),
+            route = bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH,
                 "routing": {"profile": "specialist"}})
             self.assertEqual(route["version"], 2)
             self.assertEqual((route["provider"], route["model"], route["reasoningEffort"]),
                 ("openrouter", "example/specialist", "high"))
             self.assertEqual(route["selection"], {"profileSource": "explicit",
                 "explicitFields": ["profile"]})
-            selected = bridge.resolve_native_config({"source": str(self.repo),
+            selected = bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH,
                 "routing": {"profile": "specialist", "model": "example/override",
                     "reasoningEffort": "xhigh"}})
             self.assertEqual(selected["model"], "example/override")
@@ -274,7 +275,7 @@ class NativeEntryTests(unittest.TestCase):
             for endpoint in (None, "https://caller.invalid/v1", "http://127.0.0.1:8444/v1"):
                 with self.subTest(endpoint=endpoint):
                     with self.assertRaises(bridge.NativeAuditError) as error:
-                        bridge.resolve_native_config({"source": str(self.repo),
+                        bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH,
                                                       "routing": {"baseUrl": endpoint}})
                     self.assertEqual(error.exception.reason, "CONFIG_INVALID")
 
@@ -284,7 +285,7 @@ class NativeEntryTests(unittest.TestCase):
                     'max_context_tokens=128000\n' +
                     (f'base_url="{endpoint}"\n' if endpoint else ''))
                 with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-dedicated-key"}):
-                    route = bridge.resolve_native_config({"source": str(self.repo)})
+                    route = bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
                 self.assertEqual(route["provider"], "openrouter")
                 self.assertEqual(route["endpoint"], endpoint)
                 self.assertEqual(route["selection"]["profileSource"], None)
@@ -334,7 +335,7 @@ class NativeEntryTests(unittest.TestCase):
                 self.write_config(config)
                 with patch.dict(os.environ, {"OPENROUTER_API_KEY": "synthetic-key"}), \
                      self.assertRaisesRegex(bridge.NativeAuditError, reason):
-                    bridge.resolve_native_config({"source": str(self.repo), "routing": routing})
+                    bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH, "routing": routing})
         with patch.object(bridge.importlib.metadata, "version", return_value="unsupported"):
             with self.assertRaisesRegex(bridge.NativeAuditError, "RUNTIME_UNSUPPORTED"):
                 bridge.resolve_native_config(self.request())
@@ -350,16 +351,26 @@ class NativeEntryTests(unittest.TestCase):
             with self.subTest(field=key):
                 self.write_config(f'provider="chatgpt"\nmodel="gpt-offline"\n{key}={value}\n')
                 with self.assertRaises(bridge.NativeAuditError) as raised:
-                    bridge.resolve_native_config({"source": str(self.repo)})
+                    bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
                 self.assertEqual(getattr(raised.exception, "reason", None), "POLICY_NOT_PROPAGATED")
                 self.assertEqual(getattr(raised.exception, "field", None), key)
                 self.assertNotIn("synthetic-secret", str(raised.exception))
+
+    def test_shim_path_must_be_explicit_absolute_string(self):
+        self.write_config('provider="chatgpt"\nmodel="gpt-offline"\n')
+        omitted = {"source": str(self.repo), "routing": dict(self.routing)}
+        for label, request in (("omitted", omitted), ("None", {**omitted, "shimPath": None}),
+                               ("relative", {**omitted, "shimPath": "scripts/anthropic_oauth_shim/sitecustomize.py"})):
+            with self.subTest(label), self.assertRaises(bridge.NativeAuditError) as raised:
+                bridge.resolve_native_config(request)
+            self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
+        self.assertFalse(hasattr(bridge, "SHIM_PATH"))
 
     def test_unknown_policy_field_names_are_not_returned(self):
         self.write_config('provider="chatgpt"\nmodel="gpt-offline"\n'
             'nono_synthetic_private_field=true\n')
         with self.assertRaises(bridge.NativeAuditError) as raised:
-            bridge.resolve_native_config({"source": str(self.repo)})
+            bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
         self.assertEqual(raised.exception.reason, "CONFIG_INVALID")
         self.assertNotIn("synthetic_private_field", json.dumps(raised.exception.response()))
 
@@ -571,7 +582,7 @@ class NativeEntryTests(unittest.TestCase):
              patch.object(litellm, "completion", side_effect=FORBIDDEN) as completion:
             with self.assertRaisesRegex(bridge.NativeAuditError,
                     "MODEL_REPLACEMENT_UNCONTROLLABLE"):
-                bridge.resolve_native_config({"source": str(self.repo)})
+                bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
         listing.assert_not_called()
         resolver.assert_not_called()
         completion.assert_not_called()
@@ -1051,11 +1062,11 @@ class NativeEntryTests(unittest.TestCase):
             self.write_config(cfg_text)
             with patch.object(agent, "_list_server_models", None), patch.dict(os.environ, creds):
                 with self.assertRaisesRegex(bridge.NativeAuditError, "MODEL_REPLACEMENT_UNCONTROLLABLE"):
-                    bridge.resolve_native_config({"source": str(self.repo)})
+                    bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})
             # Re-install working shim and confirm admission succeeds once hooks attest cleanly.
             module.install_required_shim(require_hooks=True)
             with patch.dict(os.environ, creds):
-                self.assertEqual(bridge.resolve_native_config({"source": str(self.repo)})["provider"], expected_provider)
+                self.assertEqual(bridge.resolve_native_config({"source": str(self.repo), "shimPath": SHIM_PATH})["provider"], expected_provider)
         # Non-Swival tool/reviewer children inherit PYTHONPATH + PI_SWIVAL_SHIM_REQUIRED=1 and stay silent,
         # whereas a Swival interpreter with a broken required target exits non-zero on startup.
         shim_dir = str(WORKTREE / "scripts/anthropic_oauth_shim")
@@ -1316,7 +1327,7 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("no netwo
         )
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}):
             route = bridge.resolve_native_config(
-                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+                {"source": str(self.repo), "shimPath": SHIM_PATH, "routing": {"profile": "anthropic-claude-mythos"}}
             )
         self.assertEqual(route["provider"], "anthropic")
         self.assertEqual(route["model"], "claude-mythos-5-2")
@@ -1332,7 +1343,7 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("no netwo
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}), \
              self.assertRaises(bridge.NativeAuditError) as raised:
             bridge.resolve_native_config(
-                {"source": str(self.repo), "routing": {"profile": "anthropic-claude-mythos"}}
+                {"source": str(self.repo), "shimPath": SHIM_PATH, "routing": {"profile": "anthropic-claude-mythos"}}
             )
         self.assertEqual(raised.exception.reason, "POLICY_NOT_PROPAGATED")
         self.assertEqual(raised.exception.field, "encrypt_secrets")
@@ -1340,6 +1351,7 @@ with patch.object(socket.socket, "connect", side_effect=AssertionError("no netwo
             overridden = bridge.resolve_native_config(
                 {
                     "source": str(self.repo),
+                    "shimPath": SHIM_PATH,
                     "routing": {"profile": "anthropic-claude-mythos", "encryptSecrets": False},
                 }
             )
