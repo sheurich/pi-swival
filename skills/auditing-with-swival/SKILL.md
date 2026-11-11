@@ -5,86 +5,59 @@ description: Run a source-only native Swival audit on committed repository conte
 
 # Auditing with Swival
 
-Use the structured `audit` API from Pi at the target Git repository root. The adapter invokes one upstream CLI `/audit` request. It validates coverage and artifacts so the operator does not need to reconstruct completion from console output. The offline fixtures exercise released phases and rejected incomplete states. The operator still reviews findings and every patch.
+Run one structured Swival `/audit` pass on an isolated committed snapshot from Pi at the target Git repository root.
 
-## Preconditions and selection
+## Preconditions
 
-- Confirm scope and the operator's provider and data boundaries before sending source to a provider. Native audit always runs on the current session's Git repository root (`cwd` is rejected); auditing another checkout requires opening a Pi session in that checkout.
-- Consult installation guidance before execution. Use its authorized specialist through existing `profileOverride` when required. Do not infer specialization from vendors, model names, or profile-name substrings.
-- With no specialist selected, use configured Swival defaults, including `active_profile`. A missing or invalid selected specialist stops before launch. A terminal selected-route failure stops without fallback; never retry without the selected specialist.
-- Use Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, and upstream's installed nono profile. Native preflight rejects mismatched package versions and Python below 3.13; it does not enforce Python's upper support bound. The real bootstrap/export gate passed on macOS; Linux remains unverified.
-- Configuration inspection does not prove account access. Do not send repository content to probe specialist access. There is no fallback to another model, provider, endpoint, account, profile, or sandbox.
+- Start Pi at the target Git repository root (`cwd` overrides are rejected; open a session in another checkout to audit it).
+- Compatibility manifest: Swival `1.9.3`, LiteLLM `1.106.6`, Python `>=3.13`, AgentFS `>=0.6.4`, and an installed `nono` profile (validated on macOS; Linux remains unverified).
+- Confirm operator scope and provider routing before sending repository code to an external model.
 
 ## Dispatch
 
-Use configured provider/model defaults:
+Use configured Swival defaults (including `active_profile`):
 
 ```json
 {"audit":{"all":true}}
 ```
 
-Select an existing operator-configured specialist profile when installation policy requires it:
+Or select an existing operator-configured profile (`security-specialist` is an illustrative profile name, not bundled):
 
 ```json
 {"audit":{"all":true},"profileOverride":"security-specialist"}
 ```
 
-`security-specialist` is illustrative, not bundled or reserved. Explicit profile selection outranks `active_profile`. Authorized explicit field overrides outrank profile values. Do not add provider/model/effort overrides automatically; inherit selected settings. Reject conflicts with installation policy before execution. Ordinary inherited effort is best-effort; auxiliary phases can omit it.
+A missing or invalid selected profile stops before launch, and any terminal route failure stops with no fallback to another model, provider, or profile. Swival may retry transient or policy errors on the same route, but `pi-swival` never substitutes another model, provider, or profile on failure. Terminal errors and incomplete phases fail closed and never attest audit completion.
 
-Swival 1.9.3 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
+Audit bounds: `paths` accepts up to 64 relative path/glob tokens without traversal or shell syntax; `workers` is `1..8`; `patchMaxTurns` is `1..100`; timeout defaults to 15 minutes (30-minute default ceiling). Native async is unsupported. Sessions using `registerNativeAuditTool` (`swival-native-audit`) accept only `audit` plus bounded model/sampling/timeout fields (`encryptSecretsOverride` accepts only `false`, admitting global `encrypt_secrets = true` while keeping the snapshot config inert).
 
 ## Route capabilities
 
-Support means a Swival-supported route meeting required native policies on the pinned runtime, not a promise that every route/version works. Swival owns provider/auth integration.
+| Provider / Route | Admission (`scripts/native_audit.py`) | Requirements |
+|---|---|---|
+| `chatgpt` | Admitted | Concrete model; complete interactive Swival login outside Pi beforehand; dedicated runtime-only auth-directory grant inside `HOME` (never added to `--add-dir` or model-tool roots). |
+| `openrouter` | Admitted | Concrete model and `OPENROUTER_API_KEY`; loopback OpenRouter-compatible endpoints require explicit `base_url`, `max_context_tokens`, and a dedicated endpoint key. |
+| `anthropic` | Admitted | Concrete model, unset `base_url`, and host-bridged `ANTHROPIC_API_KEY` or OAuth token. |
+| `bedrock` | Admitted (host session export) | Concrete model, AWS region in `base_url`, and short-lived `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` exported on the host (`aws_profile` and SDK file fallback are withheld from the child). |
+| `geap` (`vertexai`) | Admitted (host ADC token) | Concrete bare model, `project`, `location`, and host-minted `GOOGLE_OAUTH_ACCESS_TOKEN` (55-minute cap; mid-run expiry or 401 fails closed with `CREDENTIAL_EXPIRED`). |
+| `generic`, `lmstudio`, `llamacpp`, `applefm`, `google` | Refused (`MODEL_REPLACEMENT_UNCONTROLLABLE`) | Dynamic model-list adapters that can substitute models on not-found errors. |
+| `command` | Refused (`COMMAND_EXECUTION_REQUIRED`) | Incompatible with `commands=none`. |
 
-| Provider / Route | Outcome (`scripts/native_audit.py:_admit_route`) | Native requirements |
-| --- | --- | --- |
-| `chatgpt` | Admitted | Concrete model; standard upstream auth; dedicated runtime-only auth-directory grant. |
-| `openrouter` (OpenRouter API-key or explicit loopback endpoint) | Admitted | Concrete model; selected `OPENROUTER_API_KEY`; loopback requires deliberately configured adapter/model/`base_url`, `max_context_tokens`, and a dedicated endpoint key with no ChatGPT grant. |
-| `anthropic` | Admitted | Concrete model; `base_url` must be unset; `ANTHROPIC_API_KEY` or OAuth bridged on host. |
-| `bedrock` | Admitted via host session export | Concrete model; AWS region in `base_url`; short-lived `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` exported on host from `aws_profile` (never forwarded to the child); rejected with `CREDENTIAL_INTERFACE_UNSUPPORTED` if unbridged `aws_profile` or file fallback remains reachable. |
-| `geap` (`vertexai`) | Admitted via host token minting | Concrete bare model, `project`, and `location`; short-lived `GOOGLE_OAUTH_ACCESS_TOKEN` minted on host via `gcloud auth application-default print-access-token`; rejected with `CREDENTIAL_INTERFACE_UNSUPPORTED` if ADC file fallback remains reachable; a local 55-minute deadline caps token use, but cached tokens may expire sooner; expired tokens or a provider 401 fail closed with `CREDENTIAL_EXPIRED`, without refreshing or switching accounts. |
-| `generic`, `lmstudio`, `llamacpp`, `applefm`, `google` | Refused: `MODEL_REPLACEMENT_UNCONTROLLABLE` | Dynamic model-list adapters where this runtime can replace a selected model after model-not-found. |
-| `command` | Refused: `COMMAND_EXECUTION_REQUIRED` | Requires command execution, incompatible with `commands=none`. |
+Preflight rejects unpropagated or unsafe controls (`POLICY_NOT_PROPAGATED` for required encryption, request filters, `extra_body`, disabled prompt caching, or strict-read isolation; `PROFILE_UNAVAILABLE`, `ROUTE_INCOMPLETE`, `CREDENTIAL_INTERFACE_UNSUPPORTED`, `CONFIG_INVALID`, `RUNTIME_UNSUPPORTED`). Stop rather than disabling required controls.
 
-Note: upstream `/audit` scans recognized source and configuration file extensions only.
+## Isolation boundary
 
-Automatic/multi-model selectors are unsupported. Client evidence does not prove backend alias resolution or routing. Configure local endpoints deliberately; never convert a rejected generic route to another adapter. Supply only that endpoint's dedicated credential, not a remote account key.
+`pi-swival` imports only committed `HEAD^{tree}` objects into a fresh temporary Git repository outside the caller's checkout, linked worktrees, and `.git` directories (staged, unstaged, and untracked files are excluded; Git hooks, filters, and ambient `GIT_*` are disabled; working-copy `swival.toml` is neutralized). Snapshot and evidence limits are `4096` entries, `8 MiB` per file, and `64 MiB` total.
 
-Preflight returns bounded, value-free codes, including `PROFILE_UNAVAILABLE`, `ROUTE_INCOMPLETE`, `CREDENTIAL_INTERFACE_UNSUPPORTED`, `CONFIG_INVALID`, and `RUNTIME_UNSUPPORTED`. `POLICY_NOT_PROPAGATED` names requirements omitted by native or auxiliary phases. These include encryption, secret shielding, request filtering, `extra_body`, disabled prompt caching, thinking controls, strict-read/session isolation, and strict all-phase effort/retry requirements. Inline keys, custom headers, cloud/file/command credential requirements, credential-bearing URLs, ambient endpoints, and proxies fail closed. Stop instead of disabling controls.
-
-For ChatGPT only, standard upstream ChatGPT authentication permits login, token refresh, and auth-state writes. Complete interactive login with upstream Swival outside Pi before an audit. Device-login challenges cancel without exposing their contents. Refresh and persistence use upstream auth unchanged. The adapter checks metadata, never auth-store contents. API-key/local routes create no ChatGPT store and forward no ChatGPT variables.
-
-`paths` accepts at most 64 relative path/glob tokens without spaces, traversal, shell syntax, or host paths. Omit it for the auditable committed scope. `all` requires deep review of every selected file. `workers` is 1 to 8 pipeline workers, not autonomous subagents. `patchMaxTurns` is 1 to 100 turns per patch loop. The default timeout is 15 minutes; the default operator ceiling is 30 minutes.
-
-Native async is unsupported. Do not combine `audit` with `task`, `agent`, `cwd`, parallel/chain dispatch, output routing, reviewer settings, extra arguments, or permission overrides. Ordinary freeform delegation is separate and does not attest native completion. Do not use freeform slash-command tasks as a substitute.
-
-A session may expose `swival-native-audit` instead of `swival-subagent`. It takes the same `audit` object and native selection and bounding fields. General dispatch, control, `cwd`, and `async` inputs are rejected before preparation. Its `encryptSecretsOverride` accepts only `false`, admitting global `encrypt_secrets = true` for the audit as `swival-subagent` already does. Every other value is rejected. The inert run configuration never enables encryption. Project configuration, `SWIVAL_ENCRYPT_KEY`, filter, and proxy guards stay fail-closed. Scope, routing, boundary, lifetime, and completion rules below are identical. A consumer can run that session as a headless background child. Only the outer run is asynchronous; the inner native call returns after verified shutdown. The tool's presence grants no audit authorization.
-
-## Boundary
-
-The adapter imports only committed Git objects into a separate disposable repository outside the original source checkout and Git metadata. It disables source hooks, filters, lazy fetches, and remotes. It excludes staged, unstaged, and untracked content. The synthetic snapshot commit preserves the source tree, not its history. A tracked `swival.toml` remains auditable from HEAD; its runtime copy and the run's global configuration are inert.
-
-The adapter launches upstream AgentFS directly with a fresh session. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap, with `commands=none`, `files=some`, and `network=provider-only`. Instructions, skills, metaskills, MCP, A2A, autonomous subagents, lifecycle hooks, history, continuation, and memory are disabled. Verifier and patch loops inherit command and network restrictions. They cannot run project commands, builds, tests, Python, fetch tools, or PoCs. Describe verification as source-only judgment, not executed exploit reproduction.
-
-The adapter explicitly grants AgentFS write-through access to the snapshot. For ChatGPT only, it also grants a dedicated auth-store directory inside HOME. The default store is `~/.config/litellm/chatgpt/auth.json`. Safe `CHATGPT_TOKEN_DIR` and basename-only `CHATGPT_AUTH_FILE` selections are supported. Broad, shared, linked, or source/artifact/runtime-overlapping stores fail closed, including future paths under HOME's `.agentfs` and service directories. The auth directory never enters Swival `--add-dir` or model-tool roots. The adapter collects artifacts from the snapshot after verified normal shutdown; it does not claim COW-only export. Upstream also grants built-in temporary, service, and session paths. On macOS, source and Git metadata must not overlap those exceptions, including `/tmp`, `/var/tmp`, `/private/var/folders`, and HOME's `Library`. The adapter checks canonical paths and directory identities before launch. See the [complete AgentFS restriction](../swival/references/agentfs.md). The original source and Git metadata remain protected. AgentFS does not provide host-read confidentiality or provider-process egress confinement. The extension and installed runtime remain trusted.
-
-Snapshot and evidence limits are 4096 entries, 8 MiB per object/file, and 64 MiB total. Unsupported tracked links, unsafe paths, recognized credential content, protected configuration, and oversized inputs fail closed. Scanning cannot prove that source contains no secrets.
+Execution wraps inner Swival (`--sandbox builtin --files some --commands none --network provider-only --oneshot-commands`) inside an outer `agentfs run --no-default-allows --allow <snapshot>` boundary. Verification is strictly source-only: reviewer and patch phases cannot execute project commands, builds, tests, Python, or PoCs. On macOS, preflight rejects source or Git paths overlapping AgentFS built-in writable exceptions (`/tmp`, `/var/tmp`, `/private/var/folders`, `~/Library`; see [AgentFS reference](../swival/references/agentfs.md)). AgentFS does not provide host-read confidentiality or provider-process egress confinement.
 
 ## Lifetime and evidence
 
-Timeout, cancellation, and normal Pi session shutdown stop the live owned process group with bounded TERM/KILL escalation. Before export, the adapter requires process-group absence, drained diagnostics, and no active AgentFS session. Unverified shutdown retains the snapshot without export.
+Timeout, cancellation, and normal session shutdown terminate the live owned process group and verify AgentFS session exit before exporting artifacts. After an abrupt Pi crash or `SIGKILL`, Swival may remain running with no artifact export or completion claim; disk-recovered PIDs are never probed or signaled, and native artifact directories are never auto-pruned.
 
-After a Pi crash or SIGKILL, Swival may remain running. There is no artifact export or claimed completion afterward. Native runs never resume from disk, signal recovered PIDs, or use a guardian. Preserve crash resources for manual inspection. Normal completion removes the snapshot and run-local configuration; AgentFS session metadata remains retained. Native artifact directories are not automatically pruned.
+Preserved artifacts under `~/.pi/agent/swival-artifacts/native-audit-*`:
+- `manifest.json`, `run-meta.json`, `diagnostics.json`, and terminal status record
+- `evidence/native-cli-report.json` and `evidence/native-state/<audit-id>/state.json`
+- `evidence/audit-findings/<n>-<slug>.{md,patch}`
 
-The returned artifact directory contains `manifest.json`, `run-meta.json`, `diagnostics.json`, a terminal record, and `evidence/native-cli-report.json`. Audit state lives under `evidence/native-state/<audit-id>/state.json`; finding reports and patches live under `evidence/audit-findings/`. Diagnostics retain bounded counters, not raw login output. A failed terminal write uses `spawn-error.txt`; failure of both writes leaves completion unknown.
-
-Exit zero and a plausible answer are insufficient. Completion requires matching committed scope, CLI route and policy, `phase=done`, mandatory/deep coverage, and terminal verification states. It also requires feasible finding lineage, unique report/patch pairs, and complete diagnostics without lost expansion warnings. Missing, empty, reused, symlinked, oversized, truncated, or incomplete evidence cannot attest completion. Complete zero-finding state means the pipeline finished, not that the code is secure.
-
-Compare source content, status, and refs with their initial values. Review patches manually. Do not apply patches or begin remediation without separate approval. Use `self-review-worker` only for approved implementation work.
-
-## Validation
-
-Run `npm run native-agentfs-integration` with existing prerequisites and isolated synthetic fixtures. It tests the production launcher/finalizer with real AgentFS, released API/local zero-finding audit producers and HTTP doubles, plus synthetic ChatGPT refresh/model-tool-denial controls. Full finding/verifier/patch phases run separately with real upstream route resolution and synthetic LLM responses. Synthetic nono registration proves availability, not authenticity. These tests make no live provider or auth calls.
-
-Live provider or authentication tests require separate approval. Never install missing prerequisites, broaden network policy, or replace a rejected route to make a test pass.
+Completion requires exit `0`, verified shutdown, matching committed scope, `phase="done"`, full mandatory/deep file coverage, feasible Phase 4.5 finding lineage, non-empty report/patch pairs, and zero truncation or unrecovered adjudication errors. Review all findings and `.patch` proposals manually before applying changes.

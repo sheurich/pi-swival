@@ -1,19 +1,26 @@
-"""Bounded configuration/scope preflight; never construct a provider or Session.
+"""Bounded configuration/scope preflight and the native CLI launcher.
 
-Swival owns configuration precedence and provider/auth integration. Only frozen,
-nonsecret routing metadata leaves this process.
+``--preflight`` never constructs a provider or Session: Swival owns configuration
+precedence and provider/auth integration, and only frozen, nonsecret routing
+metadata leaves this process. ``--launch CLI ARGS...`` runs the pinned Swival
+CLI in this interpreter with the Phase 4.5 adjudication evidence hook installed.
 """
 # pylint: disable=import-outside-toplevel
 import argparse
 import contextlib
+import functools
+import importlib.abc
 import importlib.metadata
+import importlib.util
 import io
 import json
 import math
 import os
 from pathlib import Path
 import re
+import runpy
 import sys
+import threading
 import tomllib
 from urllib.parse import urlsplit
 
@@ -37,6 +44,10 @@ class NativeAuditError(Exception):
 
 
 RUNTIME_VERSIONS = {"swival": "1.9.3", "litellm": "1.106.6"}
+SHIM_PATH = Path(__file__).resolve().parent / "anthropic_oauth_shim" / "sitecustomize.py"
+SHIM_PROVIDERS = {"anthropic", "bedrock", "geap"}
+ADJUDICATION_ERROR_SENTINEL = "PI_SWIVAL_ADJUDICATION_ERROR"
+ADJUDICATION_ERROR_METRIC = "pi_swival_adjudication_errors"
 OVERRIDE_KEYS = {
     "provider": "provider", "model": "model",
     "reasoningEffort": "reasoning_effort", "temperature": "temperature",
@@ -187,6 +198,13 @@ def resolve_native_config(request):
     """Select through released precedence, then admit concrete native capabilities."""
     routing = request.get("routing", {})
     defer_credentials = request.get("deferCredentials") is True and not request.get("snapshot")
+    shim_path_raw = request.get("shimPath")
+    if shim_path_raw is not None:
+        if not isinstance(shim_path_raw, str) or not os.path.isabs(shim_path_raw):
+            raise NativeAuditError("CONFIG_INVALID")
+        shim_path = Path(shim_path_raw)
+    else:
+        shim_path = SHIM_PATH
     if not isinstance(routing, dict) or set(routing) - (set(OVERRIDE_KEYS) | {"profile"}):
         raise NativeAuditError("CONFIG_INVALID")
     if (sys.version_info < (3, 13) or any(importlib.metadata.version(name) != version
@@ -247,7 +265,7 @@ def resolve_native_config(request):
     except Exception as exc:
         raise NativeAuditError("CONFIG_INVALID") from exc
     _requirements(effective)
-    return _admit_route(args, profile, routing, defer_credentials=defer_credentials)
+    return _admit_route(args, profile, routing, defer_credentials=defer_credentials, shim_path=shim_path)
 
 
 def _credential_capability(args, *, defer_credentials=False):
@@ -291,7 +309,7 @@ def _credential_capability(args, *, defer_credentials=False):
         raise NativeAuditError("CREDENTIAL_UNAVAILABLE")
 
 
-def _admit_route(args, profile, routing, *, defer_credentials=False):
+def _admit_route(args, profile, routing, *, defer_credentials=False, shim_path=SHIM_PATH):
     """No provider construction, catalog request, or inference for admission."""
     provider, model = args.provider, args.model
     if not _identifier(provider, 40) or not _identifier(model):
@@ -339,10 +357,12 @@ def _admit_route(args, profile, routing, *, defer_credentials=False):
     # For anthropic, bedrock, and geap (vertex_ai), _list_server_models returns [].
     adapter_name = "vertex_ai" if provider == "geap" else provider
     adapter = LlmProviders(adapter_name)
-    if ((provider not in {"anthropic", "bedrock", "geap"}
+    if ((provider not in SHIM_PROVIDERS
             and ProviderConfigManager.get_provider_model_info(None, adapter) is not None)
             or len(set(litellm.models_by_provider.get(adapter_name, []))) == 1):
         raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
+    if provider in SHIM_PROVIDERS:
+        _attest_required_shim(shim_path)
     result = {
         "version": 2, "runtime": RUNTIME_VERSIONS, "provider": provider, "model": model,
         "reasoningEffort": args.reasoning_effort, "options": options, "profile": profile,
@@ -355,6 +375,130 @@ def _admit_route(args, profile, routing, *, defer_credentials=False):
     if provider == "bedrock" and args.aws_profile:
         result["awsProfile"] = args.aws_profile
     return result
+
+
+def _attest_required_shim(shim_path=SHIM_PATH):
+    """Prove the compatibility shim's required hooks install on the pinned runtime.
+
+    These routes depend on the shim to keep model discovery disabled; a missing
+    or non-callable upstream target means singleton model replacement cannot be
+    ruled out, so admission fails before any worker launches.
+    """
+    try:
+        if shim_path.is_symlink() or not shim_path.is_file():
+            raise RuntimeError("untrusted shim target")
+        spec = importlib.util.spec_from_file_location("pi_swival_anthropic_oauth_shim", shim_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("missing shim loader")
+        shim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shim)
+        attestation = shim.install_required_shim(require_hooks=True)
+    except (Exception, SystemExit) as exc:  # pylint: disable=broad-exception-caught
+        raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE") from exc
+    if (attestation.get("model_discovery_disabled") is not True
+            or shim.SHIM_ATTESTATION.get("model_discovery_disabled") is not True):
+        raise NativeAuditError("MODEL_REPLACEMENT_UNCONTROLLABLE")
+
+
+_ADJUDICATION_LOCK = threading.Lock()
+
+
+def _emit_adjudication_sentinel():
+    try:
+        sys.stderr.write(f"\n{ADJUDICATION_ERROR_SENTINEL}\n")
+        sys.stderr.flush()
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
+def _record_adjudication_error(state):
+    """Persist one Phase 4.5 evidence failure in state metrics and on stderr, value-free."""
+    metrics = getattr(state, "metrics", None)
+    with _ADJUDICATION_LOCK:
+        if isinstance(metrics, dict):
+            metrics[ADJUDICATION_ERROR_METRIC] = metrics.get(ADJUDICATION_ERROR_METRIC, 0) + 1
+    _emit_adjudication_sentinel()
+
+
+def _hook_adjudicate_one(module):
+    """Wrap swival.audit._adjudicate_one so silent error outcomes become evidence.
+
+    Released Phase 4.5 keeps a finding when evidence gathering fails
+    (``decision == "error"``) or when a batch worker raises, without any
+    terminal marker. Both are recorded; the missing private target itself is
+    reported as an error so inspection fails closed.
+    """
+    original = getattr(module, "_adjudicate_one", None)
+    if getattr(original, "_pi_swival_adjudication_hook", False):
+        return
+    if not callable(original):
+        _emit_adjudication_sentinel()
+        return
+
+    @functools.wraps(original)
+    def hooked(item, state, *args, **kwargs):
+        try:
+            result = original(item, state, *args, **kwargs)
+        except Exception:
+            _record_adjudication_error(state)
+            raise
+        if result is None or getattr(result, "decision", None) == "error":
+            _record_adjudication_error(state)
+        return result
+
+    hooked._pi_swival_adjudication_hook = True  # pylint: disable=protected-access
+    module._adjudicate_one = hooked  # pylint: disable=protected-access
+
+
+class _HookedLoader(importlib.abc.Loader):
+    """Execute the released module through its own loader, then install the hook."""
+
+    def __init__(self, loader):
+        self._loader = loader
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _hook_adjudicate_one(module)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
+class _AdjudicationHookFinder(importlib.abc.MetaPathFinder):
+    """Lazy post-import hook: nothing from Swival is imported until the CLI does."""
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != "swival.audit":
+            return None
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _HookedLoader(spec.loader)
+                return spec
+        return None
+
+
+def install_adjudication_hook():
+    """Idempotently hook swival.audit, whether it is already imported or loads later."""
+    loaded = sys.modules.get("swival.audit")
+    if loaded is not None:
+        _hook_adjudicate_one(loaded)
+    if not any(isinstance(finder, _AdjudicationHookFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _AdjudicationHookFinder())
+
+
+def launch(cli, cli_args):
+    """Run the pinned CLI in-process exactly as direct execution would, hook installed."""
+    install_adjudication_hook()
+    sys.argv = [cli, *cli_args]
+    sys.path[0] = os.path.dirname(cli)
+    runpy.run_path(cli, run_name="__main__")
+    return 0
 
 
 def native_scope(request):
@@ -371,7 +515,9 @@ def native_scope(request):
 
 
 def main():
-    """Read a capped adapter request and print only nonsecret metadata."""
+    """Launch the pinned CLI, or read a capped adapter request and print only nonsecret metadata."""
+    if sys.argv[1:2] == ["--launch"] and len(sys.argv) >= 3:
+        return launch(sys.argv[2], sys.argv[3:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preflight", action="store_true", required=True)
     parser.parse_args()

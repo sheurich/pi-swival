@@ -2,15 +2,13 @@
 
 [AgentFS](https://github.com/tursodatabase/agentfs) supplies an overlay and platform filesystem sandbox. Swival 1.9.3 invokes it with `--no-default-allows --allow <base-dir>`. On macOS, that grant permits host-base write-through. On Linux, AgentFS 0.6.4 overlays its launch cwd before applying grants, so an identical base path remains in the overlay. Do not assume all Swival writes stay in `delta.db` or that a fresh session prevents host-base mutation.
 
-For native audit, the adapter launches upstream AgentFS directly with `--no-default-allows` and a disposable committed snapshot grant. ChatGPT alone also receives a dedicated auth-store directory grant inside HOME. API-key/local routes receive no ChatGPT directory grant. Auth cannot overlap source, artifacts, or prospective AgentFS/service state, including all of HOME's `.agentfs`. These explicit grants are not the entire upstream write policy. The auth directory never enters Swival `--add-dir` or model-tool roots. Swival uses `--sandbox builtin` inside AgentFS to avoid a second bootstrap. Original source and Git metadata stay outside the writable scope. After verified shutdown, the adapter reads bounded artifacts from the snapshot. It does not export from guessed delta paths or automatically apply patches.
+For native audit, `pi-swival` launches AgentFS directly with `--no-default-allows` and a disposable committed snapshot grant (plus a runtime-only auth-store directory inside `HOME` for ChatGPT, excluded from Swival `--add-dir` and model-tool roots). Inner Swival runs `--sandbox builtin` to avoid a second bootstrap, keeping original source and `.git` metadata outside writable scope. Artifacts are read from the snapshot only after verified process-group shutdown.
 
-AgentFS does not establish host-read confidentiality or provider-process egress confinement. `network=provider-only` is Swival's tool policy. The installed runtime remains trusted.
+AgentFS does not provide host-read confidentiality or provider-process egress confinement (`network=provider-only` confines agent subprocesses rather than the provider client).
 
 ## Ordinary delegation
 
-Use a disposable cwd for write exploration. A fresh AgentFS session does not remove Swival's explicit base-directory grant or provide a portable host-write isolation guarantee. `noSandboxAutoSession: true` separates session state only.
-
-Parallel writable tasks need distinct disposable directories or worktrees. The same-cwd guard treats fresh AgentFS sessions and command-name allowlists as write-capable. Only agents with both `files: none` and `commands: none` receive the shared-cwd exemption. Ordinary cwd and output paths are caller-selected, not restricted to approved roots. Pi writes requested output outside the child sandbox; no confidentiality guarantee applies.
+Use a disposable `cwd` for write exploration: a fresh AgentFS session (`noSandboxAutoSession: true`) separates session state, not Swival's `--allow <base-dir>` grant. Parallel writable tasks require distinct disposable directories or worktrees; only agents with both `files: none` and `commands: none` may share a `cwd`.
 
 ## Native source locations
 
@@ -62,4 +60,4 @@ Do not delete session data or signal recorded PIDs while a process may still use
 
 ## Native validation
 
-Run `npm run native-agentfs-integration` with existing prerequisites. The gate uses isolated synthetic homes, source, Git metadata, and nono registration. It exercises real CLI bootstrap, original-source write refusal, process/session teardown, and production bounded snapshot collection. It makes no live provider/auth calls. API/local cases run the released zero-finding audit producer and resolver with HTTP doubles through production launch/finalization. ChatGPT controls exercise standard synthetic refresh persistence and model-tool auth denial. Full finding/verifier/patch phases run separately in offline fixtures. Synthetic registration proves profile availability only, not authenticity or nono enforcement.
+Run `npm run native-agentfs-integration` to exercise offline AgentFS bootstrap, original-source write refusal, process-group teardown, and bounded snapshot artifact collection against local HTTP doubles without live provider calls.

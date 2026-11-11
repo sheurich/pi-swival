@@ -6,71 +6,36 @@ description: >-
   artifacts, or other work that should pass through Swival's self-review loop.
 ---
 
-# Swival worker briefs
+# Swival Worker Briefs
 
-Use this skill when drafting the `task` value and dispatch overrides for a `swival-subagent` call to `self-review-worker`.
+Use this skill when drafting `task` briefs and overrides for `swival-subagent` calls to `self-review-worker` (`../../agents/self-review-worker.md`). Use `self-review-worker` for code edits and generated artifacts, never for pure read-only reviews.
 
-`self-review-worker` runs Swival with `--self-review` enabled. The bundled agent definition lives at `../../agents/self-review-worker.md` relative to this skill. It is an implementation agent, not a review-only agent. Use it for code changes, file edits, and generated artifacts where an in-process review pass should check the result before returning.
+`self-review-worker` defaults to `maxReviewRounds: 5`, `files: some`, `commands: all`, `noInstructions: true`, and `noMemory: true`. Pass `instructionsFullOverride: true` when the worker needs repository `AGENTS.md`/`CLAUDE.md` files; otherwise state required project constraints directly in the brief.
 
-Do not use `self-review-worker` for pure review tasks. For PR reviews or read-only change assessment, use dedicated reviewer agents or review skills.
+## How `--self-review` works
 
-The agent defaults to `maxReviewRounds: 5`, `files: some`, `commands: all`, `noInstructions: true`, and `noMemory: true`. Pass `instructionsFullOverride: true` when the worker needs repository `AGENTS.md`/`CLAUDE.md` files; host harness instructions are not loaded automatically and must be stated in the brief.
+1. **Read-only inspection (`READ_ONLY_AGENT_TOOLS`):** `SelfReviewer` can read, list, grep, and outline files inside `cwd`, but cannot run shell commands, builds, or tests.
+2. **Transcript blindness:** `SelfReviewer` sees only `<task>`, optional `<verification>` (`verifyOverride`), `<answer>`, and optional `reviewPromptOverride`—never intermediate tool calls unless quoted in `<answer>`.
+3. **Scoped to `cwd`:** `SelfReviewer` cannot inspect paths outside `cwd` (even when `addDir` or `addDirRo` is set). Keep all reviewed files inside `cwd`.
+4. **Executable test gates:** Use `test-runner` (`../../agents/test-runner.md`) with `reviewerOverride: "<script>"` when a test or build script must run inside the retry loop.
 
-## How `--self-review` works (and what it cannot see)
+## Reviewer outcome verification
 
-Understanding Swival's `SelfReviewer` mechanics is essential when writing briefs:
+In Swival 1.9.3, if `SelfReviewer` or `ExternalReviewer` errors (`exit_code >= 2`) or exhausts `maxReviewRounds`, Swival logs `accepting answer as-is` (or `Max review rounds (<N>) reached, accepting answer`) and still exits `0` with `outcome = "success"`. After every run:
 
-1. **Read-only file inspection only — no commands or tests:** `SelfReviewer` runs a read-only agent loop (`READ_ONLY_AGENT_TOOLS`, `files="some"`, `network="provider-only"`) using the same model/provider as the worker. It can read, list, grep, and outline files inside `cwd`, **but it cannot execute shell commands, builds, or tests**.
-2. **No visibility into the worker's tool-call transcript:** `SelfReviewer` receives only `<task>`, optional `<verification>` (`verifyOverride`), the worker's final `<answer>` text, and optional custom rubric instructions (`reviewPromptOverride`). It never sees intermediate tool calls or command outputs unless the worker quotes them in `<answer>`.
-3. **Scoped strictly to `cwd`:** `SelfReviewer` inspects only `cwd` (`base_dir`) with `extra_write_roots=[]`. Files outside `cwd` (including paths granted to the worker via `addDir` or `addDirRo`) are invisible to `SelfReviewer`. Keep all files that require review inside `cwd`.
-4. **When to use `test-runner` instead:** If you want an executable test, linter, or build script to run inside the retry loop after each turn, dispatch `test-runner` (`../../agents/test-runner.md`) with `reviewerOverride: "<script>"` (test-as-contract), or pair `self-review-worker` with `reviewPromptOverride` / `verifyOverride`. Because Swival's review loop applies the same outer-success fallback to both `--self-review` and external `--reviewer` scripts (see below), always verify `report.json` and run the test command in the parent session before accepting either agent's output.
+- Check `report.json` to confirm the final `type: "review"` entry in `timeline` recorded `exit_code: 0`.
+- Run `git status --short`, `git diff`, and the validation command in the parent session before staging or committing.
 
-## Reviewer outcome semantics and parent verification
+## Dispatch overrides
 
-In Swival 1.9.3, when either `SelfReviewer` (`--self-review`) or `ExternalReviewer` (`--reviewer`, used by `test-runner`) encounters a reviewer error (`verdict.status == "error"` / exit code `>= 2`) or reaches `maxReviewRounds` (default `5` on `self-review-worker`, `10` on `test-runner`), Swival logs a warning (`accepting answer as-is` or `Max review rounds (<N>) reached, accepting answer`) and still exits `0` with `result.outcome = "success"`.
-
-After every `self-review-worker` (or `test-runner`) run, the caller must:
-
-- Inspect `report.json` (confirm the final `type: "review"` entry in `timeline` has `exit_code: 0` rather than `1` or `2`).
-- Run `git status --short`, `git diff`, and the validation command independently in the parent session before staging or committing.
-- Treat same-model `--self-review` as a first-pass implementation filter, not a substitute for independent cross-model review or human acceptance.
-
-## Brief structure
-
-Every task brief should include six elements plus an explicit evidence requirement:
-
-1. **Goal:** one sentence defining the required result.
-2. **Pre-flight & Hygiene:** worktree verification, mutation boundaries, test integrity, and non-interactive failure rules.
-3. **Scope:** exact files, directories, or artifacts under `cwd` the worker may change, and paths/behaviors that must remain untouched.
-4. **Constraints:** style rules, architectural invariants, compatibility limits, and dependency boundaries (no unapproved installs or config edits).
-5. **Validation:** exact commands to run and expected outputs before declaring completion.
-6. **Done when:** specific observable states in `cwd` and validation outputs that count as complete.
-
-Prefer concrete, verifiable instructions over vague quality requests (`Fix parser EOF handling in src/parser.ts and run npm test` rather than `improve parser quality`).
-
-## Evidence standard
-
-Because `SelfReviewer` sees only `<answer>` and files under `cwd`, the brief must require the worker's final answer to include:
-
-- **Pre-flight state:** confirmed `pwd`, branch, `HEAD`, and initial `git status --short`.
-- **Changed files:** exact relative paths under `cwd` modified, added, or deleted.
-- **Commands and verbatim outputs:** each validation command run, its exact exit code, and relevant stdout/stderr summary.
-- **Residual risks:** any edge cases, skipped paths, or open questions (or `none`).
-
-When tasks rely on external or repository claims, require citations with exact file paths and line numbers.
-
-## Dispatch overrides and context budgeting
-
-Pair a well-structured brief with dispatch overrides that match the task's risk and output size:
-
-| Override | When to use |
-| --- | --- |
-| `profileOverride` | Select a named profile from `~/.config/swival/config.toml` matching task complexity (e.g. a fast/budget profile for bounded mechanical edits or a frontier reasoning profile for complex refactors). |
-| `networkOverride: "provider-only"` | Block child shell commands and Python scripts from outbound network access while preserving LLM provider API access. |
-| `reviewPromptOverride` | Supply a focused checklist for `SelfReviewer` to verify in the edited files (e.g. `"Read the modified files and verify error paths, types, and quoted test output."` ). |
-| `verifyOverride` | Point `SelfReviewer` at an acceptance-criteria file path (resolved relative to `cwd`). |
-| `instructionsFullOverride: true` | Load complete repository `AGENTS.md`/`CLAUDE.md` files without the instruction-budget cap (`<= 8,192` tokens; suppresses `--no-instructions`). |
-| `output` / `outputMode` / `maxInlineBytes` | Pass `output: "<artifact-path>"` (resolved relative to the task's `cwd`; defaults to `outputMode: "file-only"`) to return only path + size metadata to the parent while `SelfReviewer` still inspects the full `<answer>` in-process, or pass `maxInlineBytes` to keep short answers inline and truncate longer ones with a pointer to the artifact directory. |
+| Override | Purpose |
+|---|---|
+| `profileOverride` | Select a profile in `~/.config/swival/config.toml` matched to task complexity |
+| `networkOverride: "provider-only"` | Block child shell/Python network access while keeping provider API access |
+| `reviewPromptOverride` | Checklist for `SelfReviewer` (e.g. `"Verify modified files, types, and quoted test output."`) |
+| `verifyOverride` | Acceptance-criteria file path (relative to `cwd`) |
+| `instructionsFullOverride: true` | Load full `AGENTS.md`/`CLAUDE.md` without truncation |
+| `output` / `outputMode` / `maxInlineBytes` | Write output to `<path>` (`outputMode: "file-only"` by default) or cap inline characters while `SelfReviewer` still sees the full `<answer>` |
 
 ## Brief template
 
@@ -78,57 +43,52 @@ Pair a well-structured brief with dispatch overrides that match the task's risk 
 Goal: <one-sentence result>
 
 Pre-flight & Hygiene:
-- Verify `pwd`, current Git branch, `HEAD`, and `git status --short` before editing. Stop and report immediately if unexpected or unattributed dirty files exist.
-- Edit only the declared in-scope files under `cwd`. Do not run `git commit`, `git stash`, `git reset`, `git push`, package installations, or host-state mutations.
-- Do not weaken, skip (`skip`/`xfail`), or delete tests or assertions to make checks pass.
-- Non-interactive execution: stop and escalate immediately if any command prompts for credentials, SSH PIN/hardware-token touch, or interactive input; never retry or switch authentication methods.
+- Verify `pwd`, Git branch, `HEAD`, and `git status --short` before editing; stop on unexpected dirty files.
+- Edit only declared in-scope paths under `cwd`. Do not commit, push, stash, reset, install packages, or weaken/skip tests.
+- Stop immediately if any command prompts for credentials, SSH PIN/token touch, or interactive input.
 
 Scope:
-- Change only: <relative paths under cwd>.
-- Do not change: <paths, public APIs, or behaviors>.
+- Change only: <relative paths under cwd>
+- Do not change: <untouched paths, public APIs, or behaviors>
 
 Constraints:
-- <specific architectural, typing, or compatibility constraints>
+- <typing, architectural, or compatibility invariants>
 
 Validation:
-- Run: <exact command>
-- Expected: <exit 0 and observable test/lint output>
+- Run: <exact command> (expected: exit 0 and <observable output>)
 
 Done when:
-- <observable file state 1>
-- <observable validation result 2>
+- <observable file and validation outcomes>
 
 Final answer must include:
 1. Pre-flight `pwd`, branch, `HEAD`, and initial status.
-2. Exact list of changed files under `cwd`.
-3. Every validation command run, its exact exit code, and verbatim pass/fail summary (required so the read-only self-reviewer can verify your claims).
+2. Changed files under `cwd`.
+3. Every validation command run, exact exit code, and verbatim pass/fail summary.
 4. Residual risks or open questions.
 ```
 
 ## Dispatch examples
 
-Single implementation task with provider-only network isolation and custom reviewer checklist:
+Single task:
 
 ```text
 swival-subagent with
   agent: "self-review-worker",
   profileOverride: "budget",
   networkOverride: "provider-only",
-  reviewPromptOverride: "Read cmd/serve.go and cmd/serve_test.go to verify input validation, preserved error types, and that the answer quotes passing go test output.",
+  reviewPromptOverride: "Read cmd/serve.go and cmd/serve_test.go to verify input validation, error types, and passing go test output.",
   task: [
     "Goal: Add input validation to cmd/serve.go.",
-    "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status before editing; stop on unexpected dirt. Do not commit, push, install packages, or weaken tests.",
+    "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status; do not commit, install packages, or weaken tests.",
     "Scope: change only cmd/serve.go and cmd/serve_test.go.",
     "Constraints: preserve existing error types and CLI flags.",
     "Validation: run `go test -v ./cmd/...`.",
     "Done when: invalid input returns an error and `go test -v ./cmd/...` exits 0.",
-    "Final answer must include pre-flight status, changed files, exact validation commands with exit codes and output summary, and residual risks."
+    "Final answer must include pre-flight status, changed files, exact validation exit codes and summary, and residual risks."
   ].join("\n")
 ```
 
-Parallel tasks on isolated worktrees with file-backed output budgeting:
-
-Parallel write-capable tasks must target distinct `cwd` directories that already exist. Allocate each worktree before dispatching (for example with Worktrunk `wt switch --create --no-cd <branch>` or `git worktree add -b worker-a .worktrees/worker-a HEAD`). For bundled and user-scope agents in linked Git worktrees, `pi-swival` validates the worktree and passes `--add-dir-ro <git-common-dir>` automatically so read-only Git commands (`git status`, `git diff`, `git rev-parse`) work under `networkOverride: "provider-only"` while shared `.git` metadata stays write-protected. See the `swival` skill for merge and cleanup procedures.
+Parallel tasks on distinct pre-created worktrees (`pi-swival` passes `--add-dir-ro <git-common-dir>` automatically for bundled/user agents in linked worktrees):
 
 ```text
 swival-subagent with
@@ -138,38 +98,13 @@ swival-subagent with
       agent: "self-review-worker",
       cwd: ".worktrees/worker-a",
       output: ".swival-summary.md",
-      task: [
-        "Goal: Refactor auth token parsing.",
-        "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status; stop on unexpected dirt. Do not commit or weaken tests.",
-        "Scope: change only auth/*.go.",
-        "Constraints: keep public API unchanged.",
-        "Validation: run `go test ./auth/...`.",
-        "Done when: `go test ./auth/...` exits 0.",
-        "Final answer must include pre-flight status, changed files, validation commands with exit codes and output, and residual risks."
-      ].join("\n")
+      task: "Goal: Refactor auth token parsing.\nPre-flight & Hygiene: verify clean git status; do not commit.\nScope: auth/*.go only.\nValidation: run `go test ./auth/...` and quote exit code + output."
     },
     {
       agent: "self-review-worker",
       cwd: ".worktrees/worker-b",
       output: ".swival-summary.md",
-      task: [
-        "Goal: Add parser error regression tests.",
-        "Pre-flight & Hygiene: verify pwd, branch, HEAD, and clean git status; stop on unexpected dirt. Do not commit or edit production code.",
-        "Scope: change only parser/*_test.go.",
-        "Constraints: no production edits.",
-        "Validation: run `go test ./parser/...`.",
-        "Done when: `go test ./parser/...` exits 0.",
-        "Final answer must include pre-flight status, changed files, validation commands with exit codes and output, and residual risks."
-      ].join("\n")
+      task: "Goal: Add parser error regression tests.\nPre-flight & Hygiene: verify clean git status; do not edit production code.\nScope: parser/*_test.go only.\nValidation: run `go test ./parser/...` and quote exit code + output."
     }
   ]
 ```
-
-## Common pitfalls
-
-- **Assuming `--self-review` runs your test suite:** `SelfReviewer` is read-only and cannot run commands. If the worker does not quote command exit codes and output in `<answer>`, `SelfReviewer` has no way to see whether tests ran. Use `test-runner` with `reviewerOverride` when an executable script should drive retry feedback, and still verify `report.json` (`exit_code: 0` on the final `type: "review"` timeline entry) plus parent-session validation before accepting.
-- **Editing or referencing files outside `cwd`:** `SelfReviewer` cannot read paths outside `cwd` (even with `addDir` / `addDirRo`). Always set `cwd` to a root that encloses every file under review.
-- **Trusting exit code `0` without checking `report.json` and `git diff`:** Swival 1.9.3 exits `0` with `outcome = "success"` even when `maxReviewRounds` is exhausted or the reviewer errors. Check `timeline` review events in `report.json` and run validation in the parent session.
-- **Requesting review-only output from `self-review-worker`:** Use a read-only reviewer agent instead.
-- **Omitting pre-flight and git/auth stop rules:** Because `--no-instructions` is on by default, always state worktree pre-flight checks, no-commit/no-push boundaries, and non-interactive stop-on-auth-failure rules in the brief.
-- **Running parallel mutating tasks on the same `cwd`:** Pre-create and pass distinct worktree paths via `cwd`.

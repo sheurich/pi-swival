@@ -120,6 +120,7 @@ class NativeEntryTests(unittest.TestCase):
                 self.assertIn(exc.code, (None, 0), output.getvalue())
         text = output.getvalue()
         self.assertLess(len(text.encode()), 65536)
+        self.cli_output = text
         if diagnostic_path is not None:
             Path(diagnostic_path).write_text(text, encoding="utf-8")
         losses = sum(int(match[0]) for match in re.findall(
@@ -640,8 +641,19 @@ class NativeEntryTests(unittest.TestCase):
         edits = []
         failed_attempts = []
         adjudication_errors = []
+        transient_errors = []
         malformed_calls = []
         repair_calls = []
+        # The production launcher installs this hook lazily; the in-process CLI needs it explicitly.
+        bridge.install_adjudication_hook()
+        if recovery == "evidence-error":
+            released_gather = audit._gather_evidence
+            def gather(finding, state, ctx):
+                # Only Phase 4.5 evidence gathering fails; verification, patch, and report keep the released path.
+                if sys._getframe(1).f_code.co_name == "_adjudicate_one":
+                    raise RuntimeError("synthetic-evidence-failure-value-never-export")
+                return released_gather(finding, state, ctx)
+            self.enterContext(patch.object(audit, "_gather_evidence", gather))
         title = "Role authorization accepts non-admin"
         if recovery in ("reviewer-error", "consolidate-error"):
             # Exact titles from the parent Rich probe split each fixed marker at width 80.
@@ -657,6 +669,11 @@ class NativeEntryTests(unittest.TestCase):
                     or (recovery == "consolidate-error" and "phase 4.5 consolidate" in task)):
                 adjudication_errors.append(task)
                 raise agent.AgentError("synthetic-terminal-adjudication-value-never-export")
+            if (recovery == "reviewer-transient-recovered" and "phase 4.5 review" in task
+                    and not transient_errors):
+                # Released attempt 0 raises and prints `reviewer error:`; attempt 1 succeeds.
+                transient_errors.append(task)
+                raise agent.AgentError("synthetic-transient-adjudication-value-never-export")
             return released_auxiliary(context, messages, **kwargs)
 
         responses = {
@@ -756,6 +773,7 @@ class NativeEntryTests(unittest.TestCase):
                               all_files=not triage_failure)
         self.assertEqual(len(adjudication_errors), {"reviewer-error": 6,
             "consolidate-error": 1}.get(recovery, 0))
+        self.assertEqual(len(transient_errors), 1 if recovery == "reviewer-transient-recovered" else 0)
         self.assertFalse(agent._MODEL_AUTOFIX)
         if not export and commit_source:
             self.assertEqual(result["status"], "completed", result)
@@ -781,6 +799,17 @@ class NativeEntryTests(unittest.TestCase):
         if recovery == "reviewer-retry-recovered":
             self.assertEqual(state["metrics"]["phase45_lens_retries"], 1)
             self.assertEqual(calls.count("adjudication"), 4)
+        if recovery == "reviewer-transient-recovered":
+            self.assertEqual(state["metrics"]["phase45_lens_retries"], 1)
+            self.assertEqual(state["metrics"]["repair_failures"], 0)
+            self.assertEqual(calls.count("adjudication"), 3)
+            self.assertEqual(len(re.findall(r"reviewer\s+error:", self.cli_output)), 1)
+        # The hook records evidence failures value-free; released output never carries them.
+        self.assertEqual(state["metrics"].get(bridge.ADJUDICATION_ERROR_METRIC, 0),
+                         1 if recovery == "evidence-error" else 0)
+        self.assertEqual(self.cli_output.count(bridge.ADJUDICATION_ERROR_SENTINEL),
+                         1 if recovery == "evidence-error" else 0)
+        self.assertNotIn("synthetic-evidence-failure-value-never-export", self.cli_output)
         if triage_failure:
             self.assertTrue(set(state["scope"]["mandatory_files"]).issubset(
                 state["deep_reviewed_files"]))
@@ -926,6 +955,136 @@ class NativeEntryTests(unittest.TestCase):
 
     def test_released_triage_promotion_preserves_full_deep_review(self):
         self.released_finding("# Synthetic source-only report\n", recovery="triage-promoted")
+
+    def test_released_transient_reviewer_error_recovers_on_retry_without_repair(self):
+        self.released_finding("# Synthetic source-only report\n", recovery="reviewer-transient-recovered")
+
+    def test_released_evidence_failure_is_recorded_by_adjudication_hook(self):
+        """Released Phase 4.5 keeps a finding silently when evidence gathering fails; the hook records it."""
+        self.released_finding("# Synthetic source-only report\n", recovery="evidence-error")
+
+    def test_adjudication_hook_records_none_error_and_exception_outcomes_once(self):
+        outcomes = iter([None, SimpleNamespace(decision="error"), SimpleNamespace(decision="keep"),
+                         RuntimeError("synthetic-hook-value-never-export")])
+        def adjudicate(_item, _state, _ctx, ui=None):
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        module = SimpleNamespace(_adjudicate_one=adjudicate)
+        bridge._hook_adjudicate_one(module)
+        hooked = module._adjudicate_one
+        bridge._hook_adjudicate_one(module)
+        self.assertIs(module._adjudicate_one, hooked, "hook installation is idempotent")
+        state = SimpleNamespace(metrics={})
+        output = io.StringIO()
+        with contextlib.redirect_stderr(output):
+            self.assertIsNone(hooked((0, None), state, None))
+            self.assertEqual(hooked((1, None), state, None).decision, "error")
+            self.assertEqual(hooked((2, None), state, None, ui=None).decision, "keep")
+            with self.assertRaises(RuntimeError):
+                hooked((3, None), state, None)
+        self.assertEqual(state.metrics, {bridge.ADJUDICATION_ERROR_METRIC: 3})
+        self.assertEqual(output.getvalue().count(bridge.ADJUDICATION_ERROR_SENTINEL), 3)
+        self.assertNotIn("value-never-export", output.getvalue())
+        # A pinned private target that disappeared is itself evidence of an unverifiable adjudication.
+        with contextlib.redirect_stderr(output):
+            bridge._hook_adjudicate_one(SimpleNamespace())
+        self.assertEqual(output.getvalue().count(bridge.ADJUDICATION_ERROR_SENTINEL), 4)
+
+    def test_launcher_hooks_swival_audit_lazily_without_eager_imports(self):
+        cli = self.root / "probe-cli"
+        cli.write_text(
+            "import json, sys\n"
+            "eager = sorted(name for name in sys.modules if name == 'swival' or name.startswith('swival.'))\n"
+            "from swival import audit\n"
+            "print(json.dumps({'argv': sys.argv[1:], 'eager': eager, 'path0': sys.path[0],\n"
+            "    'hooked': getattr(audit._adjudicate_one, '_pi_swival_adjudication_hook', False)}))\n")
+        result = subprocess.run([sys.executable, "-B", str(WORKTREE / "scripts/native_audit.py"), "--launch",
+            str(cli), "--base-dir", str(self.repo), "--", "/audit --all"], env={**os.environ},
+            capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        probe = json.loads(result.stdout.decode())
+        self.assertEqual(probe, {"argv": ["--base-dir", str(self.repo), "--", "/audit --all"],
+            "eager": [], "path0": str(self.root), "hooked": True})
+
+    def test_required_shim_attests_hooks_and_keeps_pricing_backfill_optional(self):
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+        from swival import config as config_module
+        module = self.cloud_shim()
+        attestation = module.install_required_shim(require_hooks=True)
+        self.assertTrue(attestation["model_discovery_disabled"])
+        self.assertTrue(attestation["oauth_headers"])
+        self.assertTrue(attestation["vertex_bearer"])
+        self.assertIs(module.SHIM_ATTESTATION["model_discovery_disabled"], True)
+        self.assertEqual(agent._list_server_models("anthropic", None, None), [])
+        # Optional pricing metadata never shares the required-hook failure policy.
+        trimmed = {key: value for key, value in litellm.model_cost.items()
+                   if key not in ("claude-mythos-5-1", "claude-mythos-5-2")}
+        with patch.object(litellm, "model_cost", trimmed):
+            self.assertTrue(module.install_required_shim(require_hooks=True)["model_discovery_disabled"])
+            self.assertNotIn("claude-mythos-5-2", litellm.model_cost)
+        # Every required upstream target fails closed when missing/non-callable and resets attestation.
+        for owner, attr, extra_env in (
+            (agent, "_list_server_models", {}),
+            (AnthropicModelInfo, "get_models", {}),
+            (VertexBase, "load_auth", {}),
+            (litellm, "completion", {}),
+            (config_module, "apply_config_to_args", {"PI_SWIVAL_NO_SELF_REVIEW": "1"}),
+        ):
+            with patch.dict(os.environ, extra_env), patch.object(owner, attr, None):
+                with self.assertRaisesRegex(RuntimeError, "PI_SWIVAL_SHIM_INSTALL_FAILED"):
+                    module.install_required_shim(require_hooks=True)
+                self.assertEqual(module.SHIM_ATTESTATION, dict.fromkeys(module.SHIM_ATTESTATION, False))
+                self.assertFalse(module.install_required_shim()["model_discovery_disabled"])
+        # Preflight _admit_route refuses all three shim-dependent routes when attestation fails.
+        cloud_routes = (
+            ('provider="anthropic"\nmodel="claude-mythos-5-2"\nmax_context_tokens=1000000\n',
+             {"ANTHROPIC_API_KEY": "sk-ant-oat01-synthetic"}, "anthropic"),
+            ('provider="bedrock"\nmodel="concrete"\nbase_url="us-east-2"\nmax_context_tokens=128000\n',
+             {"AWS_ACCESS_KEY_ID": "a", "AWS_SECRET_ACCESS_KEY": "b", "AWS_SESSION_TOKEN": "c"}, "bedrock"),
+            ('provider="geap"\nmodel="gemini-concrete"\nproject="synthetic-project"\nlocation="global"\nmax_context_tokens=128000\n',
+             {"GOOGLE_OAUTH_ACCESS_TOKEN": "synthetic-google"}, "geap"),
+        )
+        for cfg_text, creds, expected_provider in cloud_routes:
+            self.write_config(cfg_text)
+            with patch.object(agent, "_list_server_models", None), patch.dict(os.environ, creds):
+                with self.assertRaisesRegex(bridge.NativeAuditError, "MODEL_REPLACEMENT_UNCONTROLLABLE"):
+                    bridge.resolve_native_config({"source": str(self.repo)})
+            # Re-install working shim and confirm admission succeeds once hooks attest cleanly.
+            module.install_required_shim(require_hooks=True)
+            with patch.dict(os.environ, creds):
+                self.assertEqual(bridge.resolve_native_config({"source": str(self.repo)})["provider"], expected_provider)
+        # Non-Swival tool/reviewer children inherit PYTHONPATH + PI_SWIVAL_SHIM_REQUIRED=1 and stay silent,
+        # whereas a Swival interpreter with a broken required target exits non-zero on startup.
+        shim_dir = str(WORKTREE / "scripts/anthropic_oauth_shim")
+        non_swival_child = (
+            "import importlib.abc, sys\n"
+            "class Block(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, name, path, target=None):\n"
+            "        if name == 'swival' or name.startswith('swival.'): return None\n"
+            "sys.meta_path.insert(0, Block())\n"
+            f"sys.path.insert(0, {shim_dir!r})\n"
+            "import sitecustomize\n"
+        )
+        silent_proc = subprocess.run([sys.executable, "-S", "-B", "-c", non_swival_child],
+            env={**os.environ, "PI_SWIVAL_SHIM_REQUIRED": "1"},
+            capture_output=True, timeout=30)
+        self.assertEqual(silent_proc.returncode, 0, silent_proc.stderr.decode())
+        broken_target_startup = (
+            "import site, sys\n"
+            "site.main()\n"
+            "from swival import agent\n"
+            "agent._list_server_models = None\n"
+            f"sys.path.insert(0, {shim_dir!r})\n"
+            "import sitecustomize\n"
+        )
+        required_proc = subprocess.run([sys.executable, "-S", "-B", "-c", broken_target_startup],
+            env={**{k: v for k, v in os.environ.items() if k != "PYTHONPATH"}, "PI_SWIVAL_SHIM_REQUIRED": "1"},
+            capture_output=True, timeout=30)
+        self.assertNotEqual(required_proc.returncode, 0)
+        self.assertIn(b"PI_SWIVAL_SHIM_INSTALL_FAILED", required_proc.stderr)
 
     def test_cloud_route_admission_and_fallback_refusal(self):
         credentials = {"AWS_ACCESS_KEY_ID": "synthetic-access", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
@@ -1310,7 +1469,8 @@ if __name__ == "__main__":
                     "lost", "recovered", "out-of-scope") else "complete"),
                 recovery=(export_mode if export_mode in ("reviewer-error", "consolidate-error",
                     "malformed-reviewers", "malformed-consolidation", "repaired-reviewers",
-                    "repaired-consolidation", "reviewer-retry-recovered", "triage-promoted")
+                    "repaired-consolidation", "reviewer-retry-recovered", "triage-promoted",
+                    "reviewer-transient-recovered", "evidence-error")
                     else "complete"))
         finally:
             fixture.doCleanups()

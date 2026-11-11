@@ -43,7 +43,7 @@ All six bundled agents (`swival`, `self-review-worker`, `test-runner`, `sandboxe
 
 ## Demo 1: generic delegation
 
-Open Pi in a disposable directory and confirm that `/tmp/swival-demo.txt` can be overwritten. Ordinary paths are caller-selected, not restricted to approved roots. Delegation does not promise confidentiality. If file policy excludes `/tmp`, use a disposable file within the selected cwd instead:
+Open Pi in a disposable directory where `/tmp/swival-demo.txt` can be written:
 
 ```text
 Use swival-subagent with task: "Print 'hello from swival' to a file
@@ -82,9 +82,7 @@ If swival rejects the first answer, the header shows `1 rounds` or more. If the 
 
 ## Demo 3: sandboxed exploration (AgentFS)
 
-Use a disposable cwd and disposable target files. Swival 1.9.3 can permit AgentFS host-base write-through through `--allow <base-dir>`. See [AgentFS platform behavior](../skills/swival/references/agentfs.md) for the Linux overlay distinction. Fresh sessions do not prevent those writes. Use the explorer only with disposable files; its session does not isolate host-base writes.
-
-Prerequisite: `agentfs` installed (see `skills/swival/references/agentfs.md`). Set `cwd` to your disposable directory on the following call. Keep a separate copy if you want to compare the original file.
+Prerequisite: `agentfs` installed (see [skills/swival/references/agentfs.md](../skills/swival/references/agentfs.md)). Pass a disposable `cwd` because Swival's `--allow <base-dir>` leaves macOS host-base writes write-through even with a fresh session:
 
 ```text
 Use swival-subagent with agent: "sandboxed-explorer"
@@ -102,11 +100,7 @@ Review direct file changes alongside any overlay diff. Native audit uses a separ
 
 ## Demo 4: native audit prompt template
 
-Use a disposable synthetic Git repository and start Pi from its root. Require Swival 1.9.3, LiteLLM 1.106.6, Python >=3.13,<3.15, AgentFS 0.6.4, upstream's nono profile, and separate approval for any live provider/auth calls. The real bootstrap/export gate passed on macOS; Linux remains unverified. Consult installation policy before execution. With no specialist selected, use configured Swival defaults. Pass a required configured specialist through `profileOverride`; a terminal selected-route failure stops without fallback. Offline representatives cover ChatGPT, API-key OpenRouter, and an explicitly configured compatible loopback endpoint. Dynamic model-list adapters are refused because upstream can replace the selected model. For ChatGPT only, standard upstream authentication can log in, refresh tokens, and write auth state. API-key/local routes receive no ChatGPT store grant. Native async is unsupported.
-
-Swival 1.9.3 can retry the same request on the same provider, model, and endpoint, including recognized policy errors. A later attempt can succeed. The adapter does not guarantee all-phase fail-fast or uniform retry-budget propagation. Never substitute a route or rewrite a refused request. Terminal failures and incomplete audits cannot attest completion.
-
-After a Pi crash or SIGKILL, Swival may remain running; there is no artifact export or claimed completion afterward. Normal timeout, cancellation, and session shutdown stop the live owned group. Native verification is source-only and patch proposals require manual review.
+Start Pi at the root of a disposable Git repository (requires Swival `1.9.3`, LiteLLM `1.106.6`, Python `>=3.13`, AgentFS `>=0.6.4`, and an installed `nono` profile; see [skills/auditing-with-swival/SKILL.md](../skills/auditing-with-swival/SKILL.md)):
 
 ```text
 /swival-audit src/**/*.py
@@ -114,21 +108,19 @@ After a Pi crash or SIGKILL, Swival may remain running; there is no artifact exp
 
 Expected behaviour:
 
-1. Pi expands the prompt and confirms relative scopes and approved routing.
-2. Pi dispatches one `audit` object, not a slash-prefixed freeform task.
-3. Native audit runs on an independent committed snapshot and returns preserved state, reports, and patch proposals.
-4. Source contents, status, and Git refs remain unchanged.
-
-Inspect native coverage and artifact pairs before treating the pipeline as complete. Native verifier judgment is not independently executed exploit reproduction. This demo does not prove uniform per-phase effort, and no patch applies automatically.
+1. Pi expands `/swival-audit` and confirms relative scopes plus any operator-configured `profileOverride`.
+2. Pi dispatches one synchronous structured `audit` call (never a freeform slash-command task).
+3. Native audit imports only committed `HEAD` objects into an isolated snapshot and exports verified `state.json`, finding reports, and `.patch` proposals after process-group shutdown.
+4. Original checkout files, status, and Git refs remain untouched; review proposed patches manually before applying.
 
 ## Demo 5: parallel dispatch
 
-Prepare two distinct disposable directories first. Add a different per-task `cwd` to each item below and use targets within those directories. The abbreviated example omits those required paths; do not dispatch it unchanged. The same-cwd guard rejects these ordinary writable tasks. It also rejects fresh AgentFS sessions sharing a writable cwd because they can still permit host-base writes.
+Pre-create two distinct disposable directories or Git worktrees (`cwd` per task) so parallel write-capable agents do not share a working copy:
 
 ```text
 Use swival-subagent with tasks: [
-  { agent: "self-review-worker", task: "Add a docstring to /tmp/fizzbuzz.py" },
-  { agent: "self-review-worker", task: "Add type hints to /tmp/test_fizzbuzz.py" }
+  { agent: "self-review-worker", cwd: "/tmp/demo-a", task: "Add a docstring to fizzbuzz.py" },
+  { agent: "self-review-worker", cwd: "/tmp/demo-b", task: "Add type hints to test_fizzbuzz.py" }
 ]
 ```
 

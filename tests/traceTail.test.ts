@@ -260,6 +260,28 @@ describe("startTraceTail", () => {
 		expect(events[0].type).toBe("text");
 		expect(events[0].type === "text" && events[0].text).toBe("Hello from delayed trace.");
 	});
+
+	it("decodes a 4-byte UTF-8 code point split across separate trace appends at temporary EOF", async () => {
+		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "trace-tail-test-"));
+		const events: TraceEvent[] = [];
+		const cleanup = startTraceTail(tempDir, (ev) => events.push(ev));
+
+		const traceFile = path.join(tempDir, "split-utf8.jsonl");
+		const encoded = Buffer.from(traceLine("assistant", [{ type: "text", text: "prefix 🦀 suffix" }]), "utf8");
+		const splitAt = encoded.indexOf(0xf0) + 2; // split 4-byte 🦀 (f0 9f a6 80) right down the middle
+		fs.appendFileSync(traceFile, encoded.subarray(0, splitAt));
+
+		// Let at least one 100ms poll cycle hit temporary EOF with the partial 4-byte sequence buffered.
+		await new Promise((r) => setTimeout(r, 180));
+		expect(events).toEqual([]);
+
+		fs.appendFileSync(traceFile, encoded.subarray(splitAt));
+		await waitFor(() => events.length === 1);
+		await cleanup();
+
+		expect(events).toEqual([{ type: "text", text: "prefix 🦀 suffix" }]);
+		expect((events[0] as { text: string }).text).not.toContain("\ufffd");
+	});
 });
 
 

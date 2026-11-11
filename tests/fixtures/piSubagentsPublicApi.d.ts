@@ -1,4 +1,4 @@
-// Portable test contract supplied for the public 0.78.0 API.
+// Portable test contract supplied for the public 0.87.0 API.
 // This fixture is not evidence from an installed consumer; runtime tests stay synthetic.
 declare module "pi-subagents/external-runs" {
 	export type ExternalRunState = "queued" | "running" | "completed" | "failed" | "stopped";
@@ -28,8 +28,8 @@ declare module "pi-subagents/external-runs" {
 
 declare module "pi-subagents/background-work" {
 	export interface BackgroundWorkItem { id: string; sessionId: string }
-	export interface BackgroundWorkListContext { sessionId: string; nowMs: number }
-	export interface BackgroundWorkReconcileContext { sessionId: string; nowMs: number }
+	export interface BackgroundWorkListContext { sessionId: string; sessionIds?: readonly string[]; nowMs: number }
+	export type BackgroundWorkReconcileContext = BackgroundWorkListContext;
 	export interface BackgroundWorkProvider {
 		name: string;
 		listActiveWork(context?: BackgroundWorkListContext): readonly BackgroundWorkItem[];
@@ -37,7 +37,7 @@ declare module "pi-subagents/background-work" {
 		reconcile?(context: BackgroundWorkReconcileContext): void;
 	}
 	export function registerBackgroundWorkProvider(provider: BackgroundWorkProvider): () => void;
-	export function snapshotBackgroundWork(sessionId: string, nowMs?: number): {
+	export function snapshotBackgroundWork(sessionIds: readonly string[], nowMs?: number): {
 		providers: readonly string[];
 		items: readonly (BackgroundWorkItem & { provider: string })[];
 	};

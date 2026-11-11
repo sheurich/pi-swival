@@ -8,7 +8,7 @@ import { nativeTestPython } from "./nativePython.js";
 
 vi.mock("node:child_process", async (importOriginal) => ({ ...await importOriginal<typeof import("node:child_process")>(), spawn: vi.fn() }));
 const deliveries: string[] = [];
-vi.mocked(spawn).mockImplementation(((executable: string, args: string[]) => {
+const defaultSpawnMock = ((executable: string, args: string[]) => {
 	const proc: any = new EventEmitter();
 	proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.stdin = new PassThrough();
 	proc.kill = vi.fn(); proc.unref = vi.fn();
@@ -27,14 +27,15 @@ vi.mocked(spawn).mockImplementation(((executable: string, args: string[]) => {
 		proc.stdout.end(); proc.stderr.end(); proc.emit("close", 0);
 	});
 	return proc;
-}) as any);
+}) as any;
+vi.mocked(spawn).mockImplementation(defaultSpawnMock);
 
 // Offline host doubles: these tests exercise dispatch, not Pi rendering or loading.
 vi.mock("@earendil-works/pi-ai", () => ({ StringEnum: (values: string[]) => ({ enum: values }) }));
 vi.mock("@earendil-works/pi-coding-agent", () => ({ getMarkdownTheme: () => ({}), getAgentDir: () => process.env.PI_CODING_AGENT_DIR ?? "/nonexistent-ordinary-safety-agent-dir" }));
 vi.mock("@earendil-works/pi-tui", () => ({ Container: class {}, Markdown: class {}, Spacer: class {}, Text: class {} }));
 vi.mock("typebox", () => ({ Type: new Proxy({}, { get: (_target, key) => (...args: unknown[]) => key === "Object" ? { properties: args[0] } : {} }) }));
-import registerExtension, { findRunMeta, isMutatingCwdAgent, pruneOldArtifacts, runSingleSwivalAsync } from "../extensions/index.js";
+import registerExtension, { findRunMeta, isMutatingCwdAgent, preflightSwivalVersion, pruneOldArtifacts, resetSwivalVersionCache, runSingleSwivalAsync } from "../extensions/index.js";
 import type { SwivalAgentConfig } from "../extensions/agents.js";
 
 const roots: string[] = [];
@@ -50,7 +51,18 @@ function fixture() {
 	return { root, artifactRoot };
 }
 const agent: SwivalAgentConfig = { name: "test", description: "test", systemPrompt: "", source: "user", filePath: "/unused" };
-afterEach(() => { deliveries.length = 0; vi.unstubAllEnvs(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+const spawnedPids: number[] = [];
+afterEach(() => {
+	deliveries.length = 0;
+	for (const pid of spawnedPids.splice(0)) {
+		try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+	}
+	vi.restoreAllMocks();
+	vi.mocked(spawn).mockReset().mockImplementation(defaultSpawnMock);
+	resetSwivalVersionCache();
+	vi.unstubAllEnvs();
+	for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+});
 
 describe("ordinary cwd write capability", () => {
 	it.each(["git", "ls,rg", "git,ls,find,rg,grep,head,tail,wc,pwd"])("treats command-name allowlist %s as write-capable", (commands) => {
@@ -235,5 +247,249 @@ describe("preserved retention and canonical alias behavior", () => {
 		const alias = path.join(meta.artifactDir, "alias"); fs.symlinkSync("future", alias);
 		meta.stdoutFile = path.join(alias, "stdout.txt"); save();
 		expect(await findRunMeta(meta.runId, f.artifactRoot)).toMatchObject({ stdoutFile: path.join(meta.artifactDir, "future", "stdout.txt") });
+	});
+});
+
+describe("synchronous process-group cleanup and UTF-8 streaming", () => {
+	function installFakeSwival(binDir: string, mode: "hang" | "exit-0-with-grandchild") {
+		const swivalPath = path.join(binDir, "swival");
+		fs.writeFileSync(swivalPath, [
+			`#!${process.execPath}`,
+			'import * as fs from "node:fs";',
+			'import * as path from "node:path";',
+			'import { spawn } from "node:child_process";',
+			'const args = process.argv.slice(2);',
+			'if (args.includes("--version")) { process.stdout.write("1.9.3\\n"); process.exit(0); }',
+			'const baseDir = args[args.indexOf("--base-dir") + 1];',
+			'const reportPath = args[args.indexOf("--report") + 1];',
+			'const pidFile = path.join(baseDir, "grandchild.pid");',
+			'spawn(process.execPath, [',
+			'  "--input-type=module", "-e",',
+			'  "import * as fs from \\"node:fs\\"; process.on(\\"SIGTERM\\", () => {}); fs.writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);",',
+			'  pidFile,',
+			'], { stdio: "inherit" });',
+			`if (${JSON.stringify(mode)} === "exit-0-with-grandchild") {`,
+			'  const waitPid = setInterval(() => {',
+			'    if (!fs.existsSync(pidFile)) return;',
+			'    clearInterval(waitPid);',
+			'    fs.writeFileSync(reportPath, JSON.stringify({ result: { outcome: "success", answer: "leader-done", exit_code: 0 } }));',
+			'    process.exit(0);',
+			'  }, 10);',
+			'} else {',
+			'  setInterval(() => {}, 1000);',
+			'}',
+		].join("\n") + "\n", { mode: 0o755 });
+	}
+
+	const waitPidFile = async (pidFile: string): Promise<number> => {
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline) {
+			if (fs.existsSync(pidFile)) {
+				const raw = fs.readFileSync(pidFile, "utf8").trim();
+				const pid = Number(raw);
+				if (Number.isInteger(pid) && pid > 1) {
+					spawnedPids.push(pid);
+					return pid;
+				}
+			}
+			await new Promise((r) => setTimeout(r, 15));
+		}
+		throw new Error(`Timed out waiting for grandchild PID at ${pidFile}`);
+	};
+
+	const assertProcessGone = (pid: number) => {
+		expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+	};
+
+	it("terminates a SIGTERM-ignoring grandchild holding stdio open on synchronous timeoutMs", async () => {
+		const actualCp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+		vi.mocked(spawn).mockImplementation(actualCp.spawn);
+		const f = fixture();
+		const binDir = path.join(f.root, "bin"); fs.mkdirSync(binDir);
+		installFakeSwival(binDir, "hang");
+		vi.stubEnv("PATH", `${binDir}${path.delimiter}${process.env.PATH ?? ""}`);
+
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const runPromise = tool.execute("sync-timeout", { agent: "swival", task: "hang", timeoutMs: 200 }, undefined, undefined, { cwd: f.root, hasUI: false });
+		const grandchildPid = await waitPidFile(path.join(f.root, "grandchild.pid"));
+		const result = await runPromise;
+
+		expect(result.isError).toBe(true);
+		expect(result.details.results[0].exitCode).not.toBe(0);
+		assertProcessGone(grandchildPid);
+	}, 15_000);
+
+	it("terminates SIGTERM-ignoring grandchildren holding stdio open on AbortSignal in parallel mode", async () => {
+		const actualCp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+		vi.mocked(spawn).mockImplementation(actualCp.spawn);
+		const f = fixture();
+		const binDir = path.join(f.root, "bin"); fs.mkdirSync(binDir);
+		installFakeSwival(binDir, "hang");
+		vi.stubEnv("PATH", `${binDir}${path.delimiter}${process.env.PATH ?? ""}`);
+
+		const cwdA = path.join(f.root, "wt-a"); fs.mkdirSync(cwdA);
+		const cwdB = path.join(f.root, "wt-b"); fs.mkdirSync(cwdB);
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const controller = new AbortController();
+		const runPromise = tool.execute("sync-abort", {
+			tasks: [
+				{ agent: "swival", task: "one", cwd: cwdA },
+				{ agent: "swival", task: "two", cwd: cwdB },
+			],
+		}, controller.signal, undefined, { cwd: f.root, hasUI: false });
+
+		const [pidA, pidB] = await Promise.all([
+			waitPidFile(path.join(cwdA, "grandchild.pid")),
+			waitPidFile(path.join(cwdB, "grandchild.pid")),
+		]);
+		controller.abort();
+		const result = await runPromise;
+
+		expect(result.details.results.every((r: any) => r.exitCode !== 0)).toBe(true);
+		assertProcessGone(pidA);
+		assertProcessGone(pidB);
+	}, 15_000);
+
+	it("reaps a SIGTERM-ignoring grandchild holding stdout/stderr open after normal leader exit 0", async () => {
+		const actualCp = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+		vi.mocked(spawn).mockImplementation(actualCp.spawn);
+		const f = fixture();
+		const binDir = path.join(f.root, "bin"); fs.mkdirSync(binDir);
+		installFakeSwival(binDir, "exit-0-with-grandchild");
+		vi.stubEnv("PATH", `${binDir}${path.delimiter}${process.env.PATH ?? ""}`);
+
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const startedAt = Date.now();
+		const result = await tool.execute("sync-normal-exit", { agent: "swival", task: "complete-with-orphan" }, undefined, undefined, { cwd: f.root, hasUI: false });
+		const grandchildPid = Number(fs.readFileSync(path.join(f.root, "grandchild.pid"), "utf8").trim());
+
+		expect(Date.now() - startedAt).toBeLessThan(5000);
+		expect(result.isError).not.toBe(true);
+		expect(result.details.results[0]).toMatchObject({ exitCode: 0, finalOutput: "leader-done" });
+		assertProcessGone(grandchildPid);
+	}, 15_000);
+
+	it("fails closed when terminateProcessGroup cannot verify descendant shutdown despite leader exit 0", async () => {
+		const f = fixture();
+		await preflightSwivalVersion(async () => "1.9.3");
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(((targetPid: number) => {
+			if (targetPid === -43210) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+			return true;
+		}) as any);
+		vi.mocked(spawn).mockImplementation(((_exe: string, args: string[]) => {
+			const proc: any = new EventEmitter();
+			proc.pid = 43210;
+			proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.stdin = new PassThrough();
+			proc.kill = vi.fn(); proc.unref = vi.fn();
+			queueMicrotask(() => {
+				fs.writeFileSync(args[args.indexOf("--report") + 1], JSON.stringify({
+					result: { outcome: "success", answer: "unverified-answer", exit_code: 0 },
+				}));
+				proc.stdout.end(); proc.stderr.end();
+				proc.emit("exit", 0, null);
+				proc.emit("close", 0, null);
+			});
+			return proc;
+		}) as any);
+
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const result = await tool.execute("unverified-group", { agent: "swival", task: "task" }, undefined, undefined, { cwd: f.root, hasUI: false });
+		expect(killSpy).toHaveBeenCalledWith(-43210, "SIGTERM");
+		expect(result.isError).toBe(true);
+		expect(result.details.results[0].exitCode).toBe(1);
+		expect(result.details.results[0].reason).toEqual({
+			code: "non_zero_exit",
+			text: "Swival process group could not be verified as terminated; descendants may remain.",
+		});
+	});
+
+	it.each(["timeout", "abort"] as const)("settles in bounded time with an explicit unverified-shutdown failure when a non-exiting child group throws EPERM on %s", async (trigger) => {
+		const f = fixture();
+		await preflightSwivalVersion(async () => "1.9.3");
+		const killSpy = vi.spyOn(process, "kill").mockImplementation(((targetPid: number) => {
+			if (targetPid === -54321) throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+			return true;
+		}) as any);
+		let createdProc: any;
+		vi.mocked(spawn).mockImplementation((() => {
+			const proc: any = new EventEmitter();
+			proc.pid = 54321;
+			proc.stdout = new PassThrough();
+			proc.stderr = new PassThrough();
+			proc.stdin = new PassThrough();
+			proc.kill = vi.fn();
+			proc.unref = vi.fn();
+			// Leader never emits exit or close and leaves stdio pipes open.
+			proc.stdout.write("partial output before stuck leader");
+			createdProc = proc;
+			return proc;
+		}) as any);
+
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const controller = new AbortController();
+		const startedAt = Date.now();
+		const runPromise = tool.execute(
+			`unverified-${trigger}`,
+			{ agent: "swival", task: "never-exits", ...(trigger === "timeout" ? { timeoutMs: 50 } : {}) },
+			controller.signal,
+			undefined,
+			{ cwd: f.root, hasUI: false },
+		);
+		if (trigger === "abort") {
+			setTimeout(() => controller.abort(), 30);
+		}
+		const result = await runPromise;
+
+		expect(Date.now() - startedAt).toBeLessThan(5000);
+		expect(killSpy).toHaveBeenCalledWith(-54321, "SIGTERM");
+		expect(createdProc.stdout.destroyed).toBe(true);
+		expect(createdProc.stderr.destroyed).toBe(true);
+		expect(createdProc.unref).toHaveBeenCalled();
+		expect(result.isError).toBe(true);
+		expect(result.details.results[0].exitCode).toBe(1);
+		expect(result.details.results[0].reason).toEqual({
+			code: "non_zero_exit",
+			text: "Swival process group could not be verified as terminated; descendants may remain.",
+		});
+		expect(result.content[0].text).toContain("Swival process group could not be verified as terminated; descendants may remain.");
+	}, 10_000);
+
+	it("preserves 4-byte UTF-8 characters split across separate stdout and stderr chunks", async () => {
+		const f = fixture();
+		await preflightSwivalVersion(async () => "1.9.3");
+		const crab = Buffer.from("crab 🦀 ok\n", "utf8");
+		const splitIdx = crab.indexOf(0xf0) + 2;
+		vi.mocked(spawn).mockImplementation(((_exe: string, args: string[]) => {
+			const proc: any = new EventEmitter();
+			proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.stdin = new PassThrough();
+			proc.kill = vi.fn(); proc.unref = vi.fn();
+			queueMicrotask(() => {
+				proc.stdout.write(crab.subarray(0, splitIdx));
+				proc.stderr.write(crab.subarray(0, splitIdx));
+				setTimeout(() => {
+					proc.stdout.write(crab.subarray(splitIdx));
+					proc.stderr.write(crab.subarray(splitIdx));
+					fs.writeFileSync(args[args.indexOf("--report") + 1], JSON.stringify({
+						result: { outcome: "success", answer: "", exit_code: 0 },
+					}));
+					proc.stdout.end(); proc.stderr.end();
+					proc.emit("close", 0);
+				}, 10);
+			});
+			return proc;
+		}) as any);
+
+		let tool: any;
+		registerExtension({ registerTool: (value: any) => { tool = value; } } as any, { artifactRoot: f.artifactRoot });
+		const result = await tool.execute("utf8-split", { agent: "swival", task: "task" }, undefined, undefined, { cwd: f.root, hasUI: false });
+		expect(result.isError).not.toBe(true);
+		expect(result.details.results[0].finalOutput).toBe("crab 🦀 ok");
+		expect(result.details.results[0].stderrTail).toEqual(["crab 🦀 ok"]);
+		expect(result.details.results[0].finalOutput).not.toContain("\ufffd");
 	});
 });

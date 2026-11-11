@@ -50,14 +50,19 @@ afterEach(() => {
 });
 
 describe("swival-subagent action:list", () => {
-	it.each([undefined, ""])("fails closed for an unresolved empty definition with selector %j", async (agent) => {
+	it("emits warning diagnostics for nameless empty definitions without blocking omitted-selector dispatch", async () => {
 		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
+		write(userDir, "default.md", "name: swival\ndescription: default helper\nfiles: none\ncommands: none");
 		const listed = await execute({ action: "list" });
-		expect.soft(listed.details.dispatchBlocked).toBe(true);
+		expect(listed.details).toMatchObject({
+			diagnostics: [{ code: "invalid_definition", source: "user" }],
+		});
 		const { preflightSwivalVersion } = await import("../extensions/index.js");
 		await preflightSwivalVersion(async () => "1.0.46");
-		const result = await execute({ task: "synthetic task", ...(agent === undefined ? {} : { agent }) });
-		expect.soft(result.isError).toBe(true);
+		// Explicit empty selector still fails closed without spawning.
+		const blankResult = await execute({ task: "synthetic task", agent: "" });
+		expect(blankResult.isError).toBe(true);
+		expect(blankResult.content[0].text).toMatch(/unknown swival agent/i);
 		expect(spawn).not.toHaveBeenCalled();
 	});
 	it.each(yamlWarningFixtures)("contains $label without leaking source or launching", async ({ frontmatter }) => {
@@ -67,7 +72,7 @@ describe("swival-subagent action:list", () => {
 		expect(captured.emitted.length + captured.stderr.length).toBe(0);
 		expect(captured.warningEvents).toEqual([]);
 		expect(captured.result.details).toMatchObject({
-			mode: "list", schemaVersion: 1, dispatchBlocked: true,
+			mode: "list", schemaVersion: 1,
 			diagnostics: [{ code: "invalid_yaml", source: "user" }],
 			diagnosticsTotal: 1, diagnosticsOmitted: 0,
 		});
@@ -83,7 +88,7 @@ describe("swival-subagent action:list", () => {
 		const captured = await captureAgentYamlWarnings(() => execute({ action: "list" }));
 		expect(captured.emitted.length + captured.stderr.length).toBe(0);
 		expect(captured.result.details).toMatchObject({
-			mode: "list", schemaVersion: 1, diagnosticsTotal: 20, diagnosticsOmitted: 8, dispatchBlocked: true,
+			mode: "list", schemaVersion: 1, diagnosticsTotal: 20, diagnosticsOmitted: 8,
 		});
 		expect(captured.result.details.diagnostics).toHaveLength(12);
 		expect(captured.result.content[0].text.length).toBeLessThanOrEqual(8192);
@@ -98,7 +103,7 @@ describe("swival-subagent action:list", () => {
 		expect(result.isError).not.toBe(true);
 		expect(result.details).toMatchObject({
 			mode: "list", schemaVersion: 1, agentScope: "user", omitted: 0,
-			diagnostics: [], diagnosticsTotal: 0, diagnosticsOmitted: 0, dispatchBlocked: false,
+			diagnostics: [], diagnosticsTotal: 0, diagnosticsOmitted: 0,
 		});
 		expect(result.details.total).toBe(result.details.agents.length);
 		expect(result.details.agents.find((a: any) => a.name === "test-runner"))
@@ -183,7 +188,7 @@ describe("swival-subagent action:list", () => {
 		expect(result.details.agents.filter((a: any) => a.source !== "bundled"))
 			.toEqual([expect.objectContaining({ name: "alpha beta", source: "user" })]);
 		expect(result.details).toMatchObject({
-			dispatchBlocked: false, diagnostics: [{ code: "invalid_definition", source: "project" }],
+			diagnostics: [{ code: "invalid_definition", source: "project" }],
 		});
 		expect(JSON.stringify(result)).not.toContain("invalid override");
 		expect(spawn).not.toHaveBeenCalled();
@@ -250,7 +255,7 @@ describe("swival-subagent action:list", () => {
 		expect(result.isError).not.toBe(true);
 		expect(result.details.agents.some((a: any) => a.name === "valid")).toBe(true);
 		expect(result.details).toMatchObject({
-			dispatchBlocked: true, diagnostics: [{ code: "invalid_yaml", source: "user" }],
+			diagnostics: [{ code: "invalid_yaml", source: "user" }],
 		});
 		expect(result.content[0].text).toMatch(/invalid_yaml/);
 		expect(JSON.stringify(result)).not.toMatch(/PRIVATE|YAMLParseError|broken\.md/);
@@ -280,32 +285,87 @@ const modes = [
 	["async", { agent: "swival", task: "task", async: true }],
 ] as const;
 
+function mockSuccessfulSpawn() {
+	vi.mocked(spawn).mockImplementation(((_exe: string, args: string[]) => {
+		const proc: any = new EventEmitter();
+		proc.stdout = new PassThrough();
+		proc.stderr = new PassThrough();
+		proc.stdin = new PassThrough();
+		proc.kill = vi.fn();
+		proc.unref = vi.fn();
+		queueMicrotask(() => {
+			if (args.includes("--version")) proc.stdout.write("1.0.46");
+			else {
+				const reportIndex = args.indexOf("--report");
+				if (reportIndex !== -1) {
+					fs.writeFileSync(args[reportIndex + 1], JSON.stringify({
+						result: { outcome: "success", answer: "OK", exit_code: 0 },
+					}));
+				}
+			}
+			proc.stdout.end();
+			proc.stderr.end();
+			proc.emit("close", 0);
+		});
+		return proc;
+	}) as any);
+}
+
 describe("discovery dispatch validation", () => {
-	it.each([undefined, ""])("blocks a whitespace-only definition with selector %j", async (agent) => {
+	it.each(["", "   ", "\t\n", "\u00a0\u2003"])(
+		"fails closed for explicit blank/whitespace agent selector %j across modes without spawning", async (blank) => {
+			write(userDir, "valid.md", "name: valid\ndescription: visible helper\nfiles: none\ncommands: none");
+			const { preflightSwivalVersion } = await import("../extensions/index.js");
+			await preflightSwivalVersion(async () => "1.0.46");
+			for (const params of [
+				{ agent: blank, task: "task" },
+				{ agent: blank, task: "task", async: true },
+				{ tasks: [{ agent: "valid", task: "one" }, { agent: blank, task: "two" }] },
+				{ chain: [{ agent: blank, task: "one" }, { agent: "valid", task: "two" }] },
+			]) {
+				const result = await execute(params);
+				expect(result.isError).toBe(true);
+				expect(result.content[0].text).toMatch(/unknown swival agent/i);
+			}
+			// Combining blank agent+task with tasks[] still fails mode-count check instead of ignoring agent+task.
+			const conflicted = await execute({ agent: blank, task: "one", tasks: [{ agent: "valid", task: "two" }] });
+			expect(conflicted.isError).toBe(true);
+			expect(conflicted.content[0].text).toMatch(/Provide exactly one mode/i);
+			expect(spawn).not.toHaveBeenCalled();
+			expect(fs.readdirSync(artifactRoot)).toEqual([]);
+		},
+	);
+
+	it("dispatches omitted selector cleanly even when a whitespace-only definition is present", async () => {
 		write(userDir, "blank.md", 'name: "   "\ndescription: PRIVATE_DESCRIPTION');
+		write(userDir, "swival.md", "name: swival\ndescription: helper\nfiles: none\ncommands: none");
 		const listed = await execute({ action: "list" });
-		expect.soft(listed.details).toMatchObject({
-			dispatchBlocked: true, diagnostics: [{ code: "invalid_definition", source: "user" }],
+		expect(listed.details).toMatchObject({
+			diagnostics: [{ code: "invalid_definition", source: "user" }],
 		});
 		expect(JSON.stringify(listed)).not.toMatch(/PRIVATE|blank\.md/);
 		expect(JSON.stringify(listed)).not.toContain(root);
-		const { preflightSwivalVersion } = await import("../extensions/index.js");
-		await preflightSwivalVersion(async () => "1.0.46");
-		const result = await execute({ task: "task", ...(agent === undefined ? {} : { agent }) });
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
-		expect(spawn).not.toHaveBeenCalled();
-		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+		mockSuccessfulSpawn();
+		const result = await execute({ task: "task" });
+		expect(result.isError).not.toBe(true);
+		expect(result.content[0].text).toContain("Discovery diagnostics: 1 total, 0 omitted (user:invalid_definition).");
+		expect(result.details).toMatchObject({
+			diagnostics: [{ code: "invalid_definition", source: "user" }],
+			diagnosticsTotal: 1,
+			diagnosticsOmitted: 0,
+		});
+		expect(JSON.stringify(result)).not.toMatch(/PRIVATE|blank\.md/);
+		expect(spawn).toHaveBeenCalled();
 	});
 
-	it.each(modes)("blocks an empty definition before any child process in %s", async (_mode, params) => {
+	it.each(modes)("dispatches valid siblings cleanly in %s when an empty definition is present", async (_mode, params) => {
 		write(userDir, "empty.md", 'name: ""\ndescription: unresolved identity');
-		write(userDir, "valid.md", "name: valid\ndescription: visible helper");
+		write(userDir, "valid.md", "name: valid\ndescription: visible helper\nfiles: none\ncommands: none");
+		write(userDir, "swival.md", "name: swival\ndescription: helper\nfiles: none\ncommands: none");
+		mockSuccessfulSpawn();
 		const result = await execute(params);
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/discovery.*invalid_definition/i);
-		expect(spawn).not.toHaveBeenCalled();
-		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+		expect(result.isError).not.toBe(true);
+		expect(spawn).toHaveBeenCalled();
 	});
 
 	it("dispatches the default swival agent when the healthy catalogue selector is omitted", async () => {
@@ -406,16 +466,16 @@ describe("discovery dispatch validation", () => {
 		expect(args).not.toContain("PRIVATE_PROMPT");
 	});
 	for (const { label, frontmatter } of yamlWarningFixtures) {
-		it.each(modes)(`blocks ${label} before any child process in %s`, async (_mode, params) => {
+		it.each(modes)(`dispatches valid siblings with ${label} present without leaking source in %s`, async (_mode, params) => {
 			write(userDir, "warning.md", frontmatter);
-			write(userDir, "valid.md", "name: valid\ndescription: visible helper");
+			write(userDir, "valid.md", "name: valid\ndescription: visible helper\nfiles: none\ncommands: none");
+			write(userDir, "swival.md", "name: swival\ndescription: helper\nfiles: none\ncommands: none");
+			mockSuccessfulSpawn();
 			const captured = await captureAgentYamlWarnings(() => execute(params));
 			expect(captured.emitted.length + captured.stderr.length).toBe(0);
-			expect(captured.result.isError).toBe(true);
-			expect(captured.result.content[0].text).toMatch(/discovery.*invalid_yaml/i);
-			expect(JSON.stringify(captured.result)).not.toMatch(/C1_|private|unrecognized/);
-			expect(spawn).not.toHaveBeenCalled();
-			expect(fs.readdirSync(artifactRoot)).toEqual([]);
+			expect(captured.result.isError).not.toBe(true);
+			expect(JSON.stringify(captured.result)).not.toMatch(/C1_|!unrecognized|rejected override/);
+			expect(spawn).toHaveBeenCalled();
 		});
 	}
 
@@ -433,15 +493,14 @@ describe("discovery dispatch validation", () => {
 		expect(spawn).not.toHaveBeenCalled();
 	});
 
-	it.each(modes)("fails closed before any child process for unresolved identity in %s", async (_mode, params) => {
+	it.each(modes)("dispatches valid siblings cleanly in %s when an unparseable sibling has no identity", async (_mode, params) => {
 		write(userDir, "broken.md", "name: [");
-		write(userDir, "valid.md", "name: valid\ndescription: visible helper");
+		write(userDir, "valid.md", "name: valid\ndescription: visible helper\nfiles: none\ncommands: none");
+		write(userDir, "swival.md", "name: swival\ndescription: helper\nfiles: none\ncommands: none");
+		mockSuccessfulSpawn();
 		const result = await execute(params);
-		expect(result.isError).toBe(true);
-		expect(result.content[0].text).toMatch(/discovery.*invalid_yaml/i);
-		expect(result.content[0].text).toMatch(/identity|identities/i);
-		expect(spawn).not.toHaveBeenCalled();
-		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+		expect(result.isError).not.toBe(true);
+		expect(spawn).toHaveBeenCalled();
 	});
 
 	it.each(modes.filter(([mode]) => mode !== "single"))(
