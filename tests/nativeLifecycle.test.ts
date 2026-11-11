@@ -170,7 +170,10 @@ describe("synchronous native CLI lifecycle", () => {
 		const run = await f.start(); const terminal = await run.completion;
 		expect(terminal).toMatchObject({ exitCode: 0, shutdown: "verified", boundary: "agentfs-cli" });
 		const launch = JSON.parse(fs.readFileSync(path.join(f.artifactDir, "launch.json"), "utf8"));
-		expect(launch.stdin).toBe(""); expect(launch.cwd).toBe(path.join(f.artifactDir, "snapshot"));
+		expect(launch.stdin).toBe("");
+		// AgentFS overlays cwd on Linux. Keep evidence in the separately allowed snapshot.
+		expect(launch.cwd).toBe(path.join(f.artifactDir, "sandbox-cwd"));
+		expect(fs.existsSync(launch.cwd)).toBe(false);
 		expect(launch.args.slice(-2)).toEqual(["--", "/audit --all --workers 1 --patch-max-turns 5"]);
 		for (const key of ["AGENTFS", "SWIVAL_AGENTFS_ACTIVE", "PYTHONPATH", "NODE_OPTIONS"]) expect(launch.env[key]).toBeUndefined();
 		expect(launch.env.LITELLM_LOCAL_MODEL_COST_MAP).toBe("True");
