@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { captureNativeRuntime, prepareNativeAudit, type NativeRuntime } from "../extensions/native-audit.js";
 import { fixtureGit, fixtureRepository, nativeScratch } from "./nativeFixtures.js";
@@ -293,6 +293,45 @@ describe("native runtime configuration roots", () => {
 			} else {
 				fs.symlinkSync(f[root], path.join(logs, "2000.01.01"));
 			}
+			await refusedCredentialState(f);
+		});
+	it.each(((["bedrock", "geap"] as const).flatMap((provider) =>
+		(["entry", "symlink-target"] as const).map((layout) => [provider, layout] as const))))(
+		"refuses %s credential state containing a hardlinked file as %s before the host credential CLI runs", async (provider, layout) => {
+			const f = await credentialFixture(provider);
+			// A hard link shares its inode with a file outside the inspected state root,
+			// so the CLI could read or write that file without any symlink to follow.
+			const nested = provider === "bedrock" ? "sso/cache" : "configurations";
+			fs.mkdirSync(path.join(f.stateRoot, nested), { recursive: true });
+			const original = path.join(f.root, "linked-state"); fs.writeFileSync(original, "# inert\n");
+			if (layout === "entry") fs.linkSync(original, path.join(f.stateRoot, nested, "entry"));
+			else {
+				const external = path.join(f.root, "operator-state"); fs.mkdirSync(external);
+				fs.linkSync(original, path.join(external, "entry"));
+				fs.symlinkSync(path.join(external, "entry"), path.join(f.stateRoot, nested, "entry"));
+			}
+			await refusedCredentialState(f);
+		});
+	it.each((["bedrock", "geap"] as const).flatMap((provider) =>
+		(["entry", "symlink-target"] as const).map((layout) => [provider, layout] as const)))(
+		"refuses %s credential state containing a FIFO as %s before the host credential CLI runs", async (provider, layout) => {
+			const f = await credentialFixture(provider);
+			// A FIFO has one link but blocks or redirects whatever the CLI reads through it.
+			const nested = provider === "bedrock" ? "sso/cache" : "configurations";
+			fs.mkdirSync(path.join(f.stateRoot, nested), { recursive: true });
+			const fifo = path.join(f.root, "state-fifo");
+			execFileSync("mkfifo", [fifo]);
+			if (layout === "entry") fs.renameSync(fifo, path.join(f.stateRoot, nested, "entry"));
+			else fs.symlinkSync(fifo, path.join(f.stateRoot, nested, "entry"));
+			await refusedCredentialState(f);
+		});
+	it.each((["bedrock", "geap"] as const).flatMap((provider) =>
+		(["file", "fifo"] as const).map((kind) => [provider, kind] as const)))(
+		"refuses a %s credential state root that is a %s instead of a directory", async (provider, kind) => {
+			const f = await credentialFixture(provider);
+			fs.mkdirSync(path.dirname(f.stateRoot), { recursive: true });
+			if (kind === "file") fs.writeFileSync(f.stateRoot, "# inert\n");
+			else execFileSync("mkfifo", [f.stateRoot]);
 			await refusedCredentialState(f);
 		});
 	it.each(["bedrock", "geap"] as const)("binds validated %s credential state for the host CLI only", async (provider) => {

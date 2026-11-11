@@ -16,6 +16,7 @@ import {
 	assertSwivalReviewCompatibility,
 	canonicalPathOrResolved,
 	expandTildePath,
+	foldPathCase,
 	readConfiguredAllowedDirsRo,
 	resolveEffectiveProviderTimeout,
 	resolveLinkedWorktreeCommonGitDir,
@@ -221,6 +222,11 @@ export function buildSwivalArgs(
 
 	// Native subagents opt-in: default to --no-subagents to prevent unmonitored
 	// recursion inside Pi. An explicit false override outranks legacy noSubagents=false.
+	// Swival lets --subagents win over --no-subagents regardless of argv order, so
+	// an extraArgs --subagents cannot coexist with an explicit false override.
+	if (overrides.subagents === false && hasCliFlag(agent.extraArgs ?? [], "--subagents")) {
+		throw new SwivalArgumentError(`Agent "${agent.name}" extraArgs enable --subagents, which Swival honors over subagentsOverride: false.`);
+	}
 	if (overrides.subagents === true || (overrides.subagents === undefined && agent.subagents === true)) args.push("--subagents");
 	else if (overrides.subagents === false || agent.noSubagents !== false) args.push("--no-subagents");
 
@@ -277,8 +283,6 @@ export function buildSwivalArgs(
 			try { return [lexical, walkCanonicalPathSync(lexical)]; } catch { return [lexical]; }
 		});
 		const baseCwd = cwd === undefined ? process.cwd() : path.isAbsolute(cwd) ? cwd : `${process.cwd()}${path.sep}${cwd}`;
-		// Default filesystems on these platforms are case-insensitive.
-		const fold = (p: string) => (process.platform === "darwin" || process.platform === "win32" ? p.toLowerCase() : p);
 		const emitted: string[] = [];
 		for (const entry of entries) {
 			if (typeof entry !== "string" || entry.trim() === "" || /[\x00-\x1f\x7f]/.test(entry) || entry.trim().startsWith("-")) {
@@ -293,11 +297,11 @@ export function buildSwivalArgs(
 			} catch (error) {
 				throw new SwivalArgumentError(`Cannot resolve ${flagName} path "${entry}": ${(error as Error).message}`);
 			}
-			const folded = fold(canonical);
-			if (canonical === path.parse(canonical).root || folded === fold(realHome)) {
+			const folded = foldPathCase(canonical);
+			if (canonical === path.parse(canonical).root || folded === foldPathCase(realHome)) {
 				throw new SwivalArgumentError(`Refusing ${flagName} grant to protected root "${entry}".`);
 			}
-			for (const protectedRoot of protectedHomeSubs.map(fold)) {
+			for (const protectedRoot of protectedHomeSubs.map(foldPathCase)) {
 				if (folded === protectedRoot || folded.startsWith(protectedRoot + path.sep) || protectedRoot.startsWith(folded + path.sep)) {
 					throw new SwivalArgumentError(`Refusing ${flagName} grant overlapping protected directory "${entry}".`);
 				}

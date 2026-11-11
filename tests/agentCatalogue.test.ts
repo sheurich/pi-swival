@@ -466,16 +466,24 @@ describe("discovery dispatch validation", () => {
 		expect(args).not.toContain("PRIVATE_PROMPT");
 	});
 	for (const { label, frontmatter } of yamlWarningFixtures) {
-		it.each(modes)(`dispatches valid siblings with ${label} present without leaking source in %s`, async (_mode, params) => {
+		// The fixture names itself swival, so it tombstones swival even beside a
+		// valid same-name sibling; unrelated valid agents still dispatch.
+		it.each(modes)(`dispatches only unrelated siblings with ${label} present without leaking source in %s`, async (mode, params) => {
 			write(userDir, "warning.md", frontmatter);
 			write(userDir, "valid.md", "name: valid\ndescription: visible helper\nfiles: none\ncommands: none");
 			write(userDir, "swival.md", "name: swival\ndescription: helper\nfiles: none\ncommands: none");
 			mockSuccessfulSpawn();
 			const captured = await captureAgentYamlWarnings(() => execute(params));
 			expect(captured.emitted.length + captured.stderr.length).toBe(0);
-			expect(captured.result.isError).not.toBe(true);
 			expect(JSON.stringify(captured.result)).not.toMatch(/C1_|!unrecognized|rejected override/);
-			expect(spawn).toHaveBeenCalled();
+			if (mode === "single") {
+				expect(captured.result.isError).not.toBe(true);
+				expect(spawn).toHaveBeenCalled();
+			} else {
+				expect(captured.result.isError).toBe(true);
+				expect(captured.result.content[0].text).toMatch(/discovery blocked dispatch.*user:invalid_yaml/);
+				expect(spawn).not.toHaveBeenCalled();
+			}
 		});
 	}
 

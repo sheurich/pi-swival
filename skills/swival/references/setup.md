@@ -119,7 +119,8 @@ The hook receives an action (`startup` or `exit`) and Swival's base directory:
 #!/bin/sh
 set -eu
 
-profile="${PROFILE:-bedrock}"
+# PROFILE or AWS_PROFILE selects the SSO profile; unset uses the default credential chain.
+profile="${PROFILE:-${AWS_PROFILE:-}}"
 action="${1:-}"
 base_dir="${2:-}"
 
@@ -130,8 +131,12 @@ fi
 
 case "$action" in
   startup)
-    aws sts get-caller-identity --profile "$profile" >/dev/null 2>&1 || \
-      aws sso login --profile "$profile"
+    if [ -n "$profile" ]; then
+      aws sts get-caller-identity --profile "$profile" >/dev/null 2>&1 || \
+        aws sso login --profile "$profile"
+    else
+      aws sts get-caller-identity >/dev/null 2>&1 || aws sso login
+    fi
     ;;
   exit)
     ;;

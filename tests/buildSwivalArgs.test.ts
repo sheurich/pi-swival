@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildSwivalArgs, checkRequiresReviewer, isAgentFsRequested, isReexecSandboxRequested, readConfiguredAllowedDirsRo, resolveLinkedWorktreeCommonGitDir, resolveSwivalChildEnv, resolveSwivalReviewEnv, ANTHROPIC_OAUTH_SHIM_DIR, type SwivalOverrides } from "../extensions/index.js";
 import { discoverSwivalAgents, type SwivalAgentConfig } from "../extensions/agents.js";
+import { canonicalPathOrResolved } from "../extensions/child-env.js";
 
 function makeAgent(overrides: Partial<SwivalAgentConfig> = {}): SwivalAgentConfig {
 	return {
@@ -105,6 +106,25 @@ describe("buildSwivalArgs", () => {
 			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", linkDir, { addDirRo: ["missing/../link/future"] });
 			expect(args[args.indexOf("--add-dir-ro") + 1]).toBe(path.join(repo, "future"));
 			expect(args).not.toContain(link);
+		});
+		it("resolves a tilde symlink before `..` so a home link cannot climb into a protected directory", () => {
+			const { home, repo } = fakeHome();
+			fs.mkdirSync(path.join(home, ".ssh", "keys"));
+			fs.symlinkSync(path.join(home, ".ssh", "keys"), path.join(home, "link-into-ssh"));
+			fs.symlinkSync(path.join(home, ".ssh", "keys"), path.join(repo, "link-into-ssh"));
+			const escape = "~/link-into-ssh/../granted";
+			// Lexical collapse would land outside the protected directory.
+			expect(path.join(home, escape.slice(2))).toBe(path.join(home, "granted"));
+			for (const overrides of [{ addDir: [escape] }, { addDirRo: [escape] }] as SwivalOverrides[]) {
+				expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", repo, overrides)).toThrow(/overlapping protected directory/);
+			}
+			expect(canonicalPathOrResolved(escape, repo, home)).toBe(path.join(home, ".ssh", "granted"));
+			expect(canonicalPathOrResolved("link-into-ssh/../granted", repo, home)).toBe(path.join(home, ".ssh", "granted"));
+			expect(canonicalPathOrResolved(`${home}/link-into-ssh/../keys`, undefined, home)).toBe(path.join(home, ".ssh", "keys"));
+			// A benign tilde link is emitted as the canonical path it resolved through.
+			fs.symlinkSync(path.join(home, "src"), path.join(home, "link-into-src"));
+			const args = buildSwivalArgs(makeAgent(), "/tmp/r.json", repo, { addDirRo: ["~/link-into-src/../src/owner"] });
+			expect(args[args.indexOf("--add-dir-ro") + 1]).toBe(path.join(home, "src", "owner"));
 		});
 		it("protects symlinked and dangling home directories under both spellings", () => {
 			const { root, home } = fakeHome();
@@ -412,6 +432,48 @@ describe("buildSwivalArgs", () => {
 				[`allowed_dirs_ro = [`, `  "${refDir}",`, `  "rel-ro",`, `]`, `[profiles.example]`, `provider = "bedrock"`].join("\n") + "\n",
 			);
 			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "rel-ro")]);
+			// A preceding multiline array whose continuation line opens on `[` does not
+			// truncate the root section before allowed_dirs_ro.
+			fs.writeFileSync(
+				path.join(wtDir, "swival.toml"),
+				["commands = [", "  [1]", "]", "allowed_dirs_ro = []", "[profiles.example]", `allowed_dirs_ro = ["${refDir}"]`].join("\n") + "\n",
+			);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([]);
+			fs.writeFileSync(
+				path.join(wtDir, "swival.toml"),
+				["commands = [", "  [1]", "]", `allowed_dirs_ro = ["${refDir}",`, '  "rel-ro", # trailing', "]"].join("\n") + "\n",
+			);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "rel-ro")]);
+			// A `]` inside a trailing comment or a string is not the array's closing bracket.
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), `allowed_dirs_ro = ["${refDir}"] # ]\n`);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir]);
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), `allowed_dirs_ro = ["${refDir}", 'b]r'] # ] trailing\n`);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "b]r")]);
+			fs.writeFileSync(
+				path.join(wtDir, "swival.toml"),
+				[`allowed_dirs_ro = [ # ]`, `  "${refDir}", # ]`, `  "rel-ro",`, `] # ]`, `[profiles.example]`, `provider = "bedrock"`].join("\n") + "\n",
+			);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([refDir, path.join(realWtDir, "rel-ro")]);
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), `allowed_dirs_ro = ["${refDir}"] stray\n`);
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([]);
+			// A present project file that cannot be read never exposes global entries,
+			// while an empty one configures nothing.
+			const xdgSwivalDir = path.join(tmpRoot, "xdg", "swival");
+			fs.mkdirSync(xdgSwivalDir, { recursive: true });
+			fs.writeFileSync(path.join(xdgSwivalDir, "config.toml"), 'allowed_dirs_ro = ["/global/ref"]\n');
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), 'allowed_dirs_ro = []\nsystem_prompt = """\nmultiline\n"""\n');
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([]);
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), "");
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual(["/global/ref"]);
+			fs.unlinkSync(path.join(wtDir, "swival.toml"));
+			fs.symlinkSync(path.join(xdgSwivalDir, "config.toml"), path.join(wtDir, "swival.toml"));
+			expect(readConfiguredAllowedDirsRo(wtDir)).toEqual([]);
+			fs.unlinkSync(path.join(wtDir, "swival.toml"));
+			fs.unlinkSync(path.join(xdgSwivalDir, "config.toml"));
+			fs.writeFileSync(
+				path.join(wtDir, "swival.toml"),
+				[`allowed_dirs_ro = [`, `  "${refDir}",`, `  "rel-ro",`, `]`, `[profiles.example]`, `provider = "bedrock"`].join("\n") + "\n",
+			);
 			const preservedArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
 			expect(preservedArgs).toContain(refDir);
 			expect(preservedArgs).toContain(path.join(realWtDir, "rel-ro"));
@@ -469,6 +531,63 @@ describe("buildSwivalArgs", () => {
 			expect(resolveLinkedWorktreeCommonGitDir(sshWtDir, fakeHome)).toBeUndefined();
 			expect(resolveLinkedWorktreeCommonGitDir(wtDir, path.join(realMainGit, "nested-home"))).toBeUndefined();
 		} finally {
+			if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+			else process.env.XDG_CONFIG_HOME = prevXdg;
+			fs.rmSync(tmpRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves configured allowed_dirs_ro through symlinks before `..` and case-folds protected worktree Git roots", () => {
+		const tmpRoot = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wt-fold-")));
+		const hostPlatform = process.platform;
+		const prevXdg = process.env.XDG_CONFIG_HOME;
+		process.env.XDG_CONFIG_HOME = path.join(tmpRoot, "xdg");
+		const linkedWorktree = (gitDir: string, worktree: string, lane: string) => {
+			const admin = path.join(gitDir, "worktrees", lane);
+			fs.mkdirSync(path.join(gitDir, "objects"), { recursive: true });
+			fs.mkdirSync(path.join(gitDir, "refs"), { recursive: true });
+			fs.mkdirSync(admin, { recursive: true });
+			fs.mkdirSync(worktree, { recursive: true });
+			fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+			fs.writeFileSync(path.join(admin, "HEAD"), `ref: refs/heads/${lane}\n`);
+			fs.writeFileSync(path.join(admin, "commondir"), "../..\n");
+			fs.writeFileSync(path.join(admin, "gitdir"), `${path.join(worktree, ".git")}\n`);
+			fs.writeFileSync(path.join(worktree, ".git"), `gitdir: ${admin}\n`);
+		};
+		try {
+			const mainGit = path.join(tmpRoot, "repo", ".git");
+			const wtDir = path.join(tmpRoot, "worktrees", "lane-a");
+			linkedWorktree(mainGit, wtDir, "lane-a");
+			expect(resolveLinkedWorktreeCommonGitDir(wtDir)).toBe(mainGit);
+			// A configured relative entry that climbs out of a symlink must resolve
+			// through the link target: lexical collapse would land back in the worktree.
+			fs.symlinkSync(path.join(mainGit, "worktrees"), path.join(wtDir, "link-into-git"));
+			fs.writeFileSync(path.join(wtDir, "swival.toml"), 'allowed_dirs_ro = ["link-into-git/.."]\n');
+			const configured = readConfiguredAllowedDirsRo(wtDir);
+			expect(configured).toEqual([`${wtDir}${path.sep}link-into-git/..`]);
+			expect(canonicalPathOrResolved(configured[0])).toBe(mainGit);
+			expect(path.resolve(configured[0])).toBe(wtDir);
+			// The common Git directory is already covered by the configured grant, so nothing is re-emitted.
+			expect(buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir)).not.toContain("--add-dir-ro");
+			fs.unlinkSync(path.join(wtDir, "swival.toml"));
+
+			// A Git directory under a differently-cased protected home entry is refused
+			// on case-insensitive platforms and accepted on case-sensitive ones.
+			const fakeHome = path.join(tmpRoot, "home");
+			const casedGit = path.join(fakeHome, ".SSH", "repo.git");
+			const casedWt = path.join(tmpRoot, "worktrees", "lane-b");
+			linkedWorktree(casedGit, casedWt, "lane-b");
+			Object.defineProperty(process, "platform", { value: "darwin" });
+			expect(resolveLinkedWorktreeCommonGitDir(casedWt, fakeHome)).toBeUndefined();
+			// The Git directory spelled as a differently-cased home itself is refused too.
+			expect(resolveLinkedWorktreeCommonGitDir(casedWt, path.join(fakeHome, ".ssh", "REPO.GIT"))).toBeUndefined();
+			expect(resolveLinkedWorktreeCommonGitDir(wtDir, fakeHome)).toBe(mainGit);
+			Object.defineProperty(process, "platform", { value: "linux" });
+			// Only a case-sensitive filesystem keeps `.SSH` distinct from the protected `.ssh`.
+			const caseSensitiveFs = !fs.existsSync(path.join(fakeHome, ".ssh"));
+			expect(resolveLinkedWorktreeCommonGitDir(casedWt, fakeHome)).toBe(caseSensitiveFs ? casedGit : undefined);
+		} finally {
+			Object.defineProperty(process, "platform", { value: hostPlatform });
 			if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = prevXdg;
 			fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -787,6 +906,19 @@ describe("buildSwivalArgs", () => {
 		expect(args).not.toContain("--subagents");
 	});
 
+	it("keeps an explicit subagents override from being reversed by extraArgs", () => {
+		// Swival honors --subagents whenever present, so a false override cannot coexist with it.
+		expect(() => buildSwivalArgs(makeAgent({ extraArgs: ["--subagents"] }), "/tmp/r.json", "/cwd", { subagents: false }))
+			.toThrow(/extraArgs enable --subagents/);
+		expect(checkRequiresReviewer(makeAgent({ requiresReviewer: true, extraArgs: ["--subagents"] }), { subagents: false }, "/cwd"))
+			.toMatch(/extraArgs enable --subagents/);
+		// Without the override the agent's escape hatch still applies.
+		expect(buildSwivalArgs(makeAgent({ extraArgs: ["--subagents"] }), "/tmp/r.json", "/cwd")).toContain("--subagents");
+		// A true override emits --subagents, which Swival honors over an extraArgs --no-subagents.
+		const enabled = buildSwivalArgs(makeAgent({ extraArgs: ["--no-subagents"] }), "/tmp/r.json", "/cwd", { subagents: true });
+		expect(enabled).toContain("--subagents");
+	});
+
 	it("passes providerTimeout and initialToolChoice from frontmatter", () => {
 		const args = buildSwivalArgs(
 			makeAgent({ providerTimeout: 120, initialToolChoice: "required" }),
@@ -1056,6 +1188,65 @@ describe("resolveSwivalChildEnv", () => {
 				].join("\n"),
 			);
 			expect(resolveSwivalChildEnv(["--"], {}, tmpHome, repoDir)).toBeUndefined();
+			// A multiline string can hide a table header or a reviewer from the
+			// line-oriented reader, so any multiline string fails closed.
+			for (const quote of ['"""', "'''"]) {
+				fs.writeFileSync(
+					path.join(cfgDir, "config.toml"),
+					[
+						`system_prompt = ${quote}`, "[notes]", quote,
+						'reviewer = "swival --profile local-qwen --reviewer-mode"',
+						"[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`,
+					].join("\n"),
+				);
+				expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir), quote).toBeUndefined();
+				fs.writeFileSync(
+					path.join(cfgDir, "config.toml"),
+					["[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`, `note = ${quote}inert${quote}`].join("\n"),
+				);
+				expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir), quote).toBeUndefined();
+			}
+			// A multiline array may continue with a line opening on `[`; that line is
+			// not a table header and must not hide a later reviewer or base_url.
+			const nestedArray = ["commands = [", "  []", "]"];
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				[...nestedArray, 'reviewer = "swival --profile local-qwen --reviewer-mode"',
+					"[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"),
+			);
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				['provider = "generic"', ...nestedArray, 'base_url = "https://attacker.example/v1"'].join("\n"),
+			);
+			expect(resolveSwivalChildEnv(["--"], {}, tmpHome, repoDir)).toBeUndefined();
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				["[profiles.gw-gpt-sol]", 'provider = "generic"', ...nestedArray, 'base_url = "https://attacker.example/v1"'].join("\n"),
+			);
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toBeUndefined();
+			// The same array before a legitimate base_url still resolves, so the
+			// continuation line is read as array content rather than refused outright.
+			fs.writeFileSync(
+				path.join(cfgDir, "config.toml"),
+				["[profiles.gw-gpt-sol]", 'provider = "generic"', ...nestedArray, `base_url = "${GATEWAY_BASE_URL}"`].join("\n"),
+			);
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toEqual({ OPENAI_API_KEY: GATEWAY_KEY });
+			// A dotted key sets profile fields without a table header.
+			for (const dotted of ['profiles.gw-gpt-sol.base_url = "https://attacker.example/v1"', 'profiles."gw-gpt-sol".base_url = "https://attacker.example/v1"']) {
+				fs.writeFileSync(
+					path.join(cfgDir, "config.toml"),
+					[dotted, "[profiles.gw-gpt-sol]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"),
+				);
+				expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir), dotted).toBeUndefined();
+			}
+			// Array-of-tables and whitespace-padded headers never select a profile silently.
+			for (const header of ["[[profiles.gw-gpt-sol]]", "[profiles.gw-gpt-sol] trailing", "[profiles.gw-gpt-sol"]) {
+				fs.writeFileSync(path.join(cfgDir, "config.toml"), [header, 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"));
+				expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir), header).toBeUndefined();
+			}
+			fs.writeFileSync(path.join(cfgDir, "config.toml"), ["[ profiles . gw-gpt-sol ]", 'provider = "generic"', `base_url = "${GATEWAY_BASE_URL}"`].join("\n"));
+			expect(resolveSwivalChildEnv(["--profile", "gw-gpt-sol", "--"], {}, tmpHome, repoDir)).toEqual({ OPENAI_API_KEY: GATEWAY_KEY });
 			fs.writeFileSync(
 				path.join(cfgDir, "config.toml"),
 				[

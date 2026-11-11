@@ -295,7 +295,8 @@ export async function prepareNativeAudit(
 	cwd: string, params: Record<string, unknown>, audit: NativeAuditOptions, runtime: NativeRuntime,
 	artifactDir: string, runId: string, maxTimeoutMs: number, signal?: AbortSignal,
 ): Promise<NativeAuditLaunch> {
-	const checkCancelled = () => { if (signal?.aborted) throw new Error("Native audit was cancelled before launch."); };
+	const cancelledBeforeLaunch = () => new Error("Native audit was cancelled before launch.");
+	const checkCancelled = () => { if (signal?.aborted) throw cancelledBeforeLaunch(); };
 	validateNativeAuditParams(params);
 	checkCancelled();
 	if (!runtime.python || !runtime.cli || !runtime.agentfs || !runtime.nono) {
@@ -428,17 +429,25 @@ export async function prepareNativeAudit(
 		}
 		throw credentialUnavailable();
 	};
-	let credentialStateRefusal: unknown;
+	let callbackFailure: unknown;
 	const credentialDeadline = await bridgeNativeCredentials(route, awsProfile, input, Number(timeoutMs), async (tool, argv) => {
 		// Inspect host credential state only when the host CLI actually runs. The
-		// bridge reports every callback failure as unavailable, so surface a refusal.
-		const credentialState = await resolveTrustedCredentialState(tool, input.HOME!, protectedRoots)
-			.catch((error: unknown) => { credentialStateRefusal = error; throw error; });
-		const executable = await resolveTrustedCliTool(tool);
-		return (await boundedExec(executable, argv, input.HOME!, undefined,
-			{ ...nativeEnvironment(input, trustedGit.env.PATH!), ...credentialState, AWS_PAGER: "", AWS_EC2_METADATA_DISABLED: "true", CLOUDSDK_CORE_DISABLE_PROMPTS: "1" },
-			10_000, 16_384)).toString("utf8");
-	}).catch((error: unknown) => { throw credentialStateRefusal ?? error; });
+		// bridge reports every callback failure as unavailable, so surface a state
+		// refusal or cancellation; only a genuine host CLI failure stays unavailable.
+		try {
+			checkCancelled();
+			const credentialState = await resolveTrustedCredentialState(tool, input.HOME!, protectedRoots)
+				.catch((error: unknown) => { callbackFailure = error; throw error; });
+			const executable = await resolveTrustedCliTool(tool);
+			checkCancelled();
+			return (await boundedExec(executable, argv, input.HOME!, undefined,
+				{ ...nativeEnvironment(input, trustedGit.env.PATH!), ...credentialState, AWS_PAGER: "", AWS_EC2_METADATA_DISABLED: "true", CLOUDSDK_CORE_DISABLE_PROMPTS: "1" },
+				10_000, 16_384, signal)).toString("utf8");
+		} catch (error) {
+			if (signal?.aborted) callbackFailure = cancelledBeforeLaunch();
+			throw error;
+		}
+	}).catch((error: unknown) => { throw callbackFailure ?? error; });
 	preflightEnv = nativePreflightEnvironment(input, trustedGit.env.PATH!);
 	let anthropicShimDir: string | undefined;
 	if (route.provider === "anthropic" || route.provider === "bedrock" || route.provider === "geap") {

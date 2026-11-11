@@ -40,6 +40,21 @@ describe("effective provider timeout hints", () => {
 	it("labels unrecognized TOML as unresolved rather than inventing 900s", () => {
 		expect(resolveEffectiveProviderTimeout(setup('"provider_timeout"=120\n')).seconds).toBeNull();
 	});
+	it.each([
+		'[profiles."fast"]\nprovider_timeout=30\n',
+		"[profiles.'fast']\nprovider_timeout=30\n",
+		'["profiles".fast]\nprovider_timeout=30\n',
+		"[profiles]\nfast.provider_timeout=30\n",
+		"[[profiles.fast]]\nprovider_timeout=30\n",
+		"[profiles.fast.nested]\nprovider_timeout=30\n",
+		"[profiles.fast]\nprovider_timeout=30\n[profiles.fast]\nprovider_timeout=40\n",
+	])("treats ambiguous project profile headers as unresolved instead of reporting the global profile: %j", (project) => {
+		const options = setup('active_profile="fast"\n[profiles.fast]\nprovider_timeout=60\n', project);
+		expect(resolveEffectiveProviderTimeout(options)).toEqual({ seconds: null, source: "unresolved configuration" });
+		// A project file that simply lacks the profile still defers to the global definition.
+		expect(resolveEffectiveProviderTimeout(setup('active_profile="fast"\n[profiles.fast]\nprovider_timeout=60\n', "[profiles.other]\nprovider_timeout=30\n")))
+			.toEqual({ seconds: 60, source: "config.toml selected profile" });
+	});
 	it("returns unresolved for a FIFO swival.toml without blocking the event loop", async () => {
 		// A blocked synchronous open would freeze this worker and defeat Vitest's
 		// own timeout, so resolve in a child process under a hard kill timeout.
