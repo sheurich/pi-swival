@@ -35,6 +35,18 @@ CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.290"
 REQUIRED_OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
 CREDENTIAL_EXPIRED_SENTINEL = "PI_SWIVAL_CREDENTIAL_EXPIRED"
 SHIM_INSTALL_FAILED_SENTINEL = "PI_SWIVAL_SHIM_INSTALL_FAILED"
+REDACTED = "[REDACTED]"
+# A provider error body may echo the credential it rejected; these values never
+# leave litellm.completion inside an exception that Swival prints or reports.
+ACTIVE_CREDENTIAL_ENV = (
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GOOGLE_OAUTH_ACCESS_TOKEN",
+    "OPENROUTER_API_KEY",
+    "CHATGPT_API_KEY",
+)
 
 # Required hook names -> installed. Updated only by install_required_shim.
 SHIM_ATTESTATION: dict[str, bool] = {
@@ -64,6 +76,33 @@ def _emit_credential_expired():
     try:
         sys.stderr.write(f"\n{CREDENTIAL_EXPIRED_SENTINEL}\n")
         sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _active_credentials(*extra):
+    """Active credential values, longest first so overlapping values redact completely."""
+    values = {os.environ.get(key, "").strip() for key in ACTIVE_CREDENTIAL_ENV}
+    values.update(value.strip() for value in extra if isinstance(value, str))
+    return sorted((value for value in values if len(value) >= 4), key=len, reverse=True)
+
+
+def _redact_exception(exc, credentials):
+    """Scrub echoed credential values from an exception while keeping its class and attributes."""
+    if not credentials:
+        return
+
+    def scrub(text):
+        for value in credentials:
+            text = text.replace(value, REDACTED)
+        return text
+
+    try:
+        exc.args = tuple(scrub(arg) if isinstance(arg, str) else arg for arg in exc.args)
+        for attribute in ("message", "body"):
+            value = getattr(exc, attribute, None)
+            if isinstance(value, str):
+                setattr(exc, attribute, scrub(value))
     except Exception:
         pass
 
@@ -261,9 +300,11 @@ def _install_oauth_completion_shim(litellm):
             kwargs["messages"] = orig_msgs
         try:
             return orig_completion(*args, **kwargs)
-        except litellm.AuthenticationError:
+        except Exception as exc:
+            _redact_exception(exc, _active_credentials(api_key))
             if (
-                isinstance(model, str)
+                isinstance(exc, litellm.AuthenticationError)
+                and isinstance(model, str)
                 and model.startswith("vertex_ai/")
                 and os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN", "").strip()
             ):

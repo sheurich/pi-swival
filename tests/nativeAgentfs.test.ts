@@ -457,8 +457,10 @@ sys.stdout.write('SENTINEL_BRIDGED_GOOGLE_BEARER\\n')
 		: { tool: "gcloud", argv: ["auth", "application-default", "print-access-token"],
 			bindings: { AWS_CONFIG_FILE: null, AWS_SHARED_CREDENTIALS_FILE: null, CLOUDSDK_CONFIG: hostGcloud, HOME: home } };
 	const artifacts = path.join(root, "artifacts");
-	/** Host-side proof after completion: one host CLI call, torn-down session, untouched host state, zero credential leakage. */
-	const assertHostBoundary = (term: unknown, result: unknown) => {
+	/** Host-side proof after completion: one host CLI call, torn-down session, untouched host state,
+	 * and zero credential leakage across retained files, the terminal record, the inspection
+	 * result, and the child's captured stdout/stderr. */
+	const assertHostBoundary = (term: unknown, result: unknown, fixtureDiagnostics: string) => {
 		const calls = fs.readFileSync(hostCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 		expect(calls).toEqual([expectedHostCall]);
 		expect(execFileSync(runtime.agentfs!, ["ps"], { env: { PATH: runtime.searchPath, HOME: home }, encoding: "utf8", timeout: 10_000 }))
@@ -467,7 +469,10 @@ sys.stdout.write('SENTINEL_BRIDGED_GOOGLE_BEARER\\n')
 		for (const [file, content] of Object.entries(hostCredentialFiles)) expect(fs.readFileSync(file, "utf8")).toBe(content);
 		const retained = retainedFiles(artifacts);
 		expect(retained.length).toBeGreaterThanOrEqual(5);
-		for (const text of [...retained.map((file) => fs.readFileSync(file, "utf8")), JSON.stringify(term), JSON.stringify(result)]) {
+		const productionResult = path.join(root, "production-result.json");
+		fs.writeFileSync(productionResult, JSON.stringify({ term, result, fixtureDiagnostics }, null, 2), { mode: 0o600 });
+		for (const text of [...retained.map((file) => fs.readFileSync(file, "utf8")), fs.readFileSync(productionResult, "utf8"),
+			fixtureDiagnostics, JSON.stringify(term), JSON.stringify(result)]) {
 			for (const sentinel of CREDENTIAL_SENTINELS) expect(text).not.toContain(sentinel);
 		}
 		return retained;
@@ -491,7 +496,6 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
      patch.object(socket, 'create_connection', side_effect=AssertionError('network forbidden')), \\
      patch.object(socket, 'getaddrinfo', side_effect=AssertionError('DNS forbidden')):
  from swival import agent, audit, sandbox_agentfs, tools
- from swival.session import Session
  import httpx
  assert sandbox_agentfs.is_inside_agentfs()
  assert os.environ.get('PI_SWIVAL_SHIM_REQUIRED') == '1'
@@ -527,14 +531,43 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
    payload = {'candidates': [{'content': {'role': 'model', 'parts': [{'text': text}]}, 'finishReason': 'STOP'}],
     'usageMetadata': {'promptTokenCount': 10, 'candidatesTokenCount': 5, 'totalTokenCount': 15}}
   return httpx.Response(200, request=request, json=payload)
+ # On macOS the outer AgentFS boundary does not isolate host-file reads; inner Swival
+ # --sandbox builtin --files some is what denies these host and parent paths to model tools.
+ # The probes run against the audit's own InputContext, captured as released main() hands
+ # it to /audit, so the policy under test is the one the launched CLI arguments produced.
+ snapshot = Path(sys.argv[sys.argv.index('--base-dir') + 1])
+ home = Path(os.environ['HOME'])
+ released_run_audit_command = audit.run_audit_command
+ audit_contexts = []
+ def probing_run_audit_command(cmd_arg, ctx):
+  tool_options = {key: value for key, value in ctx.loop_kwargs.items() if key != 'base_dir'}
+  def dispatch(name, args): return tools.dispatch(name, args, ctx.base_dir, **tool_options)
+  denied = {}
+  for label, target in (('aws_credentials', home / '.aws/credentials'), ('aws_config', home / '.aws/config'),
+    ('gcloud_adc', home / '.config/gcloud/application_default_credentials.json'), ('parent_manifest', snapshot.parent / 'manifest.json')):
+   results = [dispatch('read_file', {'file_path': str(target)}),
+    dispatch('write_file', {'file_path': str(target), 'content': 'forbidden'}),
+    dispatch('grep', {'pattern': 'SENTINEL', 'path': str(target.parent)}),
+    dispatch('list_files', {'pattern': target.name, 'path': str(target.parent)})]
+   denied[label] = all(result.startswith('error:') for result in results)
+   assert not any('SENTINEL_' in result for result in results), label
+  denied['relative_parent_manifest'] = dispatch('read_file', {'file_path': '../manifest.json'}).startswith('error:')
+  snapshot_read = dispatch('read_file', {'file_path': str(Path(ctx.base_dir) / 'code.py')})
+  audit_contexts.append({**denied,
+   'snapshot_read': not snapshot_read.startswith('error:') and 'return 42' in snapshot_read,
+   'context_policy': Path(ctx.base_dir).resolve() == snapshot.resolve() and tool_options.get('files_mode') == 'some'
+    and tool_options.get('network_mode') == 'provider-only' and getattr(tool_options.get('command_policy'), 'mode', None) == 'none'})
+  return released_run_audit_command(cmd_arg, ctx)
  with patch('google.auth.default', side_effect=AssertionError('ADC forbidden')) as adc_default, \\
-      patch.object(httpx.Client, 'send', side_effect=response):
+      patch.object(httpx.Client, 'send', side_effect=response), \\
+      patch.object(audit, 'run_audit_command', probing_run_audit_command):
   try: agent.main()
   except SystemExit as exc:
    if exc.code not in (0, None): raise
  assert requests
  assert not adc_default.called
  assert not agent._MODEL_AUTOFIX
+ assert len(audit_contexts) == 1, 'released /audit must hand exactly one InputContext to run_audit_command'
  hosts = {entry['host'] for entry in requests}
  every = lambda key: all(entry[key] for entry in requests)
  none = lambda key: not any(entry[key] for entry in requests)
@@ -545,33 +578,10 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
   transport.update(sigv4=every('sigv4'), session_token_bridged=every('session_token_bridged'), bearer_absent=none('bearer_bridged'))
  else:
   transport.update(bearer_bridged=every('bearer_bridged'), sigv4_absent=none('sigv4'), session_token_absent=none('session_token_bridged'))
- # On macOS the outer AgentFS boundary does not isolate host-file reads; inner Swival
- # --sandbox builtin --files some is what denies these host and parent paths to model tools.
- snapshot = Path(sys.argv[sys.argv.index('--base-dir') + 1])
- home = Path(os.environ['HOME'])
- session = Session(base_dir=str(snapshot), files='some', commands='none', network='provider-only',
-  no_instructions=True, no_skills=True, memory=False, history=False, subagents=False, lifecycle_enabled=False)
- with patch.object(agent, 'resolve_provider', return_value=('offline', None, None, 128000, {'provider': 'chatgpt'})):
-  session._setup()
- context = session._make_input_context(session._make_per_run_state(system_content='synthetic'))
- tool_options = {key: value for key, value in context.loop_kwargs.items() if key != 'base_dir'}
- def dispatch(name, args): return tools.dispatch(name, args, str(snapshot), **tool_options)
- denied = {}
- for label, target in (('aws_credentials', home / '.aws/credentials'), ('aws_config', home / '.aws/config'),
-   ('gcloud_adc', home / '.config/gcloud/application_default_credentials.json'), ('parent_manifest', snapshot.parent / 'manifest.json')):
-  results = [dispatch('read_file', {'file_path': str(target)}),
-   dispatch('write_file', {'file_path': str(target), 'content': 'forbidden'}),
-   dispatch('grep', {'pattern': 'SENTINEL', 'path': str(target.parent)}),
-   dispatch('list_files', {'pattern': target.name, 'path': str(target.parent)})]
-  denied[label] = all(result.startswith('error:') for result in results)
-  assert not any('SENTINEL_' in result for result in results), label
- denied['relative_parent_manifest'] = dispatch('read_file', {'file_path': '../manifest.json'}).startswith('error:')
- snapshot_read = dispatch('read_file', {'file_path': str(snapshot / 'code.py')})
- session.close()
  report_path = snapshot / 'native-cli-report.json'
  report = json.loads(report_path.read_text())
  report['cloud_transport_probe'] = transport
- report['model_tool_probe'] = {**denied, 'snapshot_read': not snapshot_read.startswith('error:') and 'return 42' in snapshot_read}
+ report['model_tool_probe'] = audit_contexts[0]
  report_path.write_text(json.dumps(report))
  print('REAL_RELEASED_CLOUD_AUDIT_WITH_HTTP_DOUBLES', flush=True)
 `, { mode: 0o700 });
@@ -581,7 +591,6 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
 	for (const stream of [run.proc.stdout, run.proc.stderr]) stream?.on("data", (chunk) => { fixtureDiagnostics = (fixtureDiagnostics + chunk).slice(0, 65536); });
 	try {
 		const term = await run.completion; const result = await inspectNativeAudit(f.artifacts, term.exitCode);
-		fs.writeFileSync(path.join(f.root, "production-result.json"), JSON.stringify({ term, result, fixtureDiagnostics }, null, 2), { mode: 0o600 });
 		expect(term, fixtureDiagnostics).toMatchObject({ exitCode: 0, shutdown: "verified", boundary: "agentfs-cli" });
 		expect(result.status, result.error).toBe("completed");
 		expect(run.route.provider).toBe(provider);
@@ -591,19 +600,23 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
 			...(provider === "bedrock" ? { sigv4: true, session_token_bridged: true, bearer_absent: true }
 				: { bearer_bridged: true, sigv4_absent: true, session_token_absent: true }) });
 		expect(report.model_tool_probe).toEqual({ aws_credentials: true, aws_config: true, gcloud_adc: true, parent_manifest: true,
-			relative_parent_manifest: true, snapshot_read: true });
+			relative_parent_manifest: true, snapshot_read: true, context_policy: true });
 		expect(fs.existsSync(path.join(f.artifacts, "snapshot"))).toBe(false);
-		f.assertHostBoundary(term, result);
+		f.assertHostBoundary(term, result, fixtureDiagnostics);
 	} finally { run.cancel("Fixture cleanup"); await run.completion; console.log(`Released cloud AgentFS evidence: ${f.root}`); }
 }, 90_000);
 
 // Released agent.main() handles the provider's auth rejection itself and writes its own
-// error report; the fixture never touches native-cli-report.json. The provider error body is
-// an echo marker without a credential prefix: released Swival retains provider error text,
-// and this proves the retained report came from released code rather than a fixture rewrite.
+// error report; the fixture never touches native-cli-report.json. The rejection body echoes
+// the bridged credential next to a PROVIDER_ECHO marker: the marker must survive into the
+// released report (proving it came from released code, not a fixture rewrite) while the
+// credential value is scrubbed. The marker precedes the credential so LiteLLM's own shape
+// heuristics cannot partially mangle the value before the shim scrubs it exactly.
 // On geap the shim's expiry sentinel reaches the parent before Swival writes that report, so
 // the live cancel usually tears the AgentFS group down first; preservation then fails closed
 // and the inert committed snapshot stays inside the artifact root, where it is scanned too.
+// Transport observations are printed inside the HTTP double, before any exception or signal,
+// so the parent verifies single-attempt/no-fallback evidence even when SIGTERM wins the race.
 it.each(["bedrock", "geap"] as const)("fails the released %s /audit producer closed on a raw HTTP auth rejection without retaining any credential", async (provider) => {
 	const f = cloudFixture(provider);
 	fs.writeFileSync(f.cli, f.cliHeader + `
@@ -614,18 +627,21 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
  import httpx
  assert sandbox_agentfs.is_inside_agentfs()
  assert os.environ.get('PI_SWIVAL_SHIM_REQUIRED') == '1'
+ attempts = []
  def rejection(request, **_kwargs):
+  attempts.append(request)
+  print('CLOUD_REJECTION_OBSERVED:' + json.dumps({'attempt': len(attempts), 'adc_called': adc_default.called,
+   'autofix': bool(agent._MODEL_AUTOFIX), 'host': request.url.host}), flush=True)
   if provider == 'bedrock':
-   return httpx.Response(400, request=request, json={'__type': 'ExpiredTokenException', 'message': 'Token expired PROVIDER_ECHO_AWS_REJECTION'})
-  return httpx.Response(401, request=request, json={'error': {'code': 401, 'message': 'Invalid credential PROVIDER_ECHO_VERTEX_REJECTION', 'status': 'UNAUTHENTICATED'}})
+   return httpx.Response(400, request=request, json={'__type': 'ExpiredTokenException',
+    'message': 'Token expired PROVIDER_ECHO_BEDROCK_REJECTION: SENTINEL_BRIDGED_AWS_SECRET'})
+  return httpx.Response(401, request=request, json={'error': {'code': 401, 'status': 'UNAUTHENTICATED',
+   'message': 'Invalid credential PROVIDER_ECHO_GEAP_REJECTION: SENTINEL_BRIDGED_GOOGLE_BEARER'}})
  with patch('google.auth.default', side_effect=AssertionError('ADC forbidden')) as adc_default, \\
-      patch.object(httpx.Client, 'send', side_effect=rejection) as transport:
+      patch.object(httpx.Client, 'send', side_effect=rejection):
   try: agent.main()
   except SystemExit as exc: code = exc.code
   else: code = 0
- assert transport.call_count == 1, 'auth rejection must not be retried'
- assert not adc_default.called
- assert not agent._MODEL_AUTOFIX
  assert code not in (0, None), 'released CLI must exit unsuccessfully'
  raise SystemExit(code)
 `, { mode: 0o700 });
@@ -635,15 +651,17 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
 	for (const stream of [run.proc.stdout, run.proc.stderr]) stream?.on("data", (chunk) => { fixtureDiagnostics = (fixtureDiagnostics + chunk).slice(0, 65536); });
 	try {
 		const term = await run.completion; const result = await inspectNativeAudit(f.artifacts, term.exitCode);
-		fs.writeFileSync(path.join(f.root, "production-result.json"), JSON.stringify({ term, result, fixtureDiagnostics }, null, 2), { mode: 0o600 });
 		expect(run.route.provider).toBe(provider);
+		const observations = [...fixtureDiagnostics.matchAll(/CLOUD_REJECTION_OBSERVED:(\{[^\n]*\})/g)].map((match) => JSON.parse(match[1]));
+		expect(observations, fixtureDiagnostics).toEqual([{ attempt: 1, adc_called: false, autofix: false,
+			host: provider === "bedrock" ? "bedrock-runtime.us-east-2.amazonaws.com" : "aiplatform.googleapis.com" }]);
 		expect(term.exitCode, fixtureDiagnostics).not.toBe(0);
 		expect(term.shutdown, fixtureDiagnostics).toBe("verified");
 		if (provider === "geap") expect(term.stopped).toBe("CREDENTIAL_EXPIRED: short-lived provider credential expired during native audit; no fallback.");
 		else expect(term.stopped).toBeUndefined();
 		expect(result.status).toBe("failed"); expect(result.answer).toBeUndefined();
 		const snapshot = path.join(f.artifacts, "snapshot"); const evidenceReport = path.join(f.artifacts, "evidence/native-cli-report.json");
-		const retained = f.assertHostBoundary(term, result);
+		const retained = f.assertHostBoundary(term, result, fixtureDiagnostics);
 		if (term.preservationFailure) {
 			// The group was torn down before the released report landed: nothing is exported
 			// and the committed-tree snapshot is retained as the only evidence.
@@ -656,7 +674,7 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
 			expect(fs.existsSync(snapshot)).toBe(false);
 			const report = JSON.parse(fs.readFileSync(evidenceReport, "utf8"));
 			expect(report.result).toMatchObject({ outcome: "error", exit_code: 1 });
-			expect(report.result.answer).toContain(provider === "bedrock" ? "PROVIDER_ECHO_AWS_REJECTION" : "PROVIDER_ECHO_VERTEX_REJECTION");
+			expect(report.result.answer).toContain(`PROVIDER_ECHO_${provider.toUpperCase()}_REJECTION: [REDACTED]`);
 			expect(retained).toContain(evidenceReport);
 		}
 	} finally { run.cancel("Fixture cleanup"); await run.completion; console.log(`Released cloud rejection AgentFS evidence: ${f.root}`); }

@@ -93,6 +93,26 @@ describe("native-audit shared finalization", () => {
 		expect(readNativeTerminal(f.runDir)).toEqual(term);
 	});
 
+	it("redacts forwarded credential values echoed into released evidence while exporting clean files byte-identical", async () => {
+		const f = fixture();
+		const patchBytes = fs.readFileSync(path.join(f.findings, "001-test.patch"));
+		fs.writeFileSync(path.join(f.runDir, "snapshot", "native-cli-report.json"),
+			'{"result":{"outcome":"error","answer":"Vertex_aiException - Invalid credential SENTINEL_BRIDGED_GOOGLE_BEARER PROVIDER_ECHO"}}\n');
+		fs.writeFileSync(path.join(f.state, "state.json"), '{"phase":"done","note":"header sk-or-SENTINEL_UNRELATED_KEY-tail"}\n');
+		fs.writeFileSync(path.join(f.findings, "001-test.md"), "token SENTINEL_BRIDGED_GOOGLE_BEARER repeated SENTINEL_BRIDGED_GOOGLE_BEARER\n");
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent,
+			redactSecrets: ["SENTINEL_BRIDGED_GOOGLE_BEARER", "sk-or-SENTINEL_UNRELATED_KEY"] }, { exitCode: 1 });
+		expect(term).toMatchObject({ exitCode: 1, shutdown: "verified" }); expect(term.preservationFailure).toBeUndefined();
+		const evidence = (relative: string) => fs.readFileSync(path.join(f.runDir, "evidence", relative), "utf8");
+		expect(JSON.parse(evidence("native-cli-report.json")).result.answer).toBe("Vertex_aiException - Invalid credential [REDACTED] PROVIDER_ECHO");
+		expect(JSON.parse(evidence("native-state/abc12345/state.json")).note).toBe("header [REDACTED]-tail");
+		expect(evidence("audit-findings/001-test.md")).toBe("token [REDACTED] repeated [REDACTED]\n");
+		expect(fs.readFileSync(path.join(f.runDir, "evidence", "audit-findings", "001-test.patch"))).toEqual(patchBytes);
+		for (const file of fs.readdirSync(f.runDir, { recursive: true, withFileTypes: true })) {
+			if (file.isFile()) expect(fs.readFileSync(path.join(file.parentPath, file.name), "utf8")).not.toContain("SENTINEL_");
+		}
+	});
+
 	it("escalates a TERM-ignoring live group and requires ESRCH before evidence export", async () => {
 		const f = fixture();
 		const child = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); process.send('ready'); setInterval(()=>{},1000)"],

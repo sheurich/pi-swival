@@ -1282,15 +1282,21 @@ class NativeEntryTests(unittest.TestCase):
         output = io.StringIO()
         def unauthorized(request, **_kwargs):
             return httpx.Response(401, request=request, json={"error": {"code": 401,
-                "message": "Invalid credential SENTINEL_VERTEX_ECHO", "status": "UNAUTHENTICATED"}})
+                "message": "Invalid credential PROVIDER_ECHO_GEAP_REJECTION: SENTINEL_BRIDGED_GOOGLE_BEARER",
+                "status": "UNAUTHENTICATED"}})
         with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "SENTINEL_BRIDGED_GOOGLE_BEARER"}), \
              patch("google.auth.default", side_effect=FORBIDDEN) as adc, \
              contextlib.redirect_stderr(output):
             failure, transport = self.call_cloud_route(self.cloud_route("geap"), unauthorized)
         self.assertIn("AuthenticationError", str(failure))
+        # The provider echoed the rejected bearer; the shim scrubs the exact value before Swival
+        # formats the error. (LiteLLM's own pattern heuristics only match known token shapes,
+        # so the echo is laid out where they cannot partially mangle it first.)
+        self.assertIn("Invalid credential PROVIDER_ECHO_GEAP_REJECTION: [REDACTED]", str(failure))
+        self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", str(failure))
         self.assertTrue(transport.called)
         self.assertIn("\nPI_SWIVAL_CREDENTIAL_EXPIRED\n", output.getvalue())
-        self.assertNotIn("SENTINEL_VERTEX_ECHO", output.getvalue())
+        self.assertNotIn("PROVIDER_ECHO_GEAP_REJECTION", output.getvalue())
         self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", output.getvalue())
         adc.assert_not_called()
         self.assertEqual(agent._list_server_models("vertex_ai", None, None), [])
@@ -1303,7 +1309,7 @@ class NativeEntryTests(unittest.TestCase):
             "AWS_SESSION_TOKEN": "SENTINEL_BRIDGED_AWS_SESSION", "AWS_CONFIG_FILE": "/dev/null",
             "AWS_SHARED_CREDENTIALS_FILE": "/dev/null", "AWS_EC2_METADATA_DISABLED": "true"}
         for status, body in ((400, {"__type": "ExpiredTokenException",
-                "message": "Token expired SENTINEL_AWS_ECHO"}),
+                "message": "Token SENTINEL_BRIDGED_AWS_SESSION for ASIASYNTHETIC expired PROVIDER_ECHO_BEDROCK_REJECTION"}),
                 (404, {"__type": "ResourceNotFoundException", "message": "Model not found"})):
             with self.subTest(status=status):
                 output = io.StringIO()
@@ -1315,7 +1321,12 @@ class NativeEntryTests(unittest.TestCase):
                 self.assertEqual(transport.call_args.args[0].url.host,
                     "bedrock-runtime.us-east-2.amazonaws.com")
                 self.assertIn(body["__type"], str(failure))
-                self.assertNotIn("SENTINEL_", output.getvalue())
+                if status == 400:
+                    self.assertIn("Token [REDACTED] for [REDACTED] expired PROVIDER_ECHO_BEDROCK_REJECTION",
+                        str(failure))
+                for secret in ("SENTINEL_", "ASIASYNTHETIC"):
+                    self.assertNotIn(secret, str(failure))
+                    self.assertNotIn(secret, output.getvalue())
                 self.assertEqual(agent._list_server_models("bedrock", None, None), [])
         self.assertEqual([entry for entry in opened if entry.startswith(str(aws))], [])
 
@@ -1376,6 +1387,49 @@ class NativeEntryTests(unittest.TestCase):
         self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", output.getvalue())
         self.assertFalse(agent._MODEL_AUTOFIX)
         adc.assert_not_called()
+
+    def test_released_entrypoint_401_writes_redacted_error_report(self):
+        """Released main() completes its own error report when no parent cancels the process."""
+        self.cloud_shim()
+        report_path = self.repo / "native-cli-report.json"
+        argv = [
+            "swival", "--base-dir", str(self.repo), "--sandbox", "builtin",
+            "--network", "provider-only", "--commands", "none", "--files", "some",
+            "--oneshot-commands", "--no-sandbox-auto-session", "--no-instructions",
+            "--no-skills", "--no-metaskills", "--no-mcp", "--no-a2a", "--no-subagents",
+            "--no-lifecycle", "--no-history", "--no-continue", "--no-memory",
+            "--no-web-search", "--no-model-routing", "--no-decisions",
+            "--provider", "geap", "--model", "gemini-3.8-flash", "--gcp-project", "synthetic-project",
+            "--location", "global", "--max-context-tokens", "128000",
+            "--report", str(report_path), "--", "/audit --all --workers 1 --patch-max-turns 5",
+        ]
+        def unauthorized(request, **_kwargs):
+            return httpx.Response(401, request=request, json={"error": {"code": 401,
+                "message": "Invalid credential PROVIDER_ECHO_GEAP_REJECTION: SENTINEL_BRIDGED_GOOGLE_BEARER",
+                "status": "UNAUTHENTICATED"}})
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "SENTINEL_BRIDGED_GOOGLE_BEARER"}), \
+             patch("google.auth.default", side_effect=FORBIDDEN) as adc, \
+             patch.object(httpx.Client, "send", side_effect=unauthorized) as transport, \
+             patch.object(sys, "argv", argv), patch.object(agent.time, "sleep"), \
+             patch("swival.sandbox_nono.check_wrapper_available"), \
+             patch("swival.sandbox_nono.build_block_net_wrapper", return_value=["offline-nono"]), \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+             self.assertRaises(SystemExit) as exited:
+            agent.main()
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(transport.call_count, 1)
+        adc.assert_not_called()
+        self.assertFalse(agent._MODEL_AUTOFIX)
+        self.assertIn("\nPI_SWIVAL_CREDENTIAL_EXPIRED\n", stderr.getvalue())
+        report_text = report_path.read_text()
+        report = json.loads(report_text)
+        self.assertEqual(report["result"]["outcome"], "error")
+        self.assertEqual(report["result"]["exit_code"], 1)
+        self.assertIn("PROVIDER_ECHO_GEAP_REJECTION", json.dumps(report["result"]))
+        self.assertIn("[REDACTED]", json.dumps(report["result"]))
+        for text in (report_text, stdout.getvalue(), stderr.getvalue()):
+            self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", text)
 
     def test_child_isolation_env_fails_closed_without_host_credential_reads(self):
         self.cloud_shim()

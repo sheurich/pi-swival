@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { assertNativeCredentialLifetime, bridgeNativeCredentials, buildNativeAuditArgs, nativeEnvironment, nativePreflightEnvironment, parseNativePreflight, parseNativeRoute, type NativeRoute } from "../extensions/native-audit.js";
+import { assertNativeCredentialLifetime, bridgeNativeCredentials, buildNativeAuditArgs, nativeCredentialValues, nativeEnvironment, nativePreflightEnvironment, parseNativePreflight, parseNativeRoute, type NativeRoute } from "../extensions/native-audit.js";
 
 const route = (provider: string): NativeRoute => ({
 	version: 2, runtime: { swival: "1.9.3", litellm: "1.106.6" }, provider, model: "concrete-model",
@@ -69,5 +69,13 @@ describe("native cloud credential boundary (offline)", () => {
 		const markers = nativePreflightEnvironment(input, "/trusted/bin");
 		expect(markers.AWS_PROFILE).toBe("present"); expect(markers.GOOGLE_APPLICATION_CREDENTIALS).toBe("present");
 		expect(JSON.stringify(markers)).not.toContain("secret-");
+		const redactable = nativeCredentialValues(env);
+		expect(redactable).toEqual(provider === "bedrock" ? ["secret-session", "secret-access", "secret-key"]
+			: provider === "geap" ? ["secret-google"] : provider === "anthropic" ? ["secret-anthropic"] : ["secret-openrouter"]);
+	});
+	it("collects only forwarded credential values of usable length, longest first and deduplicated", () => {
+		expect(nativeCredentialValues({ AWS_ACCESS_KEY_ID: "abc", AWS_SECRET_ACCESS_KEY: "  long-secret-value  ", AWS_SESSION_TOKEN: "long-secret-value",
+			GOOGLE_OAUTH_ACCESS_TOKEN: "bearer", AWS_PROFILE: "not-a-credential-value", HOME: "/synthetic/home" }))
+			.toEqual(["long-secret-value", "bearer"]);
 	});
 });

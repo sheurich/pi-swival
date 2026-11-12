@@ -60,6 +60,9 @@ const DIAGNOSTICS_LIMIT = 2 * 1024 * 1024;
 const ADJUDICATION_ERROR_SENTINEL = "PI_SWIVAL_ADJUDICATION_ERROR";
 const SHIM_INSTALL_FAILED_SENTINEL = "PI_SWIVAL_SHIM_INSTALL_FAILED";
 const CREDENTIAL_EXPIRED_SENTINEL = "PI_SWIVAL_CREDENTIAL_EXPIRED";
+/** Credential values the child may hold; a provider error body can echo them into released evidence. */
+const CREDENTIAL_ENV_KEYS = ["ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+	"GOOGLE_OAUTH_ACCESS_TOKEN", "OPENROUTER_API_KEY", "CHATGPT_API_KEY"] as const;
 const credentialUnavailable = () => new Error("Native audit configuration preflight failed: Selected provider credential is unavailable; no fallback. No native worker/provider was started.");
 
 // --------------------------------------------------------- parameters --
@@ -156,6 +159,16 @@ export function nativeEnvironment(input: NodeJS.ProcessEnv, searchPath: string, 
 	return { ...env, PATH: searchPath, LITELLM_MODE: "PRODUCTION", LITELLM_LOCAL_MODEL_COST_MAP: "True", NONO_NO_UPDATE_CHECK: "1",
 		NO_COLOR: "1", TERM: "dumb", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null",
 		GIT_NO_REPLACE_OBJECTS: "1", GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };
+}
+
+/** Forwarded credential values, longest first so overlapping values redact completely. */
+export function nativeCredentialValues(env: NodeJS.ProcessEnv): string[] {
+	const values = new Set<string>();
+	for (const key of CREDENTIAL_ENV_KEYS) {
+		const value = env[key]?.trim();
+		if (value && value.length >= 4) values.add(value);
+	}
+	return [...values].sort((a, b) => b.length - a.length);
 }
 
 const PREFLIGHT_PRESENCE_KEYS = new Set(["USE_LITELLM_PROXY", "SWIVAL_ENCRYPT_KEY", "SWIVAL_LLM_FILTER", "SWIVAL_SECRET_SHIELD",
@@ -458,6 +471,7 @@ export async function prepareNativeAudit(
 		anthropicShimDir = currentShim.dir;
 	}
 	const env = nativeEnvironment(input, trustedGit.env.PATH!, route.provider, anthropicShimDir);
+	const redactSecrets = nativeCredentialValues(env);
 	const authStore = route.provider === "chatgpt" ? await prepareNativeAuthStore(input, [...protectedRoots, runDir]) : undefined;
 	if (authStore) {
 		env.CHATGPT_TOKEN_DIR = authStore.directory;
@@ -585,7 +599,7 @@ export async function prepareNativeAudit(
 			signal: (value) => process.kill(-proc.pid!, value),
 			verify: async () => !(await boundedExec(agentfs, ["ps"], runDir, undefined, env, 5000, 65536)).toString().includes(session),
 		} : undefined;
-		finalization = finalizeNativeAudit({ runDir, ownership, cancellationReason: () => stopped,
+		finalization = finalizeNativeAudit({ runDir, ownership, cancellationReason: () => stopped, redactSecrets,
 			closeLogs: async (shutdown) => {
 				let drainTimer: ReturnType<typeof setTimeout> | undefined;
 				try {
@@ -677,8 +691,15 @@ function accountRetained(target: string, size: number, budget: EvidenceBudget): 
 	if (budget.bytes > NATIVE_TOTAL_LIMIT) throw new Error("Native evidence byte limit.");
 	budget.paths.add(target);
 }
-function publishEvidence(runDir: string, source: string, target: string, budget: EvidenceBudget): void {
-	const bytes = regularBytes(runDir, source, NATIVE_FILE_LIMIT);
+/** Released evidence is UTF-8 text; unchanged files are exported byte-identical. */
+function redactedEvidence(bytes: Buffer, secrets: readonly string[]): Buffer {
+	if (!secrets.length) return bytes;
+	const text = bytes.toString("utf8");
+	if (!secrets.some((secret) => text.includes(secret))) return bytes;
+	return Buffer.from(secrets.reduce((value, secret) => value.replaceAll(secret, "[REDACTED]"), text), "utf8");
+}
+function publishEvidence(runDir: string, source: string, target: string, budget: EvidenceBudget, secrets: readonly string[]): void {
+	const bytes = redactedEvidence(regularBytes(runDir, source, NATIVE_FILE_LIMIT), secrets);
 	try {
 		const existing = regularBytes(runDir, target, NATIVE_FILE_LIMIT);
 		if (!existing.equals(bytes)) throw new Error("Conflicting retained native evidence.");
@@ -715,7 +736,7 @@ function scanDirectory(runDir: string, directory: string, budget: { entries: num
 }
 
 /** Copy the released report, audit state, and finding report/patch pairs out of the snapshot within fixed budgets. */
-function preserveEvidence(runDir: string): void {
+function preserveEvidence(runDir: string, secrets: readonly string[]): void {
 	const snapshot = path.join(runDir, "snapshot");
 	const evidence = path.join(runDir, "evidence");
 	const budget: EvidenceBudget = { entries: 0, bytes: 0, paths: new Set() };
@@ -733,14 +754,14 @@ function preserveEvidence(runDir: string): void {
 	});
 	// Every retained entry counts, including unmatched files in export namespaces.
 	retained(evidence);
-	publishEvidence(runDir, path.join(snapshot, "native-cli-report.json"), path.join(evidence, "native-cli-report.json"), budget);
+	publishEvidence(runDir, path.join(snapshot, "native-cli-report.json"), path.join(evidence, "native-cli-report.json"), budget, secrets);
 	// Bound source traversal independently from the logical destination union.
 	const sourceScan = { entries: 0 };
 	const states = path.join(snapshot, ".swival", "audit");
 	scanDirectory(runDir, states, sourceScan, (name) => {
 		if (!/^[a-f0-9]{8}$/.test(name)) return;
 		scanned(sourceScan);
-		publishEvidence(runDir, path.join(states, name, "state.json"), path.join(evidence, "native-state", name, "state.json"), budget);
+		publishEvidence(runDir, path.join(states, name, "state.json"), path.join(evidence, "native-state", name, "state.json"), budget, secrets);
 	});
 	const findings = (source: string, target: string) => scanDirectory(runDir, source, sourceScan, (name) => {
 		const file = path.join(source, name);
@@ -748,7 +769,7 @@ function preserveEvidence(runDir: string): void {
 		if (stat.isDirectory()) findings(file, path.join(target, name));
 		else {
 			if (!stat.isFile()) throw new Error("Nonregular native evidence.");
-			if (/\.(?:md|patch)$/.test(name)) publishEvidence(runDir, file, path.join(target, name), budget);
+			if (/\.(?:md|patch)$/.test(name)) publishEvidence(runDir, file, path.join(target, name), budget, secrets);
 		}
 	});
 	findings(path.join(snapshot, "audit-findings"), path.join(evidence, "audit-findings"));
@@ -777,6 +798,8 @@ export interface NativeFinalizationOptions {
 	ownership?: NativeOwnership;
 	closeLogs?: (shutdown: NativeTerminal["shutdown"]) => Promise<void>;
 	cancellationReason?: () => string | undefined;
+	/** Forwarded credential values to scrub from exported evidence; disk-recovered runs have none. */
+	redactSecrets?: readonly string[];
 }
 
 /**
@@ -786,7 +809,7 @@ export interface NativeFinalizationOptions {
  */
 export async function finalizeNativeAudit(options: NativeFinalizationOptions,
 	outcome: { exitCode: number; stopped?: string }): Promise<NativeTerminal> {
-	const { runDir, ownership, closeLogs, cancellationReason } = options;
+	const { runDir, ownership, closeLogs, cancellationReason, redactSecrets = [] } = options;
 	const existing = readNativeTerminal(runDir);
 	if (existing && (existing.shutdown !== "unverified" || !ownership)) return existing;
 	const record: NativeTerminal = { exitedAt: new Date().toISOString(), ...(existing ?? {}), ...outcome,
@@ -811,7 +834,7 @@ export async function finalizeNativeAudit(options: NativeFinalizationOptions,
 		record.shutdownFailure = "Native CLI/process/AgentFS shutdown could not be verified.";
 		for (const name of ["snapshot", "runtime-bin", "config", "sandbox-cwd"]) retained.push(path.join(runDir, name));
 	} else {
-		try { preserveEvidence(runDir); }
+		try { preserveEvidence(runDir, redactSecrets); }
 		catch { record.preservationFailure = "Native evidence preservation failed or exceeded resource limits."; }
 		const removable = [path.join(runDir, "runtime-bin"), path.join(runDir, "config"), path.join(runDir, "sandbox-cwd")];
 		if (record.preservationFailure) retained.push(snapshot);
