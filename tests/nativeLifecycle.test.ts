@@ -37,6 +37,7 @@ snapshot = Path(args[args.index('--base-dir') + 1])
 root = snapshot.parent
 manifest = json.loads((root / 'manifest.json').read_text())
 (root / 'launch.json').write_text(json.dumps({'args':args,'cwd':str(Path.cwd()),'stdin':sys.stdin.read(), 'env':dict(os.environ)}))
+with (root / 'launches.log').open('a') as launches: launches.write('launch\\n')
 state = {'scope':manifest['scope'],'reviewed_files':manifest['scope']['mandatory_files'],
  'candidate_files':manifest['scope']['mandatory_files'],'deep_reviewed_files':manifest['scope']['mandatory_files'],
  'phase':'done','artifact_state':{},'verification_state':{},'verified_findings':[],'proposed_findings':[],'metrics':{},'truncated_files':{}}
@@ -50,6 +51,7 @@ report = {'version':1,'task':args[-1],'provider':manifest['route']['provider'],'
  'sandbox':{'mode':'builtin'},'network':'provider-only',
  'result':{'outcome':'success','exit_code':0,'answer':'synthetic source-only audit'}}
 if ${JSON.stringify(mode)} == 'auth-error': report['result'] = {'outcome':'error','exit_code':1,'error_message':'synthetic auth error'}
+if ${JSON.stringify(mode)} == 'bedrock-auth-failure': report['result'] = {'outcome':'error','exit_code':1,'error_message':'synthetic provider failure'}
 (snapshot / 'native-cli-report.json').write_text(json.dumps(report))
 print('synthetic CLI diagnostics', flush=True)
 if ${JSON.stringify(diagnosticReplay)}:
@@ -89,6 +91,18 @@ if ${JSON.stringify(mode)} in ('login-absent', 'login-expired'):
   with httpx.Client(transport=httpx.MockTransport(auth_http)) as client, patch.object(authenticator, 'get_httpx_client', return_value=client):
    auth.get_access_token()
 if ${JSON.stringify(mode)} == 'noisy': print('x' * (3 * 1024 * 1024), flush=True)
+if ${JSON.stringify(mode)}.startswith('credential-expired-'):
+ sys.stderr.write('Error detail: SENTINEL_PRIVATE_CLOUD_ERROR\\n'); sys.stderr.flush()
+ if ${JSON.stringify(mode)} == 'credential-expired-split':
+  sys.stderr.write('PI_SWIVAL_CREDENTIAL_'); sys.stderr.flush(); time.sleep(.05)
+  sys.stderr.write('EXPIRED\\n'); sys.stderr.flush()
+  signal.signal(signal.SIGTERM, signal.SIG_IGN)
+  while True: time.sleep(.05)
+ sys.stderr.write('PI_SWIVAL_CREDENTIAL_EXPIRED'); sys.stderr.flush()
+ sys.exit(int(${JSON.stringify(mode)}.rsplit('-', 1)[1]))
+if ${JSON.stringify(mode)} == 'bedrock-auth-failure':
+ sys.stderr.write('botocore.exceptions.ClientError: ExpiredTokenException SENTINEL_AWS_ERROR\\n'); sys.stderr.flush()
+ sys.exit(1)
 if ${JSON.stringify(mode)} == 'descendant':
  child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(20)'])
  (root / 'descendant-ready').write_text('ready')
@@ -119,6 +133,19 @@ else: print('')
 		runs.push(run); return run;
 	};
 	return { root, source, runtime, params, artifactDir, start };
+}
+/** Production-owned retained files: the synthetic CLI's own launch records dump the child env by design and are excluded. */
+function retainedArtifactTexts(directory: string, extra: string[] = []): string[] {
+	const texts = [...extra];
+	const walk = (current: string) => {
+		for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+			const target = path.join(current, entry.name);
+			if (entry.isDirectory()) walk(target);
+			else if (current !== directory || !["launch.json", "launches.log"].includes(entry.name)) texts.push(fs.readFileSync(target, "utf8"));
+		}
+	};
+	walk(directory);
+	return texts;
 }
 async function launched(f: ReturnType<typeof fixture>) {
 	for (let attempt = 0; attempt < 100; attempt++) {
@@ -482,6 +509,42 @@ process.send({pid:run.proc.pid}); await run.completion; })().catch(()=>process.e
 			expect(result.answer).toBeUndefined();
 		}
 	});
+
+	it.each(["credential-expired-split", "credential-expired-eof-0", "credential-expired-eof-1"])(
+		"cancels %s PI_SWIVAL_CREDENTIAL_EXPIRED stderr without retaining private cloud diagnostics", async (mode) => {
+			const f = fixture(mode); const run = await f.start(); const term = await run.completion;
+			expect(term.exitCode).not.toBe(0); expect(term.shutdown).toBe("verified");
+			expect(term.stopped).toBe("CREDENTIAL_EXPIRED: short-lived provider credential expired during native audit; no fallback.");
+			expect(() => process.kill(-run.proc.pid!, 0)).toThrow();
+			const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+			const result = await inspectNativeAudit(f.artifactDir, term.exitCode);
+			expect(result.status).toBe("failed"); expect(result.answer).toBeUndefined();
+			expect(fs.existsSync(path.join(f.artifactDir, "evidence/native-cli-report.json"))).toBe(true);
+			for (const text of retainedArtifactTexts(f.artifactDir, [JSON.stringify(term), JSON.stringify(result)])) {
+				expect(text).not.toContain("SENTINEL_PRIVATE_CLOUD_ERROR");
+			}
+		}, 20_000);
+	it("fails a Bedrock terminal auth failure once without retry or private stderr retention", async () => {
+		const f = fixture("bedrock-auth-failure");
+		Object.assign(f.runtime.environment, { AWS_ACCESS_KEY_ID: "ASIASYNTHETIC", AWS_SECRET_ACCESS_KEY: "SENTINEL_AWS_SECRET",
+			AWS_SESSION_TOKEN: "SENTINEL_AWS_SESSION" });
+		fs.mkdirSync(path.join(f.runtime.environment.XDG_CONFIG_HOME, "swival"));
+		fs.writeFileSync(path.join(f.runtime.environment.XDG_CONFIG_HOME, "swival/config.toml"),
+			'provider="bedrock"\nmodel="global.anthropic.claude-sonnet-5-5"\nbase_url="us-east-2"\nmax_context_tokens=128000\n');
+		const run = await f.start({ providerOverride: undefined, modelOverride: undefined }); const term = await run.completion;
+		expect(run.route.provider).toBe("bedrock");
+		expect(term).toMatchObject({ exitCode: 1, shutdown: "verified" });
+		const launch = JSON.parse(fs.readFileSync(path.join(f.artifactDir, "launch.json"), "utf8"));
+		expect(launch.env).toMatchObject({ AWS_CONFIG_FILE: "/dev/null", AWS_SHARED_CREDENTIALS_FILE: "/dev/null", AWS_EC2_METADATA_DISABLED: "true" });
+		expect(fs.readFileSync(path.join(f.artifactDir, "launches.log"), "utf8")).toBe("launch\n");
+		const { inspectNativeAudit } = await import("../extensions/native-audit.js");
+		const result = await inspectNativeAudit(f.artifactDir, term.exitCode);
+		expect(result.status).toBe("failed"); expect(result.answer).toBeUndefined();
+		expect(JSON.parse(fs.readFileSync(path.join(f.artifactDir, "evidence/native-cli-report.json"), "utf8")).result.outcome).toBe("error");
+		for (const text of retainedArtifactTexts(f.artifactDir, [JSON.stringify(term), JSON.stringify(result)])) {
+			for (const secret of ["SENTINEL_AWS_ERROR", "SENTINEL_AWS_SECRET", "SENTINEL_AWS_SESSION", "ASIASYNTHETIC"]) expect(text).not.toContain(secret);
+		}
+	}, 30_000);
 
 	it("cancels live execution fail-closed when sitecustomize emits PI_SWIVAL_SHIM_INSTALL_FAILED", async () => {
 		const f = fixture("complete", "PI_SWIVAL_SHIM_INSTALL_FAILED\n");

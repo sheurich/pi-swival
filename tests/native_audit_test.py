@@ -6,6 +6,7 @@ stubbed here; nativeAgentfs.test.ts separately exercises the real bootstrap.
 # pylint: disable=protected-access,import-outside-toplevel,missing-function-docstring
 # pylint: disable=too-many-locals,too-many-statements,too-many-public-methods
 import base64
+import builtins
 import contextlib
 from copy import deepcopy
 import importlib.util
@@ -1233,6 +1234,177 @@ class NativeEntryTests(unittest.TestCase):
                  contextlib.redirect_stderr(output), self.assertRaises(litellm.AuthenticationError):
                 litellm.completion(model="vertex_ai/synthetic")
         self.assertNotIn("private-error", output.getvalue())
+
+    def cloud_route(self, provider):
+        """Resolve the released cloud route exactly as the native CLI does."""
+        if provider == "bedrock":
+            return agent.resolve_provider("bedrock", "global.anthropic.claude-sonnet-5-5", None,
+                "us-east-2", 128000, False)
+        return agent.resolve_provider("geap", "gemini-3.8-flash", None, None, 128000, False,
+            project="synthetic-project", location="global")
+
+    def call_cloud_route(self, route, send):
+        mid, api, _key, _context, kwargs = route
+        with patch.object(httpx.Client, "send", side_effect=send) as transport, \
+             patch.object(agent.time, "sleep"), self.assertRaises(agent.AgentError) as raised:
+            agent.call_llm(api, mid, [{"role": "user", "content": "synthetic"}], 100, None, None,
+                None, None, False, max_retries=1, **kwargs)
+        self.assertFalse(agent._MODEL_AUTOFIX)
+        return raised.exception, transport
+
+    def recording_open(self):
+        """Record every path opened through the builtin or io.open entry points."""
+        opened = []
+        real_open = builtins.open
+        def record(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)):
+                opened.append(os.fsdecode(file))
+            return real_open(file, *args, **kwargs)
+        self.enterContext(patch.object(builtins, "open", record))
+        self.enterContext(patch.object(io, "open", record))
+        return opened
+
+    def host_credential_files(self):
+        aws = self.root / ".aws"
+        aws.mkdir()
+        (aws / "credentials").write_text("[default]\naws_access_key_id = AKIAHOSTSENTINEL\n"
+            "aws_secret_access_key = SENTINEL_HOST_AWS_SECRET_NEVER_READ\n")
+        gcloud = self.root / ".config" / "gcloud"
+        gcloud.mkdir(parents=True)
+        (gcloud / "application_default_credentials.json").write_text(json.dumps({
+            "type": "authorized_user", "client_id": "synthetic",
+            "client_secret": "SENTINEL_HOST_GCLOUD_SECRET_NEVER_READ",
+            "refresh_token": "SENTINEL_HOST_GCLOUD_SECRET_NEVER_READ"}))
+        return aws, gcloud
+
+    def test_vertex_raw_http_401_emits_fixed_sentinel_without_adc_or_echo(self):
+        self.cloud_shim()
+        output = io.StringIO()
+        def unauthorized(request, **_kwargs):
+            return httpx.Response(401, request=request, json={"error": {"code": 401,
+                "message": "Invalid credential SENTINEL_VERTEX_ECHO", "status": "UNAUTHENTICATED"}})
+        with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "SENTINEL_BRIDGED_GOOGLE_BEARER"}), \
+             patch("google.auth.default", side_effect=FORBIDDEN) as adc, \
+             contextlib.redirect_stderr(output):
+            failure, transport = self.call_cloud_route(self.cloud_route("geap"), unauthorized)
+        self.assertIn("AuthenticationError", str(failure))
+        self.assertTrue(transport.called)
+        self.assertIn("\nPI_SWIVAL_CREDENTIAL_EXPIRED\n", output.getvalue())
+        self.assertNotIn("SENTINEL_VERTEX_ECHO", output.getvalue())
+        self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", output.getvalue())
+        adc.assert_not_called()
+        self.assertEqual(agent._list_server_models("vertex_ai", None, None), [])
+
+    def test_bedrock_raw_http_expired_token_and_not_found_fail_without_substitution(self):
+        self.cloud_shim()
+        aws, _gcloud = self.host_credential_files()
+        opened = self.recording_open()
+        bridged = {"AWS_ACCESS_KEY_ID": "ASIASYNTHETIC", "AWS_SECRET_ACCESS_KEY": "SENTINEL_BRIDGED_AWS_SECRET",
+            "AWS_SESSION_TOKEN": "SENTINEL_BRIDGED_AWS_SESSION", "AWS_CONFIG_FILE": "/dev/null",
+            "AWS_SHARED_CREDENTIALS_FILE": "/dev/null", "AWS_EC2_METADATA_DISABLED": "true"}
+        for status, body in ((400, {"__type": "ExpiredTokenException",
+                "message": "Token expired SENTINEL_AWS_ECHO"}),
+                (404, {"__type": "ResourceNotFoundException", "message": "Model not found"})):
+            with self.subTest(status=status):
+                output = io.StringIO()
+                def respond(request, **_kwargs):
+                    return httpx.Response(status, request=request, json=body)
+                with patch.dict(os.environ, bridged), contextlib.redirect_stderr(output):
+                    failure, transport = self.call_cloud_route(self.cloud_route("bedrock"), respond)
+                self.assertTrue(transport.called)
+                self.assertEqual(transport.call_args.args[0].url.host,
+                    "bedrock-runtime.us-east-2.amazonaws.com")
+                self.assertIn(body["__type"], str(failure))
+                self.assertNotIn("SENTINEL_", output.getvalue())
+                self.assertEqual(agent._list_server_models("bedrock", None, None), [])
+        self.assertEqual([entry for entry in opened if entry.startswith(str(aws))], [])
+
+    def test_vertex_cached_static_credential_expires_across_requests_on_fake_clock(self):
+        module = self.cloud_shim()
+        from litellm import main as litellm_main
+        from litellm.llms.vertex_ai.vertex_llm_base import VertexBase
+        output = io.StringIO()
+        with patch.dict(os.environ, {"GOOGLE_OAUTH_ACCESS_TOKEN": "SENTINEL_BRIDGED_GOOGLE_BEARER",
+                "GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER": "1060"}), \
+             patch("google.auth.default", side_effect=FORBIDDEN) as adc, \
+             contextlib.redirect_stderr(output):
+            with patch.object(module.time, "time", return_value=1000):
+                creds, project = VertexBase().load_auth(None, "proj")
+                self.assertFalse(creds.expired)
+            self.assertEqual(project, "proj")
+            # Installation is idempotent: an earlier preflight attestation may own the wrapper.
+            self.assertEqual(type(creds).__name__, "_StaticVertexBearerCredentials")
+            self.assertEqual(creds.token, "SENTINEL_BRIDGED_GOOGLE_BEARER")
+            self.assertEqual(output.getvalue(), "")
+            with patch.object(module.time, "time", return_value=1061):
+                self.assertTrue(creds.expired)
+                with self.assertRaisesRegex(RuntimeError, "PI_SWIVAL_CREDENTIAL_EXPIRED"):
+                    VertexBase().load_auth(None, "proj")
+                with self.assertRaisesRegex(RuntimeError, "PI_SWIVAL_CREDENTIAL_EXPIRED"):
+                    creds.refresh(None)
+            self.assertEqual(output.getvalue(), "\nPI_SWIVAL_CREDENTIAL_EXPIRED\n" * 2)
+            # Released requests reuse LiteLLM's singleton Gemini adapter and its per-project
+            # credential cache; the second request must stop at the cached static credential.
+            adapter = litellm_main.vertex_chat_completion
+            self.assertIsInstance(adapter, VertexBase)
+            requests = []
+            def send(request, **_kwargs):
+                requests.append(request)
+                return httpx.Response(200, request=request, json={"candidates": [{"content": {
+                    "role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+                    "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5,
+                    "totalTokenCount": 15}})
+            mid, api, _key, _context, kwargs = self.cloud_route("geap")
+            with patch.dict(adapter._credentials_project_mapping, clear=True), \
+                 patch.object(httpx.Client, "send", side_effect=send), patch.object(agent.time, "sleep"):
+                with patch.object(module.time, "time", return_value=1000):
+                    reply = agent.call_llm(api, mid, [{"role": "user", "content": "synthetic"}],
+                        100, None, None, None, None, False, max_retries=1, **kwargs)
+                self.assertEqual(agent._msg_get(reply[0], "content"), "ok")
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0].headers["authorization"],
+                    "Bearer SENTINEL_BRIDGED_GOOGLE_BEARER")
+                cached = adapter._credentials_project_mapping[(None, "synthetic-project")][0]
+                self.assertEqual(type(cached).__name__, "_StaticVertexBearerCredentials")
+                with patch.object(module.time, "time", return_value=1061), \
+                     self.assertRaises(agent.AgentError) as raised:
+                    agent.call_llm(api, mid, [{"role": "user", "content": "synthetic"}],
+                        100, None, None, None, None, False, max_retries=1, **kwargs)
+            self.assertIn("PI_SWIVAL_CREDENTIAL_EXPIRED", str(raised.exception))
+            self.assertEqual(len(requests), 1, "expired cached credential must not reach transport")
+        self.assertEqual(output.getvalue(), "\nPI_SWIVAL_CREDENTIAL_EXPIRED\n" * 3)
+        self.assertNotIn("SENTINEL_BRIDGED_GOOGLE_BEARER", output.getvalue())
+        self.assertFalse(agent._MODEL_AUTOFIX)
+        adc.assert_not_called()
+
+    def test_child_isolation_env_fails_closed_without_host_credential_reads(self):
+        self.cloud_shim()
+        aws, gcloud = self.host_credential_files()
+        adc_disabled = self.root / "adc-disabled.json"
+        adc_disabled.write_text("{}\n")
+        gcloud_empty = self.root / "gcloud-empty"
+        gcloud_empty.mkdir()
+        opened = self.recording_open()
+        isolation = {
+            "bedrock": {"AWS_CONFIG_FILE": "/dev/null", "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+                "AWS_EC2_METADATA_DISABLED": "true"},
+            "geap": {"GOOGLE_APPLICATION_CREDENTIALS": str(adc_disabled),
+                "CLOUDSDK_CONFIG": str(gcloud_empty)},
+        }
+        for provider, env in isolation.items():
+            with self.subTest(provider=provider):
+                output = io.StringIO()
+                with patch.dict(os.environ, env), contextlib.redirect_stderr(output):
+                    for key in ("AWS_ACCESS_KEY_ID", "GOOGLE_OAUTH_ACCESS_TOKEN"):
+                        self.assertNotIn(key, os.environ)
+                    failure, transport = self.call_cloud_route(self.cloud_route(provider), FORBIDDEN)
+                transport.assert_not_called()
+                self.assertNotIn("SENTINEL_", str(failure))
+                self.assertNotIn("SENTINEL_", output.getvalue())
+        host_reads = [entry for entry in opened
+                      if entry.startswith((str(aws), str(gcloud)))]
+        self.assertEqual(host_reads, [])
+        self.assertIn(str(adc_disabled), opened)
 
     def test_shim_is_silent_in_non_swival_python_children(self):
         script = 'import importlib.util; assert importlib.util.find_spec("swival") is None; print("child-ok")'

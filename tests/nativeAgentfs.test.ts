@@ -378,3 +378,286 @@ with patch.object(socket, 'socket', side_effect=AssertionError('network forbidde
 		expect(fs.readFileSync(path.join(source, "code.py"), "utf8")).toBe("def answer(): return 42\n");
 	} finally { run.cancel("Fixture cleanup"); await run.completion; console.log(`Released API AgentFS evidence: ${root}`); }
 }, 60_000);
+
+
+type CloudProvider = "bedrock" | "geap";
+const CREDENTIAL_SENTINELS = ["ASIASYNTHETIC", "SENTINEL_BRIDGED_", "SENTINEL_HOST_", "SENTINEL_AMBIENT_", "SENTINEL_UNRELATED_", "SENTINEL_"];
+
+/** Every regular file retained under the artifact root, including a retained snapshot. */
+function retainedFiles(directory: string): string[] {
+	const files: string[] = [];
+	for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+		const target = path.join(directory, entry.name);
+		if (entry.isDirectory()) files.push(...retainedFiles(target));
+		else { expect(entry.isFile(), target).toBe(true); files.push(target); }
+	}
+	return files;
+}
+
+/**
+ * Synthetic HOME with sentinel host credential state, the selected cloud route, and
+ * host `aws`/`gcloud` doubles that record their invocation and mint bridged credentials.
+ * Ambient keys cover the other route and unrelated providers only; preflight refuses the
+ * selected route's own fallback interface, so that is not an ambient fixture here.
+ */
+function cloudFixture(provider: CloudProvider) {
+	const root = nativeScratch("native-cloud-agentfs-"); const source = fixtureRepository(root);
+	const home = path.join(root, "home"); fs.mkdirSync(home); const config = path.join(home, ".config");
+	const pack = path.join(config, "nono/packages/jedisct1/swival"); fs.mkdirSync(path.join(pack, "profiles"), { recursive: true });
+	const reviewed = path.resolve(import.meta.dirname, "fixtures/nono-availability");
+	fs.copyFileSync(path.join(reviewed, "package.json"), path.join(pack, "package.json"));
+	fs.copyFileSync(path.join(reviewed, "policy.json"), path.join(pack, "profiles/swival.json"));
+	fs.writeFileSync(path.join(config, "nono/packages/lockfile.json"), JSON.stringify({ lockfile_version: 4,
+		packages: { "jedisct1/swival": { version: "0.1.2", installed_at: "2000-01-01T00:00:00Z" } } }));
+	const hostAws = path.join(home, ".aws"); const hostGcloud = path.join(config, "gcloud");
+	fs.mkdirSync(hostAws); fs.mkdirSync(path.join(hostGcloud, "configurations"), { recursive: true });
+	const hostCredentialFiles = {
+		[path.join(hostAws, "config")]: "[profile selected-bedrock]\nregion = us-east-2\nsso_session = SENTINEL_HOST_AWS_SECRET_NEVER_READ\n",
+		[path.join(hostAws, "credentials")]: "[selected-bedrock]\naws_access_key_id = AKIAHOSTSENTINEL\naws_secret_access_key = SENTINEL_HOST_AWS_SECRET_NEVER_READ\n",
+		[path.join(hostGcloud, "application_default_credentials.json")]: JSON.stringify({ type: "authorized_user", client_id: "synthetic",
+			client_secret: "SENTINEL_HOST_GCLOUD_SECRET_NEVER_READ", refresh_token: "SENTINEL_HOST_GCLOUD_SECRET_NEVER_READ" }),
+		[path.join(hostGcloud, "configurations/config_default")]: "[core]\naccount = SENTINEL_HOST_GCLOUD_SECRET_NEVER_READ\nproject = synthetic-project\n",
+	};
+	for (const [file, content] of Object.entries(hostCredentialFiles)) {
+		fs.writeFileSync(file, content, { mode: 0o600 });
+		const stat = fs.lstatSync(file); expect(stat.isFile()).toBe(true); expect(stat.nlink).toBe(1); expect(stat.mode & 0o777).toBe(0o600);
+	}
+	fs.mkdirSync(path.join(config, "swival"));
+	fs.writeFileSync(path.join(config, "swival/config.toml"), provider === "bedrock"
+		? 'provider = "bedrock"\naws_profile = "selected-bedrock"\nbase_url = "us-east-2"\nmodel = "global.anthropic.claude-sonnet-5-5"\nmax_context_tokens = 128000\n'
+		: 'provider = "geap"\nproject = "synthetic-project"\nlocation = "global"\nmodel = "gemini-3.8-flash"\nmax_context_tokens = 128000\n');
+	const selected = path.join(fs.realpathSync(path.dirname(nativeTestPython)), path.basename(nativeTestPython));
+	const hostBin = path.join(root, "host-bin"); fs.mkdirSync(hostBin);
+	const hostCalls = path.join(root, "host-cli-calls.jsonl");
+	const expiration = new Date(Date.now() + 2 * 3600_000).toISOString();
+	fs.writeFileSync(path.join(hostBin, "aws"), `#!${selected}
+import json, os, sys
+bindings = {key: os.environ.get(key) for key in ('AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'CLOUDSDK_CONFIG', 'HOME')}
+with open(${JSON.stringify(hostCalls)}, 'a') as log: log.write(json.dumps({'tool': 'aws', 'argv': sys.argv[1:], 'bindings': bindings}) + '\\n')
+print(json.dumps({'Version': 1, 'AccessKeyId': 'ASIASYNTHETIC', 'SecretAccessKey': 'SENTINEL_BRIDGED_AWS_SECRET',
+ 'SessionToken': 'SENTINEL_BRIDGED_AWS_SESSION', 'Expiration': ${JSON.stringify(expiration)}}))
+`, { mode: 0o700 });
+	fs.writeFileSync(path.join(hostBin, "gcloud"), `#!${selected}
+import json, os, sys
+bindings = {key: os.environ.get(key) for key in ('AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'CLOUDSDK_CONFIG', 'HOME')}
+with open(${JSON.stringify(hostCalls)}, 'a') as log: log.write(json.dumps({'tool': 'gcloud', 'argv': sys.argv[1:], 'bindings': bindings}) + '\\n')
+sys.stdout.write('SENTINEL_BRIDGED_GOOGLE_BEARER\\n')
+`, { mode: 0o700 });
+	const ambient = provider === "bedrock"
+		? { GOOGLE_APPLICATION_CREDENTIALS: path.join(hostGcloud, "application_default_credentials.json"), VERTEXAI_CREDENTIALS: "SENTINEL_AMBIENT_VERTEX", OPENROUTER_API_KEY: "SENTINEL_UNRELATED_OPENROUTER" }
+		: { AWS_ACCESS_KEY_ID: "SENTINEL_AMBIENT_AWS_OVERRIDDEN", AWS_SECRET_ACCESS_KEY: "SENTINEL_AMBIENT_AWS_KEY", AWS_SESSION_TOKEN: "SENTINEL_AMBIENT_AWS_TOK",
+			AWS_PROFILE: "SENTINEL_AMBIENT_PROFILE", OPENROUTER_API_KEY: "SENTINEL_UNRELATED_OPENROUTER" };
+	const cli = path.join(root, "offline-cli");
+	const runtime = { ...captureNativeRuntime(), python: selected, cli, searchPath: [hostBin, fixtureSearchPath()].join(path.delimiter),
+		environment: { HOME: home, XDG_CONFIG_HOME: config, TMPDIR: path.join(root, "tmp"), NONO_NO_UPDATE_CHECK: "1", ...ambient } };
+	fs.mkdirSync(runtime.environment.TMPDIR);
+	const expectedHostCall = provider === "bedrock"
+		? { tool: "aws", argv: ["configure", "export-credentials", "--profile", "selected-bedrock", "--format", "process"],
+			bindings: { AWS_CONFIG_FILE: path.join(hostAws, "config"), AWS_SHARED_CREDENTIALS_FILE: path.join(hostAws, "credentials"), CLOUDSDK_CONFIG: null, HOME: home } }
+		: { tool: "gcloud", argv: ["auth", "application-default", "print-access-token"],
+			bindings: { AWS_CONFIG_FILE: null, AWS_SHARED_CREDENTIALS_FILE: null, CLOUDSDK_CONFIG: hostGcloud, HOME: home } };
+	const artifacts = path.join(root, "artifacts");
+	/** Host-side proof after completion: one host CLI call, torn-down session, untouched host state, zero credential leakage. */
+	const assertHostBoundary = (term: unknown, result: unknown) => {
+		const calls = fs.readFileSync(hostCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		expect(calls).toEqual([expectedHostCall]);
+		expect(execFileSync(runtime.agentfs!, ["ps"], { env: { PATH: runtime.searchPath, HOME: home }, encoding: "utf8", timeout: 10_000 }))
+			.not.toContain(JSON.parse(fs.readFileSync(path.join(artifacts, "manifest.json"), "utf8")).session);
+		expect(fs.readFileSync(path.join(source, "code.py"), "utf8")).toBe("def answer(): return 42\n");
+		for (const [file, content] of Object.entries(hostCredentialFiles)) expect(fs.readFileSync(file, "utf8")).toBe(content);
+		const retained = retainedFiles(artifacts);
+		expect(retained.length).toBeGreaterThanOrEqual(5);
+		for (const text of [...retained.map((file) => fs.readFileSync(file, "utf8")), JSON.stringify(term), JSON.stringify(result)]) {
+			for (const sentinel of CREDENTIAL_SENTINELS) expect(text).not.toContain(sentinel);
+		}
+		return retained;
+	};
+	const cliHeader = `#!${selected}
+import json, os, socket, sys
+from pathlib import Path
+from unittest.mock import patch
+sys.dont_write_bytecode = True
+provider = ${JSON.stringify(provider)}
+`;
+	return { root, source, home, config, hostAws, hostGcloud, selected, cli, cliHeader, runtime, artifacts, assertHostBoundary };
+}
+
+// Host-side sentinels prove the bridged credential never leaves the host CLI boundary
+// except through the selected route's env interface, and never reaches retained evidence.
+it.each(["bedrock", "geap"] as const)("runs the released %s /audit producer through real AgentFS with a bridged host credential and HTTP doubles", async (provider) => {
+	const f = cloudFixture(provider);
+	fs.writeFileSync(f.cli, f.cliHeader + `
+with patch.object(socket, 'socket', side_effect=AssertionError('network forbidden')), \\
+     patch.object(socket, 'create_connection', side_effect=AssertionError('network forbidden')), \\
+     patch.object(socket, 'getaddrinfo', side_effect=AssertionError('DNS forbidden')):
+ from swival import agent, audit, sandbox_agentfs, tools
+ from swival.session import Session
+ import httpx
+ assert sandbox_agentfs.is_inside_agentfs()
+ assert os.environ.get('PI_SWIVAL_SHIM_REQUIRED') == '1'
+ env = os.environ
+ absent = ['AWS_PROFILE', 'VERTEXAI_CREDENTIALS', 'OPENROUTER_API_KEY']
+ if provider == 'bedrock':
+  assert env.get('AWS_ACCESS_KEY_ID') == 'ASIASYNTHETIC', 'bridged AWS access key id'
+  assert env.get('AWS_SECRET_ACCESS_KEY') == 'SENTINEL_BRIDGED_AWS_SECRET', 'bridged AWS secret'
+  assert env.get('AWS_SESSION_TOKEN') == 'SENTINEL_BRIDGED_AWS_SESSION', 'bridged AWS session'
+  assert env.get('AWS_CONFIG_FILE') == '/dev/null' and env.get('AWS_SHARED_CREDENTIALS_FILE') == '/dev/null'
+  assert env.get('AWS_EC2_METADATA_DISABLED') == 'true'
+  absent += ['GOOGLE_OAUTH_ACCESS_TOKEN', 'GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER', 'GOOGLE_APPLICATION_CREDENTIALS', 'CLOUDSDK_CONFIG']
+ else:
+  assert env.get('GOOGLE_OAUTH_ACCESS_TOKEN') == 'SENTINEL_BRIDGED_GOOGLE_BEARER', 'bridged Google bearer'
+  assert env.get('GOOGLE_OAUTH_ACCESS_TOKEN_NOT_AFTER', '').isdigit(), 'bounded bearer lifetime'
+  adc = env.get('GOOGLE_APPLICATION_CREDENTIALS', '')
+  assert adc.endswith('/adc-disabled.json') and Path(adc).read_text().strip() == '{}', 'inert ADC file'
+  assert env.get('CLOUDSDK_CONFIG', '').endswith('/gcloud-empty') and set(Path(env['CLOUDSDK_CONFIG']).iterdir()) == {Path(adc)}, 'empty gcloud config'
+  absent += ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE']
+ for key in absent: assert key not in env, key
+ requests = []
+ def response(request, **_kwargs):
+  headers = request.headers
+  requests.append({'host': request.url.host,
+   'sigv4': headers.get('authorization', '').startswith('AWS4-HMAC-SHA256'),
+   'session_token_bridged': headers.get('x-amz-security-token') == 'SENTINEL_BRIDGED_AWS_SESSION',
+   'bearer_bridged': headers.get('authorization') == 'Bearer SENTINEL_BRIDGED_GOOGLE_BEARER'})
+  text = audit._PHASE1_WORKED_EXAMPLE if len(requests) == 1 else '@@ none @@'
+  if provider == 'bedrock':
+   payload = {'output': {'message': {'role': 'assistant', 'content': [{'text': text}]}}, 'stopReason': 'end_turn',
+    'usage': {'inputTokens': 10, 'outputTokens': 5, 'totalTokens': 15}, 'metrics': {'latencyMs': 10}}
+  else:
+   payload = {'candidates': [{'content': {'role': 'model', 'parts': [{'text': text}]}, 'finishReason': 'STOP'}],
+    'usageMetadata': {'promptTokenCount': 10, 'candidatesTokenCount': 5, 'totalTokenCount': 15}}
+  return httpx.Response(200, request=request, json=payload)
+ with patch('google.auth.default', side_effect=AssertionError('ADC forbidden')) as adc_default, \\
+      patch.object(httpx.Client, 'send', side_effect=response):
+  try: agent.main()
+  except SystemExit as exc:
+   if exc.code not in (0, None): raise
+ assert requests
+ assert not adc_default.called
+ assert not agent._MODEL_AUTOFIX
+ hosts = {entry['host'] for entry in requests}
+ every = lambda key: all(entry[key] for entry in requests)
+ none = lambda key: not any(entry[key] for entry in requests)
+ transport = {'request_count': len(requests),
+  'single_host': hosts == ({'bedrock-runtime.us-east-2.amazonaws.com'} if provider == 'bedrock' else {'aiplatform.googleapis.com'}),
+  'model_discovery_disabled': agent._list_server_models('bedrock' if provider == 'bedrock' else 'vertex_ai', None, None) == []}
+ if provider == 'bedrock':
+  transport.update(sigv4=every('sigv4'), session_token_bridged=every('session_token_bridged'), bearer_absent=none('bearer_bridged'))
+ else:
+  transport.update(bearer_bridged=every('bearer_bridged'), sigv4_absent=none('sigv4'), session_token_absent=none('session_token_bridged'))
+ # On macOS the outer AgentFS boundary does not isolate host-file reads; inner Swival
+ # --sandbox builtin --files some is what denies these host and parent paths to model tools.
+ snapshot = Path(sys.argv[sys.argv.index('--base-dir') + 1])
+ home = Path(os.environ['HOME'])
+ session = Session(base_dir=str(snapshot), files='some', commands='none', network='provider-only',
+  no_instructions=True, no_skills=True, memory=False, history=False, subagents=False, lifecycle_enabled=False)
+ with patch.object(agent, 'resolve_provider', return_value=('offline', None, None, 128000, {'provider': 'chatgpt'})):
+  session._setup()
+ context = session._make_input_context(session._make_per_run_state(system_content='synthetic'))
+ tool_options = {key: value for key, value in context.loop_kwargs.items() if key != 'base_dir'}
+ def dispatch(name, args): return tools.dispatch(name, args, str(snapshot), **tool_options)
+ denied = {}
+ for label, target in (('aws_credentials', home / '.aws/credentials'), ('aws_config', home / '.aws/config'),
+   ('gcloud_adc', home / '.config/gcloud/application_default_credentials.json'), ('parent_manifest', snapshot.parent / 'manifest.json')):
+  results = [dispatch('read_file', {'file_path': str(target)}),
+   dispatch('write_file', {'file_path': str(target), 'content': 'forbidden'}),
+   dispatch('grep', {'pattern': 'SENTINEL', 'path': str(target.parent)}),
+   dispatch('list_files', {'pattern': target.name, 'path': str(target.parent)})]
+  denied[label] = all(result.startswith('error:') for result in results)
+  assert not any('SENTINEL_' in result for result in results), label
+ denied['relative_parent_manifest'] = dispatch('read_file', {'file_path': '../manifest.json'}).startswith('error:')
+ snapshot_read = dispatch('read_file', {'file_path': str(snapshot / 'code.py')})
+ session.close()
+ report_path = snapshot / 'native-cli-report.json'
+ report = json.loads(report_path.read_text())
+ report['cloud_transport_probe'] = transport
+ report['model_tool_probe'] = {**denied, 'snapshot_read': not snapshot_read.startswith('error:') and 'return 42' in snapshot_read}
+ report_path.write_text(json.dumps(report))
+ print('REAL_RELEASED_CLOUD_AUDIT_WITH_HTTP_DOUBLES', flush=True)
+`, { mode: 0o700 });
+	const run = await prepareNativeAudit(f.source, { audit: { all: true }, timeoutMs: 30_000 },
+		{ paths: [], all: true, workers: 1, patchMaxTurns: 5 }, f.runtime, f.artifacts, "released-cloud", 35_000);
+	let fixtureDiagnostics = "";
+	for (const stream of [run.proc.stdout, run.proc.stderr]) stream?.on("data", (chunk) => { fixtureDiagnostics = (fixtureDiagnostics + chunk).slice(0, 65536); });
+	try {
+		const term = await run.completion; const result = await inspectNativeAudit(f.artifacts, term.exitCode);
+		fs.writeFileSync(path.join(f.root, "production-result.json"), JSON.stringify({ term, result, fixtureDiagnostics }, null, 2), { mode: 0o600 });
+		expect(term, fixtureDiagnostics).toMatchObject({ exitCode: 0, shutdown: "verified", boundary: "agentfs-cli" });
+		expect(result.status, result.error).toBe("completed");
+		expect(run.route.provider).toBe(provider);
+		const report = JSON.parse(fs.readFileSync(path.join(f.artifacts, "evidence/native-cli-report.json"), "utf8"));
+		expect(report.cloud_transport_probe.request_count).toBeGreaterThan(0);
+		expect(report.cloud_transport_probe).toEqual({ request_count: expect.any(Number), single_host: true, model_discovery_disabled: true,
+			...(provider === "bedrock" ? { sigv4: true, session_token_bridged: true, bearer_absent: true }
+				: { bearer_bridged: true, sigv4_absent: true, session_token_absent: true }) });
+		expect(report.model_tool_probe).toEqual({ aws_credentials: true, aws_config: true, gcloud_adc: true, parent_manifest: true,
+			relative_parent_manifest: true, snapshot_read: true });
+		expect(fs.existsSync(path.join(f.artifacts, "snapshot"))).toBe(false);
+		f.assertHostBoundary(term, result);
+	} finally { run.cancel("Fixture cleanup"); await run.completion; console.log(`Released cloud AgentFS evidence: ${f.root}`); }
+}, 90_000);
+
+// Released agent.main() handles the provider's auth rejection itself and writes its own
+// error report; the fixture never touches native-cli-report.json. The provider error body is
+// an echo marker without a credential prefix: released Swival retains provider error text,
+// and this proves the retained report came from released code rather than a fixture rewrite.
+// On geap the shim's expiry sentinel reaches the parent before Swival writes that report, so
+// the live cancel usually tears the AgentFS group down first; preservation then fails closed
+// and the inert committed snapshot stays inside the artifact root, where it is scanned too.
+it.each(["bedrock", "geap"] as const)("fails the released %s /audit producer closed on a raw HTTP auth rejection without retaining any credential", async (provider) => {
+	const f = cloudFixture(provider);
+	fs.writeFileSync(f.cli, f.cliHeader + `
+with patch.object(socket, 'socket', side_effect=AssertionError('network forbidden')), \\
+     patch.object(socket, 'create_connection', side_effect=AssertionError('network forbidden')), \\
+     patch.object(socket, 'getaddrinfo', side_effect=AssertionError('DNS forbidden')):
+ from swival import agent, sandbox_agentfs
+ import httpx
+ assert sandbox_agentfs.is_inside_agentfs()
+ assert os.environ.get('PI_SWIVAL_SHIM_REQUIRED') == '1'
+ def rejection(request, **_kwargs):
+  if provider == 'bedrock':
+   return httpx.Response(400, request=request, json={'__type': 'ExpiredTokenException', 'message': 'Token expired PROVIDER_ECHO_AWS_REJECTION'})
+  return httpx.Response(401, request=request, json={'error': {'code': 401, 'message': 'Invalid credential PROVIDER_ECHO_VERTEX_REJECTION', 'status': 'UNAUTHENTICATED'}})
+ with patch('google.auth.default', side_effect=AssertionError('ADC forbidden')) as adc_default, \\
+      patch.object(httpx.Client, 'send', side_effect=rejection) as transport:
+  try: agent.main()
+  except SystemExit as exc: code = exc.code
+  else: code = 0
+ assert transport.call_count == 1, 'auth rejection must not be retried'
+ assert not adc_default.called
+ assert not agent._MODEL_AUTOFIX
+ assert code not in (0, None), 'released CLI must exit unsuccessfully'
+ raise SystemExit(code)
+`, { mode: 0o700 });
+	const run = await prepareNativeAudit(f.source, { audit: { all: true }, timeoutMs: 30_000 },
+		{ paths: [], all: true, workers: 1, patchMaxTurns: 5 }, f.runtime, f.artifacts, "released-cloud-rejection", 35_000);
+	let fixtureDiagnostics = "";
+	for (const stream of [run.proc.stdout, run.proc.stderr]) stream?.on("data", (chunk) => { fixtureDiagnostics = (fixtureDiagnostics + chunk).slice(0, 65536); });
+	try {
+		const term = await run.completion; const result = await inspectNativeAudit(f.artifacts, term.exitCode);
+		fs.writeFileSync(path.join(f.root, "production-result.json"), JSON.stringify({ term, result, fixtureDiagnostics }, null, 2), { mode: 0o600 });
+		expect(run.route.provider).toBe(provider);
+		expect(term.exitCode, fixtureDiagnostics).not.toBe(0);
+		expect(term.shutdown, fixtureDiagnostics).toBe("verified");
+		if (provider === "geap") expect(term.stopped).toBe("CREDENTIAL_EXPIRED: short-lived provider credential expired during native audit; no fallback.");
+		else expect(term.stopped).toBeUndefined();
+		expect(result.status).toBe("failed"); expect(result.answer).toBeUndefined();
+		const snapshot = path.join(f.artifacts, "snapshot"); const evidenceReport = path.join(f.artifacts, "evidence/native-cli-report.json");
+		const retained = f.assertHostBoundary(term, result);
+		if (term.preservationFailure) {
+			// The group was torn down before the released report landed: nothing is exported
+			// and the committed-tree snapshot is retained as the only evidence.
+			expect(provider).toBe("geap");
+			expect(term.retainedResources).toEqual([snapshot]);
+			expect(fs.existsSync(evidenceReport)).toBe(false);
+			expect(fs.existsSync(path.join(snapshot, "native-cli-report.json"))).toBe(false);
+			expect(retained).toContain(path.join(snapshot, "code.py"));
+		} else {
+			expect(fs.existsSync(snapshot)).toBe(false);
+			const report = JSON.parse(fs.readFileSync(evidenceReport, "utf8"));
+			expect(report.result).toMatchObject({ outcome: "error", exit_code: 1 });
+			expect(report.result.answer).toContain(provider === "bedrock" ? "PROVIDER_ECHO_AWS_REJECTION" : "PROVIDER_ECHO_VERTEX_REJECTION");
+			expect(retained).toContain(evidenceReport);
+		}
+	} finally { run.cancel("Fixture cleanup"); await run.completion; console.log(`Released cloud rejection AgentFS evidence: ${f.root}`); }
+}, 90_000);
