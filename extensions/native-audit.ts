@@ -647,13 +647,22 @@ export async function prepareNativeAudit(
 const TERMINAL_DIAGNOSTICS = ["stopped", "shutdownFailure", "preservationFailure", "cleanupFailure", "persistenceFailure"] as const;
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Terminate the owned group and prove absence through ESRCH only; EPERM never counts as shutdown. */
-async function shutdownGroup(ownership: NativeOwnership): Promise<{ shutdown: "verified" | "unverified"; wasAlive: boolean }> {
+/**
+ * Terminate the owned group and prove absence through ESRCH only; EPERM never counts as shutdown.
+ * After a natural leader exit, AgentFS helpers such as the Linux FUSE unmount may still be
+ * reaping for tens of milliseconds; they are given a short grace window before any member
+ * left behind counts as a leaked descendant. An explicit cancellation signals at once.
+ */
+async function shutdownGroup(ownership: NativeOwnership, naturalExit: boolean): Promise<{ shutdown: "verified" | "unverified"; wasAlive: boolean }> {
 	const absent = () => {
 		try { ownership.signal(0); return false; }
 		catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
 	};
-	if (absent()) return { shutdown: "verified", wasAlive: false };
+	for (let attempt = 0; ; attempt++) {
+		if (absent()) return { shutdown: "verified", wasAlive: false };
+		if (!naturalExit || attempt >= 10) break;
+		await delay(25);
+	}
 	try { ownership.signal("SIGTERM"); } catch { /* Only a later ESRCH probe proves absence. */ }
 	for (let attempt = 0; attempt < 20; attempt++) {
 		if (absent()) return { shutdown: "verified", wasAlive: true };
@@ -688,7 +697,7 @@ function accountRetained(target: string, size: number, budget: EvidenceBudget): 
 	if (budget.paths.has(target)) return;
 	scanned(budget);
 	budget.bytes += size;
-	if (budget.bytes > NATIVE_TOTAL_LIMIT) throw new Error("Native evidence byte limit.");
+	if (size > NATIVE_FILE_LIMIT || budget.bytes > NATIVE_TOTAL_LIMIT) throw new Error("Native evidence byte limit.");
 	budget.paths.add(target);
 }
 /** Released evidence is UTF-8 text; unchanged files are exported byte-identical. */
@@ -816,7 +825,7 @@ export async function finalizeNativeAudit(options: NativeFinalizationOptions,
 		exitCode: outcome.exitCode ?? 1, shutdown: "unverified" };
 	delete record.shutdownFailure;
 	if (ownership) {
-		const stopped = await shutdownGroup(ownership);
+		const stopped = await shutdownGroup(ownership, !record.stopped);
 		record.shutdown = stopped.shutdown;
 		if (stopped.wasAlive && !record.stopped) record.stopped = "Native process left running descendants.";
 		let verified = false;

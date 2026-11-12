@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { completeNativeFixture, nativeScratch } from "./nativeFixtures.js";
 import { finalizeNativeAudit, inspectNativeAudit, readNativeTerminal } from "../extensions/native-audit.js";
+import { NATIVE_FILE_LIMIT } from "../extensions/contracts.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { pruneOldArtifacts } from "../extensions/index.js";
 
@@ -111,6 +112,61 @@ describe("native-audit shared finalization", () => {
 		for (const file of fs.readdirSync(f.runDir, { recursive: true, withFileTypes: true })) {
 			if (file.isFile()) expect(fs.readFileSync(path.join(file.parentPath, file.name), "utf8")).not.toContain("SENTINEL_");
 		}
+	});
+
+	it("fails preservation closed when redaction expands a report past the per-file limit", async () => {
+		const f = fixture();
+		// Four secret bytes become ten; the report crosses the limit only after redaction.
+		const report = Buffer.alloc(NATIVE_FILE_LIMIT, " "); report.write("abcd", NATIVE_FILE_LIMIT - 4);
+		fs.writeFileSync(path.join(f.runDir, "snapshot", "native-cli-report.json"), report);
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: absent, redactSecrets: ["abcd"] }, { exitCode: 0 });
+		expect(term).toMatchObject({ exitCode: 1, shutdown: "verified", preservationFailure: "Native evidence preservation failed or exceeded resource limits." });
+		expect(term.retainedResources).toEqual([path.join(f.runDir, "snapshot")]);
+		expect(fs.existsSync(path.join(f.runDir, "evidence", "native-cli-report.json"))).toBe(false);
+	});
+
+	/** A group whose members keep reaping after the leader exited, recording every signal sent.
+	 * `gone` is a wall-clock duration or, when given a function, a probe-count predicate. */
+	const reapingGroup = (gone: number | ((probe: number) => boolean)) => {
+		const deadline = Date.now() + (typeof gone === "number" ? gone : 0); const signals: (NodeJS.Signals | 0)[] = [];
+		return { signals, ownership: { verify: async () => true, signal: (signal: NodeJS.Signals | 0) => {
+			signals.push(signal);
+			if (typeof gone === "function" ? gone(signals.length) : Date.now() >= deadline) throw Object.assign(new Error("absent"), { code: "ESRCH" });
+		} } };
+	};
+	it("lets a naturally exited group finish reaping its helpers before treating members as leaked descendants", async () => {
+		const f = fixture(); const group = reapingGroup(50);
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: group.ownership }, { exitCode: 0 });
+		expect(term).toMatchObject({ exitCode: 0, shutdown: "verified", boundary: "agentfs-cli" });
+		expect(term.stopped).toBeUndefined();
+		expect(group.signals.length).toBeGreaterThan(1); expect(new Set(group.signals)).toEqual(new Set([0]));
+		expect(fs.existsSync(path.join(f.runDir, "evidence", "native-cli-report.json"))).toBe(true);
+		expect(fs.existsSync(path.join(f.runDir, "snapshot"))).toBe(false);
+	});
+	it("still terminates descendants that outlive the natural-exit grace window and fails the run", async () => {
+		const f = fixture(); const group = reapingGroup(600);
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: group.ownership }, { exitCode: 0 });
+		expect(term).toMatchObject({ exitCode: 1, shutdown: "verified", stopped: "Native process left running descendants." });
+		// Eleven probes span the full window: t = 0, 25, ..., 250 ms.
+		const probesBeforeTerm = group.signals.indexOf("SIGTERM");
+		expect(probesBeforeTerm).toBe(11); expect(group.signals.slice(0, probesBeforeTerm).every((signal) => signal === 0)).toBe(true);
+	});
+	it("accepts a group that disappears on the final grace probe and signals one that outlives it by a probe", async () => {
+		const onFinalProbe = fixture(); const lastProbe = reapingGroup((probe) => probe >= 11);
+		const accepted = await finalizeNativeAudit({ runDir: onFinalProbe.runDir, ownership: lastProbe.ownership }, { exitCode: 0 });
+		expect(accepted).toMatchObject({ exitCode: 0, shutdown: "verified" }); expect(accepted.stopped).toBeUndefined();
+		expect(lastProbe.signals).toEqual(Array<0>(11).fill(0));
+		const afterWindow = fixture(); const oneProbeLate = reapingGroup((probe) => probe >= 12);
+		const failed = await finalizeNativeAudit({ runDir: afterWindow.runDir, ownership: oneProbeLate.ownership }, { exitCode: 0 });
+		expect(failed).toMatchObject({ exitCode: 1, shutdown: "verified", stopped: "Native process left running descendants." });
+		// SIGTERM itself meets ESRCH; only the following probe proves absence.
+		expect(oneProbeLate.signals).toEqual([...Array<0>(11).fill(0), "SIGTERM", 0]);
+	});
+	it("signals an explicitly cancelled group on the first tick without a grace window", async () => {
+		const f = fixture(); const group = reapingGroup(100);
+		const term = await finalizeNativeAudit({ runDir: f.runDir, ownership: group.ownership }, { exitCode: 1, stopped: "Native audit was cancelled." });
+		expect(term).toMatchObject({ exitCode: 1, shutdown: "verified", stopped: "Native audit was cancelled." });
+		expect(group.signals.slice(0, 2)).toEqual([0, "SIGTERM"]);
 	});
 
 	it("escalates a TERM-ignoring live group and requires ESRCH before evidence export", async () => {
