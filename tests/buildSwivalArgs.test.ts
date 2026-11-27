@@ -380,6 +380,48 @@ describe("buildSwivalArgs", () => {
 		expect(args[bd + 1]).toBe("/cwd-fallback");
 	});
 
+	it("rejects every project swival.toml entry across effective base-dir forms", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-project-config-")));
+		try {
+			const clean = path.join(root, "clean");
+			const configured = path.join(root, "configured");
+			fs.mkdirSync(clean);
+			fs.mkdirSync(configured);
+			const projectConfig = path.join(configured, "swival.toml");
+			fs.writeFileSync(projectConfig, 'provider = "command"\nmodel = "id"\n');
+
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", configured)).toThrow(/project configuration exists/);
+			expect(() => buildSwivalArgs(makeAgent({ baseDir: configured }), "/tmp/r.json", clean)).toThrow(/project configuration exists/);
+			expect(() => buildSwivalArgs(makeAgent({ extraArgs: ["--base-dir", configured] }), "/tmp/r.json", clean)).toThrow(/project configuration exists/);
+			expect(() => buildSwivalArgs(makeAgent({ extraArgs: [`--base-dir=${configured}`] }), "/tmp/r.json", clean)).toThrow(/project configuration exists/);
+			expect(() => buildSwivalArgs(makeAgent({ baseDir: clean, extraArgs: ["--base-dir", configured] }), "/tmp/r.json", root)).toThrow(/project configuration exists/);
+			for (const abbreviation of ["--b", "--base-d", "--base-di"]) {
+				expect(() => buildSwivalArgs(makeAgent({ extraArgs: [`${abbreviation}=${configured}`] }), "/tmp/r.json", clean)).toThrow(/spell --base-dir in full/);
+			}
+			const nested = path.join(configured, "nested");
+			const baseLink = path.join(root, "base-link");
+			fs.mkdirSync(nested);
+			fs.symlinkSync(nested, baseLink);
+			expect(() => buildSwivalArgs(makeAgent({ extraArgs: ["--base-dir", `${baseLink}/..`] }), "/tmp/r.json", clean)).toThrow(/project configuration exists/);
+
+			// Empty files, directories, and links are entries Swival may interpret now
+			// or in a future compatible release; none cross the delegation boundary.
+			fs.writeFileSync(projectConfig, "");
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", configured)).toThrow(/project configuration exists/);
+			fs.unlinkSync(projectConfig);
+			fs.mkdirSync(projectConfig);
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", configured)).toThrow(/project configuration exists/);
+			fs.rmSync(projectConfig, { recursive: true });
+			fs.symlinkSync(path.join(root, "missing.toml"), projectConfig);
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", configured)).toThrow(/project configuration exists/);
+
+			const args = buildSwivalArgs(makeAgent({ baseDir: clean }), "/tmp/r.json", root);
+			expect(args).toEqual(expect.arrayContaining(["--base-dir", clean, "--report", "/tmp/r.json"]));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("auto-adds --add-dir-ro for a validated linked Git worktree and rejects forged .git pointers", () => {
 		const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-swival-wt-"));
 		const prevXdg = process.env.XDG_CONFIG_HOME;
@@ -474,10 +516,7 @@ describe("buildSwivalArgs", () => {
 				path.join(wtDir, "swival.toml"),
 				[`allowed_dirs_ro = [`, `  "${refDir}",`, `  "rel-ro",`, `]`, `[profiles.example]`, `provider = "bedrock"`].join("\n") + "\n",
 			);
-			const preservedArgs = buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir);
-			expect(preservedArgs).toContain(refDir);
-			expect(preservedArgs).toContain(path.join(realWtDir, "rel-ro"));
-			expect(preservedArgs).toContain(realMainGit);
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir)).toThrow(/project configuration exists/);
 			fs.unlinkSync(path.join(wtDir, "swival.toml"));
 			// Global XDG config.toml allowed_dirs_ro is preserved when CLI --add-dir-ro is unset, and skipped when CLI --add-dir-ro is set
 			const xdgSwival = path.join(tmpRoot, "xdg", "swival");
@@ -567,8 +606,8 @@ describe("buildSwivalArgs", () => {
 			expect(configured).toEqual([`${wtDir}${path.sep}link-into-git/..`]);
 			expect(canonicalPathOrResolved(configured[0])).toBe(mainGit);
 			expect(path.resolve(configured[0])).toBe(wtDir);
-			// The common Git directory is already covered by the configured grant, so nothing is re-emitted.
-			expect(buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir)).not.toContain("--add-dir-ro");
+			// Project configuration is never admitted to an ordinary delegated launch.
+			expect(() => buildSwivalArgs(makeAgent(), "/tmp/r.json", wtDir)).toThrow(/project configuration exists/);
 			fs.unlinkSync(path.join(wtDir, "swival.toml"));
 
 			// A Git directory under a differently-cased protected home entry is refused

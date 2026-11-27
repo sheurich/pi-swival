@@ -189,6 +189,29 @@ export function asyncOptionError(options: { timeoutMs?: unknown; output?: unknow
 
 // --------------------------------------------------------- argv builder --
 
+/**
+ * Project Swival configuration is repository-controlled and is merged after
+ * user configuration. Until Swival exposes a supported way to disable that
+ * merge, refuse every directory entry at the project-config path before a
+ * delegated process can select providers, endpoints, hooks, or executables.
+ */
+function assertNoProjectSwivalConfig(baseDir: string): void {
+	const configPath = path.join(baseDir, "swival.toml");
+	try {
+		fs.lstatSync(configPath);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return;
+		throw new SwivalArgumentError(
+			`Cannot verify that project Swival configuration is absent at "${configPath}". Refusing to start delegated Swival.`,
+		);
+	}
+	throw new SwivalArgumentError(
+		`Refusing to start delegated Swival because project configuration exists at "${configPath}". ` +
+		"Repository-controlled swival.toml can redirect provider execution; keep trusted settings in the user configuration instead.",
+	);
+}
+
 export function buildSwivalArgs(
 	agent: SwivalAgentConfig,
 	reportPath: string,
@@ -197,6 +220,13 @@ export function buildSwivalArgs(
 ): string[] {
 	if (agent.extraArgs?.includes("--")) {
 		throw new SwivalArgumentError(`Agent "${agent.name}" extraArgs must not include the option terminator "--".`);
+	}
+	for (const token of agent.extraArgs ?? []) {
+		const equals = token.indexOf("=");
+		const flag = equals === -1 ? token : token.slice(0, equals);
+		if (flag !== "--base-dir" && flag.length > 2 && "--base-dir".startsWith(flag)) {
+			throw new SwivalArgumentError(`Agent "${agent.name}" extraArgs must spell --base-dir in full.`);
+		}
 	}
 	const args: string[] = [];
 	const pushValue = (flag: string, value: string | number | undefined) => {
@@ -265,6 +295,20 @@ export function buildSwivalArgs(
 	}
 	if (agent.baseDir) args.push("--base-dir", agent.baseDir);
 	else if (cwd) args.push("--base-dir", cwd);
+	// extraArgs are appended later and can override --base-dir, so enforce the
+	// policy against the same final-value semantics Swival receives.
+	const configuredBaseDir = lastCliOptionValue([...args, ...(agent.extraArgs ?? [])], "--base-dir") ?? cwd;
+	const rawBaseDir = configuredBaseDir ?? process.cwd();
+	const absoluteBaseDir = path.isAbsolute(rawBaseDir) ? rawBaseDir : `${cwd ?? process.cwd()}${path.sep}${rawBaseDir}`;
+	let effectiveBaseDir: string;
+	try {
+		effectiveBaseDir = walkCanonicalPathSync(absoluteBaseDir);
+	} catch (error) {
+		throw new SwivalArgumentError(
+			`Cannot resolve the delegated Swival base directory safely: ${(error as Error).message}. Refusing to start delegated Swival.`,
+		);
+	}
+	assertNoProjectSwivalConfig(effectiveBaseDir);
 	if (agent.source === "project" && (overrides.addDir !== undefined || overrides.addDirRo !== undefined)) {
 		throw new SwivalArgumentError(`Project-scope agent "${agent.name}" cannot use addDirOverride or addDirRoOverride.`);
 	}
@@ -316,14 +360,15 @@ export function buildSwivalArgs(
 	for (const d of emittedAddDirRo) args.push("--add-dir-ro", d);
 	const effectiveFilesMode = lastCliOptionValue(agent.extraArgs ?? [], "--files") ?? agent.files;
 	if (agent.source !== "project" && effectiveFilesMode !== "none") {
-		const configuredBaseDir = lastCliOptionValue(agent.extraArgs ?? [], "--base-dir") ?? agent.baseDir ?? cwd;
 		const baseDirCandidate = configuredBaseDir ? (cwd ? path.resolve(cwd, configuredBaseDir) : configuredBaseDir) : undefined;
 		const linkedCommonGitDir = resolveLinkedWorktreeCommonGitDir(baseDirCandidate);
 		if (linkedCommonGitDir) {
 			const extraAddDirs = allCliOptionValues(agent.extraArgs ?? [], "--add-dir");
 			const extraAddDirsRo = allCliOptionValues(agent.extraArgs ?? [], "--add-dir-ro");
 			const hasCliAddDirRo = effectiveAddDirRo.length > 0 || extraAddDirsRo.length > 0;
-			const inheritedConfigRo = hasCliAddDirRo ? [] : readConfiguredAllowedDirsRo(baseDirCandidate);
+			// Project configuration is forbidden above; inherit only the operator's
+			// global read-only grants when the CLI did not set its own.
+			const inheritedConfigRo = hasCliAddDirRo ? [] : readConfiguredAllowedDirsRo(undefined);
 			const existingCanonical = [...emittedAddDir, ...extraAddDirs, ...emittedAddDirRo, ...extraAddDirsRo, ...inheritedConfigRo]
 				.map((d) => canonicalPathOrResolved(d, cwd));
 			const alreadyCovered = existingCanonical.some((d) => d === linkedCommonGitDir || linkedCommonGitDir.startsWith(d + path.sep));
