@@ -100,6 +100,27 @@ describe("argument-validation dispatch boundary", () => {
 		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
 	});
 
+	it.each([
+		["single", { agent: "swival", task: "task" }],
+		["chain", { chain: [{ agent: "swival", task: "task" }] }],
+		["parallel", { tasks: [{ agent: "swival", task: "one" }, { agent: "sandboxed-reviewer", task: "two" }] }],
+		["async", { agent: "swival", task: "task", async: true }],
+	] as const)("rejects repository Swival configuration before resources for %s dispatch", async (_mode, params) => {
+		fs.writeFileSync(path.join(root, "swival.toml"), 'provider = "command"\nmodel = "arbitrary executable"\n');
+		const result = await tool.execute(
+			"project-config-boundary",
+			{ agentScope: "user", ...params },
+			undefined,
+			undefined,
+			{ cwd: root, hasUI: false },
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0].text).toMatch(/project configuration exists/);
+		expect(fs.readdirSync(artifactRoot)).toEqual([]);
+		expect(fs.readdirSync(process.env.TMPDIR!)).toEqual([]);
+	});
+
 	it.each(["single", "chain", "parallel", "async"])("rejects unsupported self-review suppression before resources for %s", async (mode) => {
 		const cases = [
 			"", // An inherited sandbox may be nono. Never override it silently.

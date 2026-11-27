@@ -109,6 +109,8 @@ Manage background runs with `action` and `id`:
 
 Relative `cwd` resolves against Pi's `cwd`; relative `output` resolves against the task or step `cwd`. Pi writes `output` atomically (mode `0600`) after symlink checks. Synchronous `output` defaults to `outputMode: "file-only"` (failed chains still inline partial output); pass `outputMode: "inline"` to return both file metadata and text. `maxInlineBytes` caps returned character count. `timeoutMs` applies per child process.
 
+Delegated runs reject any `<base-dir>/swival.toml` entry before launch because repository configuration can change provider and executable behavior. Keep trusted routing and other Swival defaults in `~/.config/swival/config.toml`.
+
 ### Dispatch-time overrides
 
 Top-level overrides apply across single, parallel, and chain modes (per-item entries accept `agent`, `task`, `cwd`, `seed`, `output`, and `outputMode`):
